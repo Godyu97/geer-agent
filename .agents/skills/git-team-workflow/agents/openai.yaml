@@ -1,0 +1,4 @@
+interface:
+  display_name: "Git Team Workflow"
+  short_description: "Run fast begin/end Git flows with resumable conflict routing"
+  default_prompt: "Use $git-team-workflow to run the fast coding begin/end workflow for the current feature branch."

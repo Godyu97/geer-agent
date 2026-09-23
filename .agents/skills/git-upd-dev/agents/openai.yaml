@@ -1,0 +1,4 @@
+interface:
+  display_name: "Git Update Dev"
+  short_description: "Merge remote main into dev and return to your branch"
+  default_prompt: "Use $git-upd-dev only when the user explicitly requests the `upd dev` workflow."
