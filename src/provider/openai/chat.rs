@@ -5,13 +5,8 @@ use async_openai::{
     config::OpenAIConfig,
     error::OpenAIError,
     types::chat::{
-        ChatCompletionMessageToolCall, ChatCompletionMessageToolCalls,
-        ChatCompletionRequestAssistantMessage, ChatCompletionRequestAssistantMessageContent,
-        ChatCompletionRequestMessage, ChatCompletionRequestSystemMessage,
-        ChatCompletionRequestToolMessage, ChatCompletionRequestToolMessageContent,
-        ChatCompletionRequestUserMessage, ChatCompletionRequestUserMessageContent,
-        CreateChatCompletionRequestArgs, CreateChatCompletionStreamResponse, FinishReason,
-        FunctionCall,
+        ChatCompletionRequestMessage, CreateChatCompletionRequestArgs,
+        CreateChatCompletionStreamResponse, FinishReason,
     },
 };
 use futures_util::{Stream, StreamExt};
@@ -27,12 +22,10 @@ const REPLY_IDLE_TIMEOUT: Duration = Duration::from_secs(90);
 pub(crate) struct Chat {
     client: Client<OpenAIConfig>,
     model: String,
-    system_prompt: String,
-    history: Vec<ChatCompletionRequestMessage>,
 }
 
 impl Chat {
-    pub(crate) fn new(config: &Config, system_prompt: String) -> Self {
+    pub(crate) fn new(config: &Config) -> Self {
         let client_config = OpenAIConfig::new()
             .with_api_key(config.api_key.clone())
             .with_api_base(config.base_url.clone());
@@ -40,99 +33,24 @@ impl Chat {
         Self {
             client: Client::with_config(client_config),
             model: config.model.clone(),
-            system_prompt,
-            history: Vec::new(),
         }
     }
 
     pub(crate) async fn complete_step<F>(
         &mut self,
+        messages: Vec<ChatCompletionRequestMessage>,
         tools: &[ToolSpec],
         mut on_delta: F,
     ) -> Result<ModelStep, Box<dyn Error>>
     where
         F: FnMut(&str) -> io::Result<()>,
     {
-        self.request_reply(tools, &mut on_delta).await
-    }
-
-    pub(crate) fn apply_tool_results(&mut self, text: String, results: &[(ToolCall, String)]) {
-        let calls: Vec<ToolCall> = results
-            .iter()
-            .enumerate()
-            .map(|(index, (call, _))| {
-                let mut call = call.clone();
-                if call.id.is_empty() {
-                    call.id = format!("call_{}_{index}", self.history.len());
-                }
-                call
-            })
-            .collect();
-        self.history.push(ChatCompletionRequestMessage::Assistant(
-            ChatCompletionRequestAssistantMessage {
-                content: (!text.is_empty())
-                    .then_some(ChatCompletionRequestAssistantMessageContent::Text(text)),
-                tool_calls: Some(
-                    calls
-                        .iter()
-                        .map(|call| {
-                            ChatCompletionMessageToolCalls::Function(
-                                ChatCompletionMessageToolCall {
-                                    id: call.id.clone(),
-                                    function: FunctionCall {
-                                        name: call.name.clone(),
-                                        arguments: call.args.clone(),
-                                    },
-                                },
-                            )
-                        })
-                        .collect(),
-                ),
-                ..Default::default()
-            },
-        ));
-        for (call, result) in calls.iter().zip(results.iter().map(|(_, result)| result)) {
-            self.history.push(ChatCompletionRequestMessage::Tool(
-                ChatCompletionRequestToolMessage {
-                    content: ChatCompletionRequestToolMessageContent::Text(result.clone()),
-                    tool_call_id: call.id.clone(),
-                },
-            ));
-        }
-    }
-
-    /// Chat Completions 没有 pending：出错或轮次用尽时 history 已经是最终状态。
-    #[allow(clippy::unused_self, clippy::needless_pass_by_ref_mut)]
-    pub(crate) fn commit_turn(&mut self) {}
-
-    pub(crate) fn reset(&mut self) {
-        self.history.clear();
-    }
-
-    pub(crate) fn begin_turn(&mut self, user_input: &str) {
-        self.history.push(ChatCompletionRequestMessage::User(
-            ChatCompletionRequestUserMessage {
-                content: ChatCompletionRequestUserMessageContent::Text(user_input.to_owned()),
-                name: None,
-            },
-        ));
-    }
-
-    pub(crate) fn finish_turn(&mut self, answer: String) {
-        self.history.push(ChatCompletionRequestMessage::Assistant(
-            ChatCompletionRequestAssistantMessage {
-                content: Some(ChatCompletionRequestAssistantMessageContent::Text(answer)),
-                ..Default::default()
-            },
-        ));
-    }
-
-    pub(crate) fn rollback_turn(&mut self) {
-        self.history.pop();
+        self.request_reply(messages, tools, &mut on_delta).await
     }
 
     async fn request_reply<F>(
         &self,
+        messages: Vec<ChatCompletionRequestMessage>,
         tools: &[ToolSpec],
         on_delta: &mut F,
     ) -> Result<ModelStep, Box<dyn Error>>
@@ -140,13 +58,6 @@ impl Chat {
         F: FnMut(&str) -> io::Result<()>,
     {
         let mut request = CreateChatCompletionRequestArgs::default();
-        let mut messages = vec![ChatCompletionRequestMessage::System(
-            ChatCompletionRequestSystemMessage {
-                content: self.system_prompt.clone().into(),
-                name: None,
-            },
-        )];
-        messages.extend(self.history.iter().cloned());
         request.model(self.model.clone()).messages(messages);
         if !tools.is_empty() {
             request.tools(super::chat_tools(tools));
@@ -229,6 +140,7 @@ where
                     return Ok(ModelStep {
                         text: answer,
                         calls: calls.into_values().collect(),
+                        output: Vec::new(),
                     });
                 }
                 return match reason {
@@ -236,6 +148,7 @@ where
                         Ok(ModelStep {
                             text: answer,
                             calls: Vec::new(),
+                            output: Vec::new(),
                         })
                     }
                     FinishReason::Stop | FinishReason::Length => Err(io::Error::new(
@@ -276,45 +189,7 @@ mod tests {
     use futures_util::{StreamExt, stream};
     use tokio::time::Instant;
 
-    use super::{Chat, collect_reply};
-    use crate::config::{Config, OpenAiApi};
-
-    fn test_chat() -> Chat {
-        Chat::new(
-            &Config {
-                api_key: "test-key".to_owned(),
-                model: "test-model".to_owned(),
-                base_url: "https://example.invalid/v1".to_owned(),
-                api: OpenAiApi::ChatCompletions,
-                tools_enabled: true,
-                bash_bin: "bash".into(),
-            },
-            "test prompt".to_owned(),
-        )
-    }
-
-    #[test]
-    fn completed_turns_are_kept_and_failed_turn_is_rolled_back() {
-        let mut chat = test_chat();
-        chat.begin_turn("remember this");
-        chat.finish_turn("I will remember.".to_owned());
-        assert_eq!(chat.history.len(), 2);
-
-        chat.begin_turn("this request will fail");
-        chat.rollback_turn();
-        assert_eq!(chat.history.len(), 2);
-    }
-
-    #[test]
-    fn reset_clears_all_messages() {
-        let mut chat = test_chat();
-        chat.begin_turn("hello");
-        chat.finish_turn("hi".to_owned());
-
-        chat.reset();
-
-        assert!(chat.history.is_empty());
-    }
+    use super::collect_reply;
 
     #[allow(deprecated)]
     fn chunk(

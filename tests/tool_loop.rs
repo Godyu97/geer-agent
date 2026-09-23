@@ -269,6 +269,52 @@ fn reset_keeps_system_prompt_for_both_apis() {
 }
 
 #[test]
+fn ordinary_turns_keep_history_but_commands_do_not_add_messages() {
+    for api in ["responses", "chat-completions"] {
+        let replies = if api == "responses" {
+            vec![Reply::ResponsesFinal; 2]
+        } else {
+            vec![Reply::ChatFinal; 2]
+        };
+        let (output, bodies) = run_repl(api, replies, "first\n/help\n\nsecond\n/exit\n");
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(bodies.len(), 2);
+        if api == "responses" {
+            let input = bodies[1]["input"].as_array().expect("Responses 历史");
+            assert_eq!(input.len(), 3);
+            assert_eq!(input[0]["content"], "first");
+            assert_eq!(input[1]["type"], "message");
+            assert_eq!(input[2]["content"], "second");
+        } else {
+            let messages = bodies[1]["messages"].as_array().expect("Chat 历史");
+            assert_eq!(messages.len(), 4);
+            assert_eq!(messages[0]["role"], "system");
+            assert_eq!(messages[1]["content"], "first");
+            assert_eq!(messages[2]["content"], "done");
+            assert_eq!(messages[3]["content"], "second");
+        }
+    }
+}
+
+#[test]
+fn chat_failure_before_tools_discards_failed_user_message() {
+    let (output, bodies) = run_repl(
+        "chat-completions",
+        vec![Reply::Error, Reply::ChatFinal],
+        "first\nsecond\n/exit\n",
+    );
+    assert!(output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("模型请求失败"));
+    let messages = bodies[1]["messages"].as_array().expect("Chat 消息");
+    assert_eq!(messages.len(), 2);
+    assert_eq!(messages[1]["content"], "second");
+}
+
+#[test]
 fn invalid_bash_path_fails_before_repl() {
     let output = Command::new(env!("CARGO_BIN_EXE_geer-agent"))
         .env("OPENAI_API_KEY", "test-key")

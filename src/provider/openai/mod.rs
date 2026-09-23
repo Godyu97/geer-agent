@@ -10,7 +10,7 @@ use async_openai::types::{
 
 use crate::{
     config::{Config, OpenAiApi},
-    provider::{ChatProvider, ModelStep, ToolCall, ToolSpec},
+    provider::{ChatProvider, Messages, ModelStep, ToolSpec},
 };
 
 use chat::Chat;
@@ -56,69 +56,42 @@ enum Api {
 }
 
 impl Provider {
-    pub(crate) fn new(config: &Config, system_prompt: String) -> Self {
+    pub(crate) fn new(config: &Config) -> Self {
         let api = match config.api {
-            OpenAiApi::Responses => Api::Responses(Responses::new(config, system_prompt)),
-            OpenAiApi::ChatCompletions => Api::ChatCompletions(Chat::new(config, system_prompt)),
+            OpenAiApi::Responses => Api::Responses(Responses::new(config)),
+            OpenAiApi::ChatCompletions => Api::ChatCompletions(Chat::new(config)),
         };
         Self { api }
     }
 }
 
 impl ChatProvider for Provider {
-    fn begin_turn(&mut self, user_input: &str) {
-        match &mut self.api {
-            Api::Responses(api) => api.begin_turn(user_input),
-            Api::ChatCompletions(api) => api.begin_turn(user_input),
-        }
-    }
-
     async fn complete_step<F>(
         &mut self,
+        messages: Messages,
         tools: &[ToolSpec],
         on_delta: F,
     ) -> Result<ModelStep, Box<dyn Error>>
     where
         F: FnMut(&str) -> io::Result<()>,
     {
-        match &mut self.api {
-            Api::Responses(api) => api.complete_step(tools, on_delta).await,
-            Api::ChatCompletions(api) => api.complete_step(tools, on_delta).await,
-        }
-    }
-
-    fn apply_tool_results(&mut self, text: String, results: &[(ToolCall, String)]) {
-        match &mut self.api {
-            Api::Responses(api) => api.apply_tool_results(text, results),
-            Api::ChatCompletions(api) => api.apply_tool_results(text, results),
-        }
-    }
-
-    fn finish_turn(&mut self, text: String) {
-        match &mut self.api {
-            Api::Responses(api) => api.finish_turn(text),
-            Api::ChatCompletions(api) => api.finish_turn(text),
-        }
-    }
-
-    fn commit_turn(&mut self) {
-        match &mut self.api {
-            Api::Responses(api) => api.commit_turn(),
-            Api::ChatCompletions(api) => api.commit_turn(),
-        }
-    }
-
-    fn rollback_turn(&mut self) {
-        match &mut self.api {
-            Api::Responses(api) => api.rollback_turn(),
-            Api::ChatCompletions(api) => api.rollback_turn(),
-        }
-    }
-
-    fn reset(&mut self) {
-        match &mut self.api {
-            Api::Responses(api) => api.reset(),
-            Api::ChatCompletions(api) => api.reset(),
+        match (&mut self.api, messages) {
+            (
+                Api::Responses(api),
+                Messages::Responses {
+                    instructions,
+                    input,
+                },
+            ) => {
+                api.complete_step(instructions, input, tools, on_delta)
+                    .await
+            }
+            (Api::ChatCompletions(api), Messages::Chat(messages)) => {
+                api.complete_step(messages, tools, on_delta).await
+            }
+            _ => Err(
+                io::Error::new(io::ErrorKind::InvalidInput, "模型接口与消息类型不匹配。").into(),
+            ),
         }
     }
 }

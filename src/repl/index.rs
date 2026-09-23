@@ -1,16 +1,24 @@
 use std::{error::Error, io, io::BufRead, io::Write};
 
 use super::color::Color;
+use crate::prompt::Prompt;
 
 pub(crate) trait Session {
-    async fn handle_message<F>(&mut self, message: &str, on_delta: F) -> Result<(), Box<dyn Error>>
+    async fn handle_message<F>(
+        &mut self,
+        prompt: &mut Prompt,
+        on_delta: F,
+    ) -> Result<(), Box<dyn Error>>
     where
         F: FnMut(&str) -> io::Result<()>;
 
     fn reset(&mut self);
 }
 
-pub(crate) async fn run(session: &mut impl Session) -> Result<(), Box<dyn Error>> {
+pub(crate) async fn run(
+    session: &mut impl Session,
+    prompt: &mut Prompt,
+) -> Result<(), Box<dyn Error>> {
     let color = Color::detect();
     let stdin = io::stdin();
 
@@ -40,6 +48,7 @@ pub(crate) async fn run(session: &mut impl Session) -> Result<(), Box<dyn Error>
             Input::Empty => {}
             Input::Help => print_help(),
             Input::Reset => {
+                prompt.reset();
                 session.reset();
                 println!("（已清空对话记忆）");
             }
@@ -51,6 +60,7 @@ pub(crate) async fn run(session: &mut impl Session) -> Result<(), Box<dyn Error>
                 println!("未知命令：{command}（输入 /help 查看可用命令）");
             }
             Input::Message(message) => {
+                prompt.begin_turn(&message);
                 {
                     let mut stdout = io::stdout().lock();
                     color.write_assistant_prompt(&mut stdout)?;
@@ -58,7 +68,7 @@ pub(crate) async fn run(session: &mut impl Session) -> Result<(), Box<dyn Error>
                 }
 
                 let result = session
-                    .handle_message(&message, |delta| {
+                    .handle_message(prompt, |delta| {
                         let mut stdout = io::stdout().lock();
                         if delta.starts_with("\n[调用工具") || delta.starts_with("\n[工具调用轮次")
                         {

@@ -4,6 +4,10 @@ use std::{io, path::Path, time::Duration};
 
 use tokio::{process::Command, time::timeout};
 
+mod conversation;
+
+pub(crate) use conversation::Prompt;
+
 const BASH_VERSION_TIMEOUT: Duration = Duration::from_secs(3);
 
 pub(crate) async fn load(bash_bin: &Path) -> io::Result<String> {
@@ -185,9 +189,16 @@ mod tests {
             bash_version(&path).await.expect("识别版本"),
             "GNU bash, version 9.9"
         );
-        fs::write(&path, "#!/bin/sh\nprintf 'other shell\\n'\n").expect("更新版本输出");
-        let error = bash_version(&path).await.expect_err("无法识别非 Bash 输出");
+        let invalid_path = path.with_extension("invalid");
+        fs::write(&invalid_path, "#!/bin/sh\nprintf 'other shell\\n'\n")
+            .expect("创建非 Bash 版本探测程序");
+        fs::set_permissions(&invalid_path, fs::Permissions::from_mode(0o700))
+            .expect("设置执行权限");
+        let error = bash_version(&invalid_path)
+            .await
+            .expect_err("无法识别非 Bash 输出");
         fs::remove_file(&path).expect("清理测试程序");
+        fs::remove_file(&invalid_path).expect("清理非 Bash 测试程序");
         assert!(error.to_string().contains("无法识别"));
     }
 }

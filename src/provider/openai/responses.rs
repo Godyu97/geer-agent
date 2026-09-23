@@ -6,9 +6,7 @@ use async_openai::{
     error::OpenAIError,
     middleware::ReqwestService,
     types::responses::{
-        CreateResponseArgs, EasyInputContent, EasyInputMessage, FunctionCallOutput,
-        FunctionCallOutputItemParam, InputItem, InputParam, Item, OutputItem, Response,
-        ResponseStreamEvent, Role,
+        CreateResponseArgs, InputItem, InputParam, OutputItem, Response, ResponseStreamEvent,
     },
 };
 use futures_util::{Stream, StreamExt};
@@ -26,14 +24,10 @@ const RETRY_DELAY: Duration = Duration::from_millis(200);
 pub(super) struct Responses {
     client: Client<OpenAIConfig>,
     model: String,
-    system_prompt: String,
-    history: Vec<InputItem>,
-    pending: Vec<InputItem>,
-    last_output: Vec<OutputItem>,
 }
 
 impl Responses {
-    pub(super) fn new(config: &Config, system_prompt: String) -> Self {
+    pub(super) fn new(config: &Config) -> Self {
         let client_config = OpenAIConfig::new()
             .with_api_key(config.api_key.clone())
             .with_api_base(config.base_url.clone());
@@ -42,33 +36,22 @@ impl Responses {
             // SDK 默认会静默重试；这里由外层循环控制次数并显示进度。
             client: Client::with_config(client_config).with_http_service(ReqwestService::default()),
             model: config.model.clone(),
-            system_prompt,
-            history: Vec::new(),
-            pending: Vec::new(),
-            last_output: Vec::new(),
         }
-    }
-
-    pub(super) fn begin_turn(&mut self, user_input: &str) {
-        self.pending = vec![InputItem::EasyMessage(EasyInputMessage {
-            role: Role::User,
-            content: EasyInputContent::Text(user_input.to_owned()),
-            ..Default::default()
-        })];
-        self.last_output.clear();
     }
 
     pub(super) async fn complete_step<F>(
         &mut self,
+        instructions: String,
+        input: Vec<InputItem>,
         tools: &[ToolSpec],
         mut on_delta: F,
     ) -> Result<ModelStep, Box<dyn Error>>
     where
         F: FnMut(&str) -> io::Result<()>,
     {
-        let mut input = self.history.clone();
-        input.extend(self.pending.iter().cloned());
-        let response = self.request_reply(input, tools, &mut on_delta).await?;
+        let response = self
+            .request_reply(instructions, input, tools, &mut on_delta)
+            .await?;
         let calls: Vec<ToolCall> = response
             .output
             .iter()
@@ -91,44 +74,16 @@ impl Responses {
             )
             .into());
         }
-        self.last_output = response.output;
         Ok(ModelStep {
             text: String::new(),
             calls,
+            output: response.output,
         })
-    }
-
-    pub(super) fn apply_tool_results(&mut self, _text: String, results: &[(ToolCall, String)]) {
-        self.pending
-            .extend(self.last_output.drain(..).map(Into::into));
-        for (call, output) in results {
-            self.pending.push(InputItem::Item(Item::FunctionCallOutput(
-                FunctionCallOutputItemParam {
-                    call_id: Some(call.id.clone()),
-                    output: FunctionCallOutput::Text(output.clone()),
-                    id: None,
-                    status: None,
-                    name: None,
-                    namespace: None,
-                    caller: None,
-                },
-            )));
-        }
-    }
-
-    pub(super) fn finish_turn(&mut self, _text: String) {
-        self.pending
-            .extend(self.last_output.drain(..).map(Into::into));
-        self.commit_turn();
-    }
-
-    pub(super) fn rollback_turn(&mut self) {
-        self.pending.clear();
-        self.last_output.clear();
     }
 
     async fn request_reply<F>(
         &self,
+        instructions: String,
         input: Vec<InputItem>,
         tools: &[ToolSpec],
         on_delta: &mut F,
@@ -140,7 +95,7 @@ impl Responses {
         builder
             .model(self.model.clone())
             .input(InputParam::Items(input))
-            .instructions(self.system_prompt.clone());
+            .instructions(instructions);
         if !tools.is_empty() {
             builder.tools(super::response_tools(tools));
         }
@@ -180,17 +135,6 @@ impl Responses {
                 }
             }
         }
-    }
-
-    pub(super) fn commit_turn(&mut self) {
-        self.history.extend(std::mem::take(&mut self.pending));
-        self.last_output.clear();
-    }
-
-    pub(super) fn reset(&mut self) {
-        self.history.clear();
-        self.pending.clear();
-        self.last_output.clear();
     }
 }
 
@@ -281,22 +225,7 @@ mod tests {
     };
     use futures_util::{StreamExt, stream};
 
-    use super::{Responses, collect_reply};
-    use crate::config::{Config, OpenAiApi};
-
-    fn test_provider() -> Responses {
-        Responses::new(
-            &Config {
-                api_key: "test-key".to_owned(),
-                model: "test-model".to_owned(),
-                base_url: "https://example.invalid/v1".to_owned(),
-                api: OpenAiApi::Responses,
-                tools_enabled: true,
-                bash_bin: "bash".into(),
-            },
-            "test prompt".to_owned(),
-        )
-    }
+    use super::collect_reply;
 
     fn delta(text: &str) -> ResponseStreamEvent {
         ResponseStreamEvent::ResponseOutputTextDelta(ResponseTextDeltaEvent {
@@ -460,17 +389,5 @@ mod tests {
             error.downcast_ref::<io::Error>().map(io::Error::kind),
             Some(io::ErrorKind::TimedOut)
         );
-    }
-
-    #[test]
-    fn completed_history_is_committed_and_reset_clears_it() {
-        let mut provider = test_provider();
-        provider.begin_turn("hello");
-        provider.last_output = response("hi").output;
-        provider.finish_turn(String::new());
-        assert_eq!(provider.history.len(), 2);
-        provider.reset();
-        assert!(provider.history.is_empty());
-        assert!(provider.pending.is_empty());
     }
 }

@@ -4,7 +4,7 @@ use std::{error::Error, io};
 
 use crate::{
     config::Config,
-    prompt,
+    prompt::{self, Prompt},
     provider::{ChatProvider, ToolSpec, openai::Provider},
     repl::{self, Session},
     tools::Tools,
@@ -15,11 +15,12 @@ const MAX_TOOL_ROUNDS: usize = 5;
 pub(crate) async fn run() -> Result<(), Box<dyn Error>> {
     let config = Config::load()?;
     let system_prompt = prompt::load(&config.bash_bin).await?;
+    let mut prompt = Prompt::new(config.api, system_prompt);
     let mut agent = Agent {
-        chat: Provider::new(&config, system_prompt),
+        chat: Provider::new(&config),
         tools: Tools::new(config.tools_enabled, config.bash_bin.clone())?,
     };
-    repl::run(&mut agent).await
+    repl::run(&mut agent, &mut prompt).await
 }
 
 struct Agent {
@@ -30,17 +31,16 @@ struct Agent {
 impl Session for Agent {
     async fn handle_message<F>(
         &mut self,
-        message: &str,
+        prompt: &mut Prompt,
         mut on_delta: F,
     ) -> Result<(), Box<dyn Error>>
     where
         F: FnMut(&str) -> io::Result<()>,
     {
-        run_tool_loop(&mut self.chat, &mut self.tools, message, &mut on_delta).await
+        run_tool_loop(&mut self.chat, &mut self.tools, prompt, &mut on_delta).await
     }
 
     fn reset(&mut self) {
-        self.chat.reset();
         self.tools.reset();
     }
 }
@@ -60,45 +60,47 @@ fn tool_specs(tools: &Tools) -> Vec<ToolSpec> {
 async fn run_tool_loop<P, F>(
     chat: &mut P,
     tools: &mut Tools,
-    message: &str,
+    prompt: &mut Prompt,
     on_delta: &mut F,
 ) -> Result<(), Box<dyn Error>>
 where
     P: ChatProvider,
     F: FnMut(&str) -> io::Result<()>,
 {
-    chat.begin_turn(message);
     let specs = tool_specs(tools);
     let mut used_tools = false;
     for round in 0..=MAX_TOOL_ROUNDS {
-        let step = match chat.complete_step(&specs, &mut *on_delta).await {
+        let step = match chat
+            .complete_step(prompt.messages(), &specs, &mut *on_delta)
+            .await
+        {
             Ok(step) => step,
             Err(error) => {
                 if used_tools {
-                    chat.commit_turn();
+                    prompt.commit_turn();
                 } else {
-                    chat.rollback_turn();
+                    prompt.rollback_turn();
                 }
                 return Err(error);
             }
         };
         if step.calls.is_empty() {
-            chat.finish_turn(step.text);
+            prompt.finish_turn(step);
             return Ok(());
         }
         if round == MAX_TOOL_ROUNDS {
             on_delta("\n[工具调用轮次过多，已停止]\n")?;
-            chat.commit_turn();
+            prompt.commit_turn();
             return Ok(());
         }
         used_tools = true;
         let mut results = Vec::new();
-        for call in step.calls {
+        for call in &step.calls {
             on_delta(&format!("\n[调用工具 {}]\n", call.name))?;
             let output = tools.execute(&call.name, &call.args).await;
-            results.push((call, output));
+            results.push((call.clone(), output));
         }
-        chat.apply_tool_results(step.text, &results);
+        prompt.apply_tool_results(step, &results);
     }
     unreachable!("工具轮次循环已覆盖所有出口")
 }
@@ -109,54 +111,36 @@ mod tests {
 
     use super::{MAX_TOOL_ROUNDS, run_tool_loop};
     use crate::{
-        provider::{ChatProvider, ModelStep, ToolCall, ToolSpec},
+        config::OpenAiApi,
+        prompt::Prompt,
+        provider::{ChatProvider, Messages, ModelStep, ToolCall, ToolSpec},
         tools::Tools,
     };
 
     struct FakeProvider {
         steps: VecDeque<Result<ModelStep, String>>,
-        events: Vec<String>,
+        snapshots: Vec<serde_json::Value>,
     }
 
     impl ChatProvider for FakeProvider {
-        fn begin_turn(&mut self, user_input: &str) {
-            self.events.push(format!("begin:{user_input}"));
-        }
-
         async fn complete_step<F>(
             &mut self,
+            messages: Messages,
             _tools: &[ToolSpec],
             _on_delta: F,
         ) -> Result<ModelStep, Box<dyn Error>>
         where
             F: FnMut(&str) -> io::Result<()>,
         {
-            self.events.push("complete".to_owned());
+            let Messages::Chat(messages) = messages else {
+                panic!("测试只使用 Chat 消息");
+            };
+            self.snapshots.push(serde_json::to_value(messages)?);
             match self.steps.pop_front() {
                 Some(Ok(step)) => Ok(step),
                 Some(Err(error)) => Err(error.into()),
                 None => panic!("没有更多模型步骤"),
             }
-        }
-
-        fn apply_tool_results(&mut self, _text: String, results: &[(ToolCall, String)]) {
-            self.events.push(format!("apply:{}", results.len()));
-        }
-
-        fn finish_turn(&mut self, text: String) {
-            self.events.push(format!("finish:{text}"));
-        }
-
-        fn commit_turn(&mut self) {
-            self.events.push("commit".to_owned());
-        }
-
-        fn rollback_turn(&mut self) {
-            self.events.push("rollback".to_owned());
-        }
-
-        fn reset(&mut self) {
-            self.events.push("reset".to_owned());
         }
     }
 
@@ -168,6 +152,7 @@ mod tests {
                 name: "get_current_time".to_owned(),
                 args: "{}".to_owned(),
             }],
+            output: Vec::new(),
         }
     }
 
@@ -175,13 +160,20 @@ mod tests {
         ModelStep {
             text: text.to_owned(),
             calls: Vec::new(),
+            output: Vec::new(),
         }
     }
 
-    async fn run(chat: &mut FakeProvider) -> Result<String, Box<dyn Error>> {
+    fn prompt() -> Prompt {
+        let mut prompt = Prompt::new(OpenAiApi::ChatCompletions, "system".to_owned());
+        prompt.begin_turn("现在几点");
+        prompt
+    }
+
+    async fn run(chat: &mut FakeProvider, prompt: &mut Prompt) -> Result<String, Box<dyn Error>> {
         let mut tools = Tools::new(true, "bash".into()).expect("工作目录存在");
         let mut printed = String::new();
-        run_tool_loop(chat, &mut tools, "现在几点", &mut |delta| {
+        run_tool_loop(chat, &mut tools, prompt, &mut |delta| {
             printed.push_str(delta);
             Ok(())
         })
@@ -189,85 +181,67 @@ mod tests {
         Ok(printed)
     }
 
+    fn fake(steps: Vec<Result<ModelStep, String>>) -> FakeProvider {
+        FakeProvider {
+            steps: steps.into(),
+            snapshots: Vec::new(),
+        }
+    }
+
     #[tokio::test]
-    async fn text_only_finishes_without_commit_or_rollback() {
-        let mut chat = FakeProvider {
-            steps: VecDeque::from([Ok(text_step("hi"))]),
-            events: Vec::new(),
+    async fn text_only_finishes_and_next_turn_sees_answer() {
+        let mut chat = fake(vec![Ok(text_step("hi"))]);
+        let mut prompt = prompt();
+        run(&mut chat, &mut prompt).await.expect("纯文本应成功");
+        let Messages::Chat(messages) = prompt.messages() else {
+            panic!("Chat 消息")
         };
-        let printed = run(&mut chat).await.expect("纯文本应成功");
-        assert_eq!(printed, "");
-        assert_eq!(chat.events, ["begin:现在几点", "complete", "finish:hi"]);
+        assert_eq!(messages.len(), 3);
+        assert_eq!(chat.snapshots[0].as_array().expect("消息").len(), 2);
     }
 
     #[tokio::test]
     async fn one_tool_round_then_text() {
-        let mut chat = FakeProvider {
-            steps: VecDeque::from([Ok(tool_step()), Ok(text_step("晚上八点"))]),
-            events: Vec::new(),
-        };
-        let printed = run(&mut chat).await.expect("一轮工具应成功");
+        let mut chat = fake(vec![Ok(tool_step()), Ok(text_step("晚上八点"))]);
+        let mut prompt = prompt();
+        let printed = run(&mut chat, &mut prompt).await.expect("一轮工具应成功");
         assert!(printed.contains("[调用工具 get_current_time]"));
-        assert_eq!(
-            chat.events,
-            [
-                "begin:现在几点",
-                "complete",
-                "apply:1",
-                "complete",
-                "finish:晚上八点"
-            ]
-        );
+        let messages = chat.snapshots[1].as_array().expect("第二次请求");
+        assert_eq!(messages[2]["tool_calls"][0]["id"], "call_1");
+        assert_eq!(messages[3]["tool_call_id"], "call_1");
     }
 
     #[tokio::test]
     async fn max_tool_rounds_commits_without_applying_last_calls() {
-        let mut steps = VecDeque::new();
-        for _ in 0..=MAX_TOOL_ROUNDS {
-            steps.push_back(Ok(tool_step()));
-        }
-        let mut chat = FakeProvider {
-            steps,
-            events: Vec::new(),
-        };
-        let printed = run(&mut chat).await.expect("轮次用尽应停止");
+        let mut chat = fake((0..=MAX_TOOL_ROUNDS).map(|_| Ok(tool_step())).collect());
+        let mut prompt = prompt();
+        let printed = run(&mut chat, &mut prompt).await.expect("轮次用尽应停止");
         assert!(printed.contains("工具调用轮次过多"));
-        let apply_count = chat
-            .events
-            .iter()
-            .filter(|event| *event == "apply:1")
-            .count();
-        assert_eq!(apply_count, MAX_TOOL_ROUNDS);
-        assert_eq!(chat.events.last().map(String::as_str), Some("commit"));
+        let Messages::Chat(messages) = prompt.messages() else {
+            panic!("Chat 消息")
+        };
+        assert_eq!(messages.len(), 2 + MAX_TOOL_ROUNDS * 2);
     }
 
     #[tokio::test]
     async fn error_before_tools_rolls_back() {
-        let mut chat = FakeProvider {
-            steps: VecDeque::from([Err("boom".to_owned())]),
-            events: Vec::new(),
+        let mut chat = fake(vec![Err("boom".to_owned())]);
+        let mut prompt = prompt();
+        run(&mut chat, &mut prompt).await.expect_err("应失败");
+        let Messages::Chat(messages) = prompt.messages() else {
+            panic!("Chat 消息")
         };
-        let mut tools = Tools::new(true, "bash".into()).expect("工作目录存在");
-        let error = run_tool_loop(&mut chat, &mut tools, "hi", &mut |_| Ok(()))
-            .await
-            .expect_err("应失败");
-        assert!(error.to_string().contains("boom"));
-        assert_eq!(chat.events, ["begin:hi", "complete", "rollback"]);
+        assert_eq!(messages.len(), 1);
     }
 
     #[tokio::test]
-    async fn error_after_tools_commits() {
-        let mut chat = FakeProvider {
-            steps: VecDeque::from([Ok(tool_step()), Err("boom".to_owned())]),
-            events: Vec::new(),
+    async fn error_after_tools_keeps_pairs() {
+        let mut chat = fake(vec![Ok(tool_step()), Err("boom".to_owned())]);
+        let mut prompt = prompt();
+        run(&mut chat, &mut prompt).await.expect_err("应失败");
+        let Messages::Chat(messages) = prompt.messages() else {
+            panic!("Chat 消息")
         };
-        let mut tools = Tools::new(true, "bash".into()).expect("工作目录存在");
-        run_tool_loop(&mut chat, &mut tools, "hi", &mut |_| Ok(()))
-            .await
-            .expect_err("应失败");
-        assert_eq!(
-            chat.events,
-            ["begin:hi", "complete", "apply:1", "complete", "commit"]
-        );
+        assert_eq!(messages.len(), 4);
     }
 }
