@@ -12,7 +12,12 @@ const BASH_VERSION_TIMEOUT: Duration = Duration::from_secs(3);
 
 pub(crate) async fn load(bash_bin: &Path) -> io::Result<String> {
     let bash_version = bash_version(bash_bin).await?;
-    Ok(compose(&system_version().await, &bash_version))
+    let current_dir = std::env::current_dir()?;
+    Ok(compose(
+        &system_version().await,
+        &bash_version,
+        &current_dir.display().to_string(),
+    ))
 }
 
 async fn bash_version(bash_bin: &Path) -> io::Result<String> {
@@ -119,11 +124,12 @@ fn format_system_version(os: &str, release: &str, kernel: &str) -> String {
     }
 }
 
-fn compose(system: &str, bash: &str) -> String {
+fn compose(system: &str, bash: &str, current_dir: &str) -> String {
     format!(
-        "你是本机运行的助手。回答和建议的命令应参考以下环境信息。\n<context_data>\nsystem_version: {}\nbash_version: {}\n</context_data>",
+        "你是本机运行的助手。回答和建议的命令应参考以下环境信息。\n<context_data>\nsystem_version: {}\nbash_version: {}\ncurrent_dir: {}\n</context_data>",
         escape_xml(system),
-        escape_xml(bash)
+        escape_xml(bash),
+        escape_xml(current_dir),
     )
 }
 
@@ -155,10 +161,11 @@ mod tests {
             parse_pretty_name("NAME=Fedora\nPRETTY_NAME=\"Fedora Linux 44\"\n"),
             Some("Fedora Linux 44".to_owned())
         );
-        let prompt = compose("Linux <test>", "GNU bash, version 5.3");
+        let prompt = compose("Linux <test>", "GNU bash, version 5.3", "/workspace/test");
         assert!(prompt.contains("<context_data>"));
         assert!(prompt.contains("Linux &lt;test&gt;"));
         assert!(prompt.contains("bash_version: GNU bash, version 5.3"));
+        assert!(prompt.contains("current_dir: /workspace/test"));
     }
 
     #[tokio::test]
