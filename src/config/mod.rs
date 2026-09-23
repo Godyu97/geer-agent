@@ -1,3 +1,5 @@
+//! 配置层：可被任意业务模块引用。本模块不依赖其它业务模块。
+
 use std::{error::Error, io, path::Path};
 
 const DEFAULT_BASE_URL: &str = "https://api.openai.com/v1";
@@ -16,6 +18,7 @@ pub(crate) struct Config {
     pub(crate) model: String,
     pub(crate) base_url: String,
     pub(crate) api: OpenAiApi,
+    pub(crate) tools_enabled: bool,
 }
 
 impl Config {
@@ -32,6 +35,7 @@ impl Config {
             std::env::var("OPENAI_MODEL").ok(),
             std::env::var("OPENAI_BASE_URL").ok(),
             std::env::var("OPENAI_API").ok(),
+            std::env::var("GEER_AGENT_TOOLS").ok(),
         )
         .map_err(|message| io::Error::new(io::ErrorKind::InvalidInput, message).into())
     }
@@ -41,6 +45,7 @@ impl Config {
         model: Option<String>,
         base_url: Option<String>,
         api: Option<String>,
+        tools_enabled: Option<String>,
     ) -> Result<Self, String> {
         let api_key = required_value(api_key, "OPENAI_API_KEY")?;
         let model = required_value(model, "OPENAI_MODEL")?;
@@ -58,11 +63,22 @@ impl Config {
             }
         };
 
+        let tools_enabled = match tools_enabled.as_deref().map(str::trim) {
+            None | Some("") | Some("on") => true,
+            Some("off") => false,
+            Some(other) => {
+                return Err(format!(
+                    "不支持的 GEER_AGENT_TOOLS 值：{other}。可选 on 或 off。"
+                ));
+            }
+        };
+
         Ok(Self {
             api_key,
             model,
             base_url,
             api,
+            tools_enabled,
         })
     }
 }
@@ -80,7 +96,7 @@ mod tests {
 
     #[test]
     fn rejects_missing_api_key() {
-        let error = Config::from_values(None, Some("gpt-test".to_owned()), None, None)
+        let error = Config::from_values(None, Some("gpt-test".to_owned()), None, None, None)
             .expect_err("缺少 key 时应报错");
 
         assert!(error.contains("OPENAI_API_KEY"));
@@ -88,7 +104,7 @@ mod tests {
 
     #[test]
     fn rejects_missing_model() {
-        let error = Config::from_values(Some("secret".to_owned()), None, None, None)
+        let error = Config::from_values(Some("secret".to_owned()), None, None, None, None)
             .expect_err("缺少 model 时应报错");
 
         assert!(error.contains("OPENAI_MODEL"));
@@ -101,6 +117,7 @@ mod tests {
             Some(" gpt-test ".to_owned()),
             Some("  ".to_owned()),
             None,
+            None,
         )
         .expect("key 与 model 已提供");
 
@@ -108,6 +125,7 @@ mod tests {
         assert_eq!(config.model, "gpt-test");
         assert_eq!(config.base_url, DEFAULT_BASE_URL);
         assert_eq!(config.api, OpenAiApi::Responses);
+        assert!(config.tools_enabled);
     }
 
     #[test]
@@ -117,11 +135,13 @@ mod tests {
             Some("gpt-test".to_owned()),
             Some("https://proxy.example/v1".to_owned()),
             Some("chat-completions".to_owned()),
+            Some("off".to_owned()),
         )
         .expect("自定义 endpoint 应被接受");
 
         assert_eq!(config.base_url, "https://proxy.example/v1");
         assert_eq!(config.api, OpenAiApi::ChatCompletions);
+        assert!(!config.tools_enabled);
     }
 
     #[test]
@@ -131,6 +151,7 @@ mod tests {
             Some("gpt-test".to_owned()),
             None,
             Some("other".to_owned()),
+            None,
         )
         .expect_err("未知接口应在进入 REPL 前报错");
         assert!(error.contains("OPENAI_API"));

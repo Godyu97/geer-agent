@@ -86,6 +86,7 @@ cargo clippy --all-targets --all-features
 
 - Edition 2024；工具链以本机 `rustc`/`cargo` 为准，不要无故加 `rust-toolchain.toml`。
 - 二进制 crate，入口 `src/main.rs`。模块按能力增长：`src/<module>.rs` 或 `src/<module>/mod.rs`，不要一上来铺 `domain/application/infrastructure`。
+- 模块依赖只允许向下：`config` 可被所有模块引用；`provider` 可被 `repl` / `agent` 引用，且不引用 `tools`；`repl` 是无工具的交互基底，不引用 `tools` / `agent`；`tools` 不引用 `provider` / `repl` / `agent`；`agent` 是带工具的 REPL，可引用 `repl`、`tools` 与 `provider`。入口 `main` 只启动 `agent`。
 - 标识符英文；注释只写「为什么」和 Rust 初学者不容易看出来的所有权/生命周期/错误处理选择，用中文。
 - 库路径与可失败逻辑用 `Result`/`Option`。`unwrap`/`expect` 仅限「这是 bug」或测试。禁止 `unsafe`。
 - 优先标准库。新 crate 必须能回答「std 为什么不够」。异步、流式输出、HTTP 客户端等在对应 change 的 design 里论证后再加。

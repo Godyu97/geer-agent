@@ -1,17 +1,18 @@
 use std::{error::Error, io, io::BufRead, io::Write};
 
 use super::color::Color;
-use crate::{
-    config::Config,
-    provider::{ChatProvider, openai::Provider},
-};
 
-pub(crate) async fn run() -> Result<(), Box<dyn Error>> {
-    let config = Config::load()?;
-    let mut chat = Provider::new(&config);
+pub(crate) trait Session {
+    async fn handle_message<F>(&mut self, message: &str, on_delta: F) -> Result<(), Box<dyn Error>>
+    where
+        F: FnMut(&str) -> io::Result<()>;
+
+    fn reset(&mut self);
+}
+
+pub(crate) async fn run(session: &mut impl Session) -> Result<(), Box<dyn Error>> {
     let color = Color::detect();
     let stdin = io::stdin();
-    let mut stdin = stdin.lock();
 
     println!("GeekAgent —— 最简单的 Agent");
     println!("输入 /help 查看命令。\n");
@@ -23,7 +24,7 @@ pub(crate) async fn run() -> Result<(), Box<dyn Error>> {
             stdout.flush()?;
         }
 
-        let line = match read_input_line(&mut stdin)? {
+        let line = match read_input_line(&mut stdin.lock())? {
             InputLine::Line(line) => line,
             InputLine::InvalidUtf8 => {
                 eprintln!("输入包含无效 UTF-8，请重新输入。");
@@ -39,7 +40,7 @@ pub(crate) async fn run() -> Result<(), Box<dyn Error>> {
             Input::Empty => {}
             Input::Help => print_help(),
             Input::Reset => {
-                chat.reset();
+                session.reset();
                 println!("（已清空对话记忆）");
             }
             Input::Exit => {
@@ -56,10 +57,15 @@ pub(crate) async fn run() -> Result<(), Box<dyn Error>> {
                     stdout.flush()?;
                 }
 
-                let result = chat
-                    .stream_reply(&message, |delta| {
+                let result = session
+                    .handle_message(&message, |delta| {
                         let mut stdout = io::stdout().lock();
-                        color.write_assistant_delta(&mut stdout, delta)?;
+                        if delta.starts_with("\n[调用工具") || delta.starts_with("\n[工具调用轮次")
+                        {
+                            color.write_tool_delta(&mut stdout, delta)?;
+                        } else {
+                            color.write_assistant_delta(&mut stdout, delta)?;
+                        }
                         stdout.flush()
                     })
                     .await;
