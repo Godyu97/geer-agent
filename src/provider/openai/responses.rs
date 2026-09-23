@@ -14,7 +14,7 @@ use tokio::time::{Instant, sleep, timeout, timeout_at};
 
 use crate::{
     config::Config,
-    provider::{ModelStep, ToolCall, ToolSpec},
+    provider::{ModelStep, TokenUsage, ToolCall, ToolSpec},
 };
 
 const REPLY_IDLE_TIMEOUT: Duration = Duration::from_secs(90);
@@ -77,6 +77,10 @@ impl Responses {
         Ok(ModelStep {
             text: String::new(),
             calls,
+            usage: response.usage.as_ref().map(|usage| TokenUsage {
+                input: u64::from(usage.input_tokens),
+                output: u64::from(usage.output_tokens),
+            }),
             output: response.output,
         })
     }
@@ -215,6 +219,7 @@ fn timeout_error() -> io::Error {
 mod tests {
     use std::{io, time::Duration};
 
+    use async_openai::types::responses::{InputTokenDetails, OutputTokenDetails, ResponseUsage};
     use async_openai::{
         error::OpenAIError,
         types::responses::{
@@ -340,6 +345,36 @@ mod tests {
         .expect("完成事件应结束流");
 
         assert_eq!(printed, "hello");
+    }
+
+    #[tokio::test]
+    async fn completed_response_carries_token_usage() {
+        let mut completed = response("done");
+        completed.usage = Some(ResponseUsage {
+            input_tokens: 31,
+            input_tokens_details: InputTokenDetails {
+                cached_tokens: 0,
+                cache_write_tokens: None,
+            },
+            output_tokens: 9,
+            output_tokens_details: OutputTokenDetails {
+                reasoning_tokens: 0,
+            },
+            total_tokens: 40,
+        });
+        let event = ResponseStreamEvent::ResponseCompleted(ResponseCompletedEvent {
+            sequence_number: 2,
+            response: completed,
+        });
+        let result = collect_reply(
+            stream::iter([Ok(delta("done")), Ok(event)]),
+            &mut |_| Ok(()),
+            Duration::from_secs(1),
+        )
+        .await
+        .expect("完成响应");
+        let usage = result.usage.expect("应有用量");
+        assert_eq!((usage.input_tokens, usage.output_tokens), (31, 9));
     }
 
     #[tokio::test]

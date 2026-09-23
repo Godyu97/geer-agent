@@ -36,6 +36,13 @@ pub(crate) struct ModelStep {
     pub text: String,
     pub calls: Vec<ToolCall>,
     pub output: Vec<OutputItem>,
+    pub usage: Option<TokenUsage>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct TokenUsage {
+    pub input: u64,
+    pub output: u64,
 }
 
 /// 单步对话：工具循环由 `agent` 编排。

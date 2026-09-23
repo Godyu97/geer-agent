@@ -11,19 +11,31 @@ const COMMAND_TIMEOUT: Duration = Duration::from_secs(10);
 const MAX_CAPTURE_BYTES: usize = 8 * 1024;
 const MAX_RESULT_CHARS: usize = 2000;
 
-pub(super) async fn run(bash_bin: &Path, cwd: &Path, command: &str) -> String {
-    match run_with_timeout(bash_bin, cwd, command, COMMAND_TIMEOUT).await {
-        Ok(text) => text,
-        Err(error) => format!("Bash 执行失败：{error}"),
+pub(super) async fn run_with_status(bash_bin: &Path, cwd: &Path, command: &str) -> (String, bool) {
+    match run_with_timeout_status(bash_bin, cwd, command, COMMAND_TIMEOUT).await {
+        Ok(result) => result,
+        Err(error) => (format!("Bash 执行失败：{error}"), false),
     }
 }
 
+#[cfg(test)]
 async fn run_with_timeout(
     bash_bin: &Path,
     cwd: &Path,
     command: &str,
     limit: Duration,
 ) -> io::Result<String> {
+    run_with_timeout_status(bash_bin, cwd, command, limit)
+        .await
+        .map(|(text, _)| text)
+}
+
+async fn run_with_timeout_status(
+    bash_bin: &Path,
+    cwd: &Path,
+    command: &str,
+    limit: Duration,
+) -> io::Result<(String, bool)> {
     let mut child = Command::new(bash_bin)
         .arg("-c")
         .arg(command)
@@ -53,6 +65,7 @@ async fn run_with_timeout(
     };
     let stdout = join_capture(&mut stdout_task).await?;
     let stderr = join_capture(&mut stderr_task).await?;
+    let success = status.is_some_and(|status| status.success());
     let mut result = if let Some(status) = status {
         format!(
             "退出状态：{}\n",
@@ -73,7 +86,7 @@ async fn run_with_timeout(
     if stdout.truncated || stderr.truncated {
         result.push_str("\n[输出已截断]");
     }
-    Ok(truncate_chars(result, MAX_RESULT_CHARS))
+    Ok((truncate_chars(result, MAX_RESULT_CHARS), success))
 }
 
 struct Capture {

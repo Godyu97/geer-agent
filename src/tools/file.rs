@@ -56,13 +56,12 @@ impl Operation {
         }
     }
 
-    pub(super) fn run(self, path: &Path) -> String {
-        let result = match self {
+    pub(super) fn run_checked(self, path: &Path) -> Result<String, String> {
+        match self {
             Self::Read { offset, limit } => read(path, offset, limit),
             Self::Write { content } => write(path, &content),
             Self::Edit { edits } => edit(path, &edits),
-        };
-        result.unwrap_or_else(|error| format!("文件工具失败：{error}"))
+        }
     }
 }
 

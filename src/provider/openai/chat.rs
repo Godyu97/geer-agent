@@ -5,7 +5,7 @@ use async_openai::{
     config::OpenAIConfig,
     error::OpenAIError,
     types::chat::{
-        ChatCompletionRequestMessage, CreateChatCompletionRequestArgs,
+        ChatCompletionRequestMessage, ChatCompletionStreamOptions, CreateChatCompletionRequestArgs,
         CreateChatCompletionStreamResponse, FinishReason,
     },
 };
@@ -14,7 +14,7 @@ use tokio::time::{Instant, timeout_at};
 
 use crate::{
     config::Config,
-    provider::{ModelStep, ToolCall, ToolSpec},
+    provider::{ModelStep, TokenUsage, ToolCall, ToolSpec},
 };
 
 const REPLY_IDLE_TIMEOUT: Duration = Duration::from_secs(90);
@@ -58,7 +58,13 @@ impl Chat {
         F: FnMut(&str) -> io::Result<()>,
     {
         let mut request = CreateChatCompletionRequestArgs::default();
-        request.model(self.model.clone()).messages(messages);
+        request
+            .model(self.model.clone())
+            .messages(messages)
+            .stream_options(ChatCompletionStreamOptions {
+                include_usage: Some(true),
+                include_obfuscation: None,
+            });
         if !tools.is_empty() {
             request.tools(super::chat_tools(tools));
         }
@@ -93,6 +99,10 @@ where
                 io::Error::new(io::ErrorKind::UnexpectedEof, "模型响应未完成便断开。")
             })??;
 
+        let chunk_usage = chunk.usage.map(|usage| TokenUsage {
+            input: u64::from(usage.prompt_tokens),
+            output: u64::from(usage.completion_tokens),
+        });
         for choice in chunk.choices {
             if choice.index != 0 {
                 continue;
@@ -141,6 +151,10 @@ where
                         text: answer,
                         calls: calls.into_values().collect(),
                         output: Vec::new(),
+                        usage: match chunk_usage {
+                            Some(usage) => Some(usage),
+                            None => tail_usage(&mut stream).await,
+                        },
                     });
                 }
                 return match reason {
@@ -149,6 +163,10 @@ where
                             text: answer,
                             calls: Vec::new(),
                             output: Vec::new(),
+                            usage: match chunk_usage {
+                                Some(usage) => Some(usage),
+                                None => tail_usage(&mut stream).await,
+                            },
                         })
                     }
                     FinishReason::Stop | FinishReason::Length => Err(io::Error::new(
@@ -163,6 +181,24 @@ where
                     .into()),
                 };
             }
+        }
+    }
+}
+
+async fn tail_usage<S>(stream: &mut S) -> Option<TokenUsage>
+where
+    S: Stream<Item = Result<CreateChatCompletionStreamResponse, OpenAIError>> + Unpin,
+{
+    // 兼容接口可能不发尾包；等待有界，避免正文结束后卡住 REPL。
+    let deadline = Instant::now() + Duration::from_millis(200);
+    loop {
+        let next = timeout_at(deadline, stream.next()).await.ok()??;
+        let chunk = next.ok()?;
+        if let Some(usage) = chunk.usage {
+            return Some(TokenUsage {
+                input: u64::from(usage.prompt_tokens),
+                output: u64::from(usage.completion_tokens),
+            });
         }
     }
 }
@@ -182,8 +218,8 @@ mod tests {
         error::OpenAIError,
         types::chat::{
             ChatChoiceStream, ChatCompletionMessageToolCallChunk,
-            ChatCompletionStreamResponseDelta, CreateChatCompletionStreamResponse, FinishReason,
-            FunctionCallStream,
+            ChatCompletionStreamResponseDelta, CompletionUsage, CreateChatCompletionStreamResponse,
+            FinishReason, FunctionCallStream,
         },
     };
     use futures_util::{StreamExt, stream};
@@ -335,6 +371,39 @@ mod tests {
 
         assert_eq!(answer.text, "hello");
         assert_eq!(output, "hello");
+        assert_eq!(answer.usage, None);
+    }
+
+    #[tokio::test]
+    async fn reads_usage_after_finish_reason() {
+        let mut usage_chunk = chunk(None, None);
+        usage_chunk.choices.clear();
+        usage_chunk.usage = Some(CompletionUsage {
+            prompt_tokens: 21,
+            completion_tokens: 8,
+            total_tokens: 29,
+            prompt_tokens_details: None,
+            completion_tokens_details: None,
+        });
+        let events = stream::iter([
+            Ok(chunk(Some("done"), Some(FinishReason::Stop))),
+            Ok(usage_chunk),
+        ]);
+        let step = collect_reply(
+            events,
+            &mut |_| Ok(()),
+            Duration::from_secs(1),
+            Instant::now() + Duration::from_secs(1),
+        )
+        .await
+        .expect("读取用量尾包");
+        assert_eq!(
+            step.usage,
+            Some(crate::provider::TokenUsage {
+                input: 21,
+                output: 8
+            })
+        );
     }
 
     #[tokio::test]

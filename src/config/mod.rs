@@ -4,9 +4,19 @@ use std::{
     error::Error,
     io,
     path::{Path, PathBuf},
+    time::Duration,
 };
 
 const DEFAULT_BASE_URL: &str = "https://api.openai.com/v1";
+const DEFAULT_MAX_DURATION: Duration = Duration::from_secs(600);
+pub(crate) const DEFAULT_RESOURCE_LIMITS: ResourceLimits = ResourceLimits {
+    max_input_tokens: None,
+    max_output_tokens: None,
+    max_cost_usd: None,
+    input_usd_per_million: None,
+    output_usd_per_million: None,
+    max_duration: DEFAULT_MAX_DURATION,
+};
 #[cfg(feature = "embed-env")]
 const EMBEDDED_ENV: &str = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/.env"));
 
@@ -24,6 +34,107 @@ pub(crate) struct Config {
     pub(crate) api: OpenAiApi,
     pub(crate) tools_enabled: bool,
     pub(crate) bash_bin: PathBuf,
+    pub(crate) limits: ResourceLimits,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct ResourceLimits {
+    pub(crate) max_input_tokens: Option<u64>,
+    pub(crate) max_output_tokens: Option<u64>,
+    pub(crate) max_cost_usd: Option<f64>,
+    pub(crate) input_usd_per_million: Option<f64>,
+    pub(crate) output_usd_per_million: Option<f64>,
+    pub(crate) max_duration: Duration,
+}
+
+impl Default for ResourceLimits {
+    fn default() -> Self {
+        DEFAULT_RESOURCE_LIMITS
+    }
+}
+
+impl ResourceLimits {
+    fn from_values(values: [Option<String>; 6]) -> Result<Self, String> {
+        let [
+            input_tokens,
+            output_tokens,
+            max_cost,
+            input_rate,
+            output_rate,
+            duration,
+        ] = values;
+        let limits = Self {
+            max_input_tokens: parse_positive_u64(input_tokens, "GEER_AGENT_MAX_INPUT_TOKENS")?,
+            max_output_tokens: parse_positive_u64(output_tokens, "GEER_AGENT_MAX_OUTPUT_TOKENS")?,
+            max_cost_usd: parse_positive_f64(max_cost, "GEER_AGENT_MAX_COST_USD")?,
+            input_usd_per_million: parse_nonnegative_f64(
+                input_rate,
+                "GEER_AGENT_INPUT_USD_PER_MILLION_TOKENS",
+            )?,
+            output_usd_per_million: parse_nonnegative_f64(
+                output_rate,
+                "GEER_AGENT_OUTPUT_USD_PER_MILLION_TOKENS",
+            )?,
+            max_duration: parse_positive_u64(duration, "GEER_AGENT_MAX_DURATION_SECONDS")?
+                .map(Duration::from_secs)
+                .unwrap_or(DEFAULT_MAX_DURATION),
+        };
+        if limits.input_usd_per_million.is_some() != limits.output_usd_per_million.is_some() {
+            return Err("输入与输出 Token 单价必须一起配置。".to_owned());
+        }
+        if limits.max_cost_usd.is_some() && limits.input_usd_per_million.is_none() {
+            return Err("GEER_AGENT_MAX_COST_USD 需要同时配置输入与输出 Token 单价。".to_owned());
+        }
+        Ok(limits)
+    }
+
+    pub(crate) fn requires_usage(&self) -> bool {
+        self.max_input_tokens.is_some()
+            || self.max_output_tokens.is_some()
+            || self.max_cost_usd.is_some()
+    }
+}
+
+fn parse_positive_u64(value: Option<String>, name: &str) -> Result<Option<u64>, String> {
+    value
+        .map(|value| {
+            value
+                .trim()
+                .parse::<u64>()
+                .map_err(|_| format!("{name} 必须是正整数。"))
+                .and_then(|number| {
+                    (number > 0)
+                        .then_some(number)
+                        .ok_or_else(|| format!("{name} 必须是正整数。"))
+                })
+        })
+        .transpose()
+}
+
+fn parse_positive_f64(value: Option<String>, name: &str) -> Result<Option<f64>, String> {
+    parse_nonnegative_f64(value, name)?
+        .map(|number| {
+            (number > 0.0)
+                .then_some(number)
+                .ok_or_else(|| format!("{name} 必须是正数。"))
+        })
+        .transpose()
+}
+
+fn parse_nonnegative_f64(value: Option<String>, name: &str) -> Result<Option<f64>, String> {
+    value
+        .map(|value| {
+            value
+                .trim()
+                .parse::<f64>()
+                .map_err(|_| format!("{name} 必须是非负数。"))
+                .and_then(|number| {
+                    (number.is_finite() && number >= 0.0)
+                        .then_some(number)
+                        .ok_or_else(|| format!("{name} 必须是非负数。"))
+                })
+        })
+        .transpose()
 }
 
 impl Config {
@@ -35,7 +146,7 @@ impl Config {
         #[cfg(feature = "embed-env")]
         dotenvy::from_read(EMBEDDED_ENV.as_bytes())?;
 
-        Self::from_values(
+        let mut config = Self::from_values(
             std::env::var("OPENAI_API_KEY").ok(),
             std::env::var("OPENAI_MODEL").ok(),
             std::env::var("OPENAI_BASE_URL").ok(),
@@ -43,7 +154,17 @@ impl Config {
             std::env::var("GEER_AGENT_TOOLS").ok(),
             std::env::var("GEER_AGENT_BASH_BIN").ok(),
         )
-        .map_err(|message| io::Error::new(io::ErrorKind::InvalidInput, message).into())
+        .map_err(|message| io::Error::new(io::ErrorKind::InvalidInput, message))?;
+        config.limits = ResourceLimits::from_values([
+            std::env::var("GEER_AGENT_MAX_INPUT_TOKENS").ok(),
+            std::env::var("GEER_AGENT_MAX_OUTPUT_TOKENS").ok(),
+            std::env::var("GEER_AGENT_MAX_COST_USD").ok(),
+            std::env::var("GEER_AGENT_INPUT_USD_PER_MILLION_TOKENS").ok(),
+            std::env::var("GEER_AGENT_OUTPUT_USD_PER_MILLION_TOKENS").ok(),
+            std::env::var("GEER_AGENT_MAX_DURATION_SECONDS").ok(),
+        ])
+        .map_err(|message| io::Error::new(io::ErrorKind::InvalidInput, message))?;
+        Ok(config)
     }
 
     fn from_values(
@@ -102,6 +223,7 @@ impl Config {
             api,
             tools_enabled,
             bash_bin,
+            limits: ResourceLimits::default(),
         })
     }
 }
@@ -115,7 +237,7 @@ fn required_value(value: Option<String>, name: &str) -> Result<String, String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{Config, DEFAULT_BASE_URL, OpenAiApi};
+    use super::{Config, DEFAULT_BASE_URL, OpenAiApi, ResourceLimits};
 
     #[test]
     fn rejects_missing_api_key() {
@@ -197,5 +319,31 @@ mod tests {
         )
         .expect_err("自定义 Bash 路径必须为绝对路径");
         assert!(error.contains("GEER_AGENT_BASH_BIN"));
+    }
+
+    #[test]
+    fn resource_limits_validate_values_and_price_pair() {
+        let values = [
+            Some("100".to_owned()),
+            Some("50".to_owned()),
+            Some("0.25".to_owned()),
+            Some("1.5".to_owned()),
+            Some("3".to_owned()),
+            Some("30".to_owned()),
+        ];
+        let limits = ResourceLimits::from_values(values).expect("有效资源配置");
+        assert_eq!(limits.max_input_tokens, Some(100));
+        assert_eq!(limits.max_duration.as_secs(), 30);
+        assert!(limits.requires_usage());
+        for (index, bad) in [(0, "0"), (2, "NaN"), (3, "-1"), (5, "0")] {
+            let mut values = [None, None, None, None, None, None];
+            values[index] = Some(bad.to_owned());
+            assert!(
+                ResourceLimits::from_values(values).is_err(),
+                "index={index}"
+            );
+        }
+        let missing_rate = [None, None, Some("1".to_owned()), None, None, None];
+        assert!(ResourceLimits::from_values(missing_rate).is_err());
     }
 }

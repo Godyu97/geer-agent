@@ -22,6 +22,21 @@ REPL 向模型提供 `get_current_time`、`read`、`write`、`edit`、`bash`。�
 
 四个本机工具各自在本次 REPL 会话首次使用时请求 `y/N` 授权。授权覆盖该工具本会话内的后续调用以及任意本机路径；`/reset` 清除对话和授权。非交互输入无法确认时默认拒绝执行。
 
+## 执行预算
+
+每条输入默认在第 12 个模型响应后提示收敛；若近期持续取得新结果，通用提示可推迟到第 15 个响应。最多使用 30 个模型响应、100 次实际工具调用和 10 分钟。单次响应中的多个已授权 `read` 可以并行执行；`write`、`edit`、`bash` 按调用顺序执行。连续相同结果、连续错误或连续无进展会先提示模型改变方法，仍继续时关闭工具并请求最终回答。
+
+以下进程环境变量或 `.env` 项可选：
+
+| 名称 | 含义 |
+| --- | --- |
+| `GEER_AGENT_MAX_DURATION_SECONDS` | 单条输入的总时长上限，默认 600 |
+| `GEER_AGENT_MAX_INPUT_TOKENS` / `GEER_AGENT_MAX_OUTPUT_TOKENS` | 模型报告的累计输入/输出 Token 上限 |
+| `GEER_AGENT_MAX_COST_USD` | 按显式单价计算的美元费用上限 |
+| `GEER_AGENT_INPUT_USD_PER_MILLION_TOKENS` / `GEER_AGENT_OUTPUT_USD_PER_MILLION_TOKENS` | 每百万输入/输出 Token 的美元单价；配置费用上限时两项都必填 |
+
+启用 Token 或费用上限后，兼容接口若不返回 Token 用量，程序会停止继续执行工具并尝试最终回答。Chat Completions 会请求流式用量尾包；兼容接口可能不支持。每次运行及工具调用的结构化指标写到 stderr，含结束原因、用量、耗时和摘要，不含工具参数、结果正文或 API key。
+
 需要将配置随单个二进制携带时，在项目根目录准备 `.env`，然后运行：
 
 ```sh

@@ -15,10 +15,29 @@ enum Reply {
     ChatCalls(usize),
     ChatBash(String),
     ChatFinal,
+    ReadBatch {
+        api: &'static str,
+    },
+    NamedCall {
+        api: &'static str,
+        name: String,
+        args: String,
+        id: usize,
+        usage: bool,
+    },
     Error,
 }
 
 fn run_repl(api: &str, replies: Vec<Reply>, input: &str) -> (Output, Vec<Value>) {
+    run_repl_with_env(api, replies, input, &[])
+}
+
+fn run_repl_with_env(
+    api: &str,
+    replies: Vec<Reply>,
+    input: &str,
+    env: &[(&str, &str)],
+) -> (Output, Vec<Value>) {
     let listener = TcpListener::bind("127.0.0.1:0").expect("绑定模拟服务");
     listener.set_nonblocking(true).expect("非阻塞监听");
     let url = format!("http://{}/v1", listener.local_addr().expect("服务地址"));
@@ -45,13 +64,18 @@ fn run_repl(api: &str, replies: Vec<Reply>, input: &str) -> (Output, Vec<Value>)
         bodies
     });
 
-    let mut child = Command::new(env!("CARGO_BIN_EXE_geer-agent"))
+    let mut command = Command::new(env!("CARGO_BIN_EXE_geer-agent"));
+    command
         .env("OPENAI_API_KEY", "test-key")
         .env("OPENAI_MODEL", "test-model")
         .env("OPENAI_BASE_URL", url)
         .env("OPENAI_API", api)
         .env("GEER_AGENT_TOOLS", "on")
-        .env_remove("GEER_AGENT_BASH_BIN")
+        .env_remove("GEER_AGENT_BASH_BIN");
+    for (name, value) in env {
+        command.env(name, value);
+    }
+    let mut child = command
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -143,6 +167,60 @@ fn write_reply(stream: &mut TcpStream, reply: Reply) {
             "text/event-stream",
             chat_chunk(json!({"content":"done"}), json!("stop")),
         ),
+        Reply::ReadBatch {
+            api: "chat-completions",
+        } => {
+            let calls: Vec<_> = (0..3).map(|index| json!({"index":index,"id":format!("read_{index}"),"type":"function","function":{"name":"read","arguments":format!(r#"{{"path":"batch-{index}.txt"}}"#)}})).collect();
+            (
+                "200 OK",
+                "text/event-stream",
+                chat_chunk(json!({"tool_calls":calls}), json!("tool_calls")),
+            )
+        }
+        Reply::ReadBatch { api: "responses" } => {
+            let calls: Vec<_> = (0..3).map(|index| json!({"type":"function_call","arguments":format!(r#"{{"path":"batch-{index}.txt"}}"#),"call_id":format!("read_{index}"),"name":"read"})).collect();
+            let response = json!({"created_at":0,"completed_at":0,"id":"resp_batch","model":"test-model","object":"response","output":calls,"status":"completed"});
+            (
+                "200 OK",
+                "text/event-stream",
+                sse(json!({"type":"response.completed","sequence_number":1,"response":response})),
+            )
+        }
+        Reply::ReadBatch { .. } => panic!("不支持的 API"),
+        Reply::NamedCall {
+            api: "chat-completions",
+            name,
+            args,
+            id,
+            usage,
+        } => {
+            let mut body = chat_chunk(
+                json!({"tool_calls":[{"index":0,"id":format!("call_{id}"),"type":"function","function":{"name":name,"arguments":args}}]}),
+                json!("tool_calls"),
+            );
+            if usage {
+                body.push_str(&sse(json!({"id":"chat_1","object":"chat.completion.chunk","created":0,"model":"test-model","choices":[],"usage":{"prompt_tokens":10,"completion_tokens":2,"total_tokens":12}})));
+            }
+            ("200 OK", "text/event-stream", body)
+        }
+        Reply::NamedCall {
+            api: "responses",
+            name,
+            args,
+            id,
+            usage,
+        } => {
+            let mut response = json!({"created_at":0,"completed_at":0,"id":format!("resp_{id}"),"model":"test-model","object":"response","output":[{"type":"function_call","arguments":args,"call_id":format!("call_{id}"),"name":name}],"status":"completed"});
+            if usage {
+                response["usage"] = json!({"input_tokens":10,"input_tokens_details":{"cached_tokens":0},"output_tokens":2,"output_tokens_details":{"reasoning_tokens":0},"total_tokens":12});
+            }
+            (
+                "200 OK",
+                "text/event-stream",
+                sse(json!({"type":"response.completed","sequence_number":1,"response":response})),
+            )
+        }
+        Reply::NamedCall { .. } => panic!("不支持的 API"),
     };
     write!(stream, "HTTP/1.1 {status}\r\nContent-Type: {kind}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).expect("发送响应");
 }
@@ -155,6 +233,26 @@ fn chat_chunk(delta: Value, finish_reason: Value) -> String {
 
 fn sse(value: Value) -> String {
     format!("data: {value}\n\n")
+}
+
+fn named(api: &'static str, name: &str, args: &str, id: usize, usage: bool) -> Reply {
+    Reply::NamedCall {
+        api,
+        name: name.to_owned(),
+        args: args.to_owned(),
+        id,
+        usage,
+    }
+}
+
+fn run_reason(output: &Output) -> String {
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    stderr
+        .lines()
+        .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+        .find(|event| event["event"] == "agent_run")
+        .and_then(|event| event["terminationReason"].as_str().map(str::to_owned))
+        .expect("运行结束原因")
 }
 
 #[test]
@@ -401,19 +499,291 @@ fn noninteractive_bash_request_is_denied_without_running() {
 }
 
 #[test]
-fn chat_stops_after_five_tool_rounds() {
-    let replies = (1..=6).map(Reply::ChatCalls).collect();
-    let (output, bodies) = run_repl("chat-completions", replies, "time\n/exit\n");
-    assert!(output.status.success());
-    assert_eq!(bodies.len(), 6);
-    assert!(String::from_utf8_lossy(&output.stdout).contains("工具调用轮次过多"));
+fn both_apis_continue_after_five_tool_turns() {
+    for api in ["responses", "chat-completions"] {
+        let replies = if api == "responses" {
+            [vec![Reply::ResponsesCalls; 6], vec![Reply::ResponsesFinal]].concat()
+        } else {
+            (1..=6)
+                .map(Reply::ChatCalls)
+                .chain([Reply::ChatFinal])
+                .collect()
+        };
+        let (output, bodies) = run_repl(api, replies, "time\n/exit\n");
+        assert!(
+            output.status.success(),
+            "{api}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(bodies.len(), 7, "{api}");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(stdout.contains("done"), "{api}: {stdout}");
+        assert!(!stdout.contains("工具调用轮次过多"), "{api}: {stdout}");
+    }
 }
 
 #[test]
-fn responses_stops_after_five_tool_rounds() {
-    let replies = vec![Reply::ResponsesCalls; 6];
-    let (output, bodies) = run_repl("responses", replies, "time\n/exit\n");
-    assert!(output.status.success());
-    assert_eq!(bodies.len(), 6);
-    assert!(String::from_utf8_lossy(&output.stdout).contains("工具调用轮次过多"));
+fn both_apis_finalize_without_tools_and_keep_final_text() {
+    for api in ["responses", "chat-completions"] {
+        let replies = if api == "responses" {
+            [
+                vec![Reply::ResponsesCalls; 29],
+                vec![Reply::ResponsesFinal, Reply::ResponsesFinal],
+            ]
+            .concat()
+        } else {
+            (1..=29)
+                .map(Reply::ChatCalls)
+                .chain([Reply::ChatFinal, Reply::ChatFinal])
+                .collect()
+        };
+        let (output, bodies) = run_repl(api, replies, "first\nsecond\n/exit\n");
+        assert!(
+            output.status.success(),
+            "{api}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(bodies.len(), 31, "{api}");
+
+        let finalization = &bodies[29];
+        let next_turn = &bodies[30];
+        assert!(
+            finalization["tools"].is_null()
+                || finalization["tools"].as_array().is_some_and(Vec::is_empty),
+            "{api}: {finalization}"
+        );
+        assert_eq!(
+            next_turn["tools"].as_array().expect("下一轮恢复工具").len(),
+            5,
+            "{api}"
+        );
+
+        if api == "responses" {
+            assert!(
+                finalization["instructions"]
+                    .as_str()
+                    .expect("收敛指令")
+                    .contains("最后一个 Agent Turn")
+            );
+            assert!(
+                !next_turn["instructions"]
+                    .as_str()
+                    .expect("下一轮系统提示")
+                    .contains("最后一个 Agent Turn")
+            );
+            let input = next_turn["input"].as_array().expect("下一轮历史");
+            assert!(input.iter().any(|item| {
+                item["type"] == "message"
+                    && item["role"] == "assistant"
+                    && item.to_string().contains("done")
+            }));
+            assert!(
+                input
+                    .iter()
+                    .any(|item| { item["role"] == "user" && item["content"] == "second" })
+            );
+        } else {
+            let final_messages = finalization["messages"].as_array().expect("收敛消息");
+            assert!(
+                final_messages[0]["content"]
+                    .as_str()
+                    .expect("收敛指令")
+                    .contains("最后一个 Agent Turn")
+            );
+            let messages = next_turn["messages"].as_array().expect("下一轮历史");
+            assert!(
+                !messages[0]["content"]
+                    .as_str()
+                    .expect("下一轮系统提示")
+                    .contains("最后一个 Agent Turn")
+            );
+            assert!(
+                messages
+                    .iter()
+                    .any(|item| { item["role"] == "assistant" && item["content"] == "done" })
+            );
+            assert!(
+                messages
+                    .iter()
+                    .any(|item| { item["role"] == "user" && item["content"] == "second" })
+            );
+        }
+    }
+}
+
+#[test]
+fn both_apis_stop_repeated_calls_and_consecutive_errors() {
+    for api in ["chat-completions", "responses"] {
+        for distinct in [false, true] {
+            let mut replies: Vec<_> = (1..=4)
+                .map(|id| {
+                    let args = if distinct {
+                        format!(r#"{{"attempt":{id}}}"#)
+                    } else {
+                        "{}".to_owned()
+                    };
+                    named(api, "unknown", &args, id, false)
+                })
+                .collect();
+            replies.push(if api == "responses" {
+                Reply::ResponsesFinal
+            } else {
+                Reply::ChatFinal
+            });
+            let (output, bodies) = run_repl(api, replies, "work\n/exit\n");
+            assert!(
+                output.status.success(),
+                "{api}: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert_eq!(bodies.len(), 5, "{api}");
+            assert!(
+                bodies[4]["tools"].is_null()
+                    || bodies[4]["tools"].as_array().is_some_and(Vec::is_empty)
+            );
+            assert_eq!(
+                run_reason(&output),
+                if distinct {
+                    "consecutive_errors"
+                } else {
+                    "repeated_tool_loop"
+                }
+            );
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert!(!stderr.contains("attempt"));
+            assert!(!stderr.contains("未知工具"));
+        }
+    }
+}
+
+#[test]
+fn both_apis_enforce_reported_token_budget_without_running_tool() {
+    for api in ["chat-completions", "responses"] {
+        let replies = vec![
+            named(api, "get_current_time", "{}", 1, true),
+            if api == "responses" {
+                Reply::ResponsesFinal
+            } else {
+                Reply::ChatFinal
+            },
+        ];
+        let (output, bodies) = run_repl_with_env(
+            api,
+            replies,
+            "work\n/exit\n",
+            &[("GEER_AGENT_MAX_INPUT_TOKENS", "10")],
+        );
+        assert!(
+            output.status.success(),
+            "{api}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(bodies.len(), 2, "{api}");
+        assert_eq!(run_reason(&output), "max_tokens");
+        assert!(
+            bodies[1]["tools"].is_null()
+                || bodies[1]["tools"].as_array().is_some_and(Vec::is_empty)
+        );
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            !stderr.contains("\"event\":\"tool_call\""),
+            "工具未执行: {stderr}"
+        );
+    }
+}
+
+#[test]
+fn both_apis_stop_when_configured_budget_lacks_usage() {
+    for api in ["chat-completions", "responses"] {
+        let replies = vec![
+            named(api, "get_current_time", "{}", 1, false),
+            if api == "responses" {
+                Reply::ResponsesFinal
+            } else {
+                Reply::ChatFinal
+            },
+        ];
+        let (output, bodies) = run_repl_with_env(
+            api,
+            replies,
+            "work\n/exit\n",
+            &[("GEER_AGENT_MAX_INPUT_TOKENS", "10")],
+        );
+        assert!(
+            output.status.success(),
+            "{api}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(bodies.len(), 2, "{api}");
+        assert_eq!(run_reason(&output), "usage_unavailable");
+        assert!(
+            bodies[1]["tools"].is_null()
+                || bodies[1]["tools"].as_array().is_some_and(Vec::is_empty)
+        );
+    }
+}
+
+#[test]
+fn both_apis_pair_multi_read_batch_in_original_order() {
+    for api in ["chat-completions", "responses"] {
+        let replies = vec![
+            Reply::ReadBatch { api },
+            if api == "responses" {
+                Reply::ResponsesFinal
+            } else {
+                Reply::ChatFinal
+            },
+        ];
+        let (output, bodies) = run_repl(api, replies, "read\n/exit\n");
+        assert!(
+            output.status.success(),
+            "{api}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(bodies.len(), 2);
+        assert_eq!(run_reason(&output), "completed");
+        if api == "responses" {
+            let input = bodies[1]["input"].as_array().expect("Responses 输入");
+            let ids: Vec<_> = input
+                .iter()
+                .filter(|item| item["type"] == "function_call_output")
+                .map(|item| item["call_id"].as_str().expect("调用标识"))
+                .collect();
+            assert_eq!(ids, ["read_0", "read_1", "read_2"]);
+        } else {
+            let messages = bodies[1]["messages"].as_array().expect("Chat 消息");
+            let ids: Vec<_> = messages
+                .iter()
+                .filter(|item| item["role"] == "tool")
+                .map(|item| item["tool_call_id"].as_str().expect("调用标识"))
+                .collect();
+            assert_eq!(ids, ["read_0", "read_1", "read_2"]);
+        }
+    }
+}
+
+#[test]
+fn successful_tool_breaks_consecutive_error_chain() {
+    for api in ["chat-completions", "responses"] {
+        let replies = vec![
+            named(api, "unknown", r#"{"attempt":1}"#, 1, false),
+            named(api, "unknown", r#"{"attempt":2}"#, 2, false),
+            named(api, "get_current_time", "{}", 3, false),
+            named(api, "unknown", r#"{"attempt":3}"#, 4, false),
+            named(api, "unknown", r#"{"attempt":4}"#, 5, false),
+            if api == "responses" {
+                Reply::ResponsesFinal
+            } else {
+                Reply::ChatFinal
+            },
+        ];
+        let (output, bodies) = run_repl(api, replies, "work\n/exit\n");
+        assert!(
+            output.status.success(),
+            "{api}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(bodies.len(), 6, "{api}");
+        assert_eq!(run_reason(&output), "completed");
+    }
 }

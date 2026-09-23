@@ -66,11 +66,22 @@ impl Prompt {
     }
 
     pub(crate) fn messages(&self) -> Messages {
+        self.messages_with_runtime_instruction(None)
+    }
+
+    pub(crate) fn messages_with_runtime_instruction(
+        &self,
+        runtime_instruction: Option<&str>,
+    ) -> Messages {
+        let system = match runtime_instruction {
+            Some(instruction) => format!("{}\n\n{instruction}", self.system),
+            None => self.system.clone(),
+        };
         match &self.state {
             State::Chat { history } => {
                 let mut messages = vec![ChatCompletionRequestMessage::System(
                     ChatCompletionRequestSystemMessage {
-                        content: self.system.clone().into(),
+                        content: system.into(),
                         name: None,
                     },
                 )];
@@ -81,7 +92,7 @@ impl Prompt {
                 let mut input = history.clone();
                 input.extend(pending.iter().cloned());
                 Messages::Responses {
-                    instructions: self.system.clone(),
+                    instructions: system,
                     input,
                 }
             }
@@ -215,11 +226,16 @@ mod tests {
             text: text.to_owned(),
             calls: Vec::new(),
             output: Vec::new(),
+            usage: None,
         }
     }
 
     fn body(prompt: &Prompt) -> Value {
-        match prompt.messages() {
+        body_with_instruction(prompt, None)
+    }
+
+    fn body_with_instruction(prompt: &Prompt, runtime_instruction: Option<&str>) -> Value {
+        match prompt.messages_with_runtime_instruction(runtime_instruction) {
             Messages::Chat(messages) => serde_json::to_value(messages).expect("Chat 消息可序列化"),
             Messages::Responses {
                 instructions,
@@ -248,6 +264,27 @@ mod tests {
     }
 
     #[test]
+    fn runtime_instruction_is_request_scoped_for_both_apis() {
+        for api in [OpenAiApi::ChatCompletions, OpenAiApi::Responses] {
+            let mut prompt = Prompt::new(api, "system".to_owned());
+            prompt.begin_turn("hello");
+
+            let with_runtime = body_with_instruction(&prompt, Some("runtime"));
+            let without_runtime = body(&prompt);
+            match api {
+                OpenAiApi::ChatCompletions => {
+                    assert_eq!(with_runtime[0]["content"], "system\n\nruntime");
+                    assert_eq!(without_runtime[0]["content"], "system");
+                }
+                OpenAiApi::Responses => {
+                    assert_eq!(with_runtime["instructions"], "system\n\nruntime");
+                    assert_eq!(without_runtime["instructions"], "system");
+                }
+            }
+        }
+    }
+
+    #[test]
     fn chat_missing_call_id_and_failed_turn() {
         let mut prompt = Prompt::new(OpenAiApi::ChatCompletions, "system".to_owned());
         prompt.begin_turn("first");
@@ -264,6 +301,7 @@ mod tests {
                 text: String::new(),
                 calls: vec![call.clone()],
                 output: Vec::new(),
+                usage: None,
             },
             &[(call, "now".to_owned())],
         );
@@ -305,6 +343,7 @@ mod tests {
                 text: String::new(),
                 calls: vec![call.clone()],
                 output: vec![output],
+                usage: None,
             },
             &[(call, "now".to_owned())],
         );
