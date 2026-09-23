@@ -11,15 +11,20 @@ const COMMAND_TIMEOUT: Duration = Duration::from_secs(10);
 const MAX_CAPTURE_BYTES: usize = 8 * 1024;
 const MAX_RESULT_CHARS: usize = 2000;
 
-pub(super) async fn run(cwd: &Path, command: &str) -> String {
-    match run_with_timeout(cwd, command, COMMAND_TIMEOUT).await {
+pub(super) async fn run(bash_bin: &Path, cwd: &Path, command: &str) -> String {
+    match run_with_timeout(bash_bin, cwd, command, COMMAND_TIMEOUT).await {
         Ok(text) => text,
         Err(error) => format!("Bash 执行失败：{error}"),
     }
 }
 
-async fn run_with_timeout(cwd: &Path, command: &str, limit: Duration) -> io::Result<String> {
-    let mut child = Command::new("bash")
+async fn run_with_timeout(
+    bash_bin: &Path,
+    cwd: &Path,
+    command: &str,
+    limit: Duration,
+) -> io::Result<String> {
+    let mut child = Command::new(bash_bin)
         .arg("-c")
         .arg(command)
         .current_dir(cwd)
@@ -118,27 +123,61 @@ fn truncate_chars(text: String, max: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::run_with_timeout;
-    use std::time::Duration;
+    use std::{path::Path, time::Duration};
 
     #[tokio::test]
     async fn reports_output_exit_status_timeout_and_truncation() {
         let cwd = std::env::current_dir().expect("工作目录存在");
-        let success = run_with_timeout(&cwd, "printf hello", Duration::from_secs(1))
-            .await
-            .expect("命令可运行");
+        let success = run_with_timeout(
+            Path::new("bash"),
+            &cwd,
+            "printf hello",
+            Duration::from_secs(1),
+        )
+        .await
+        .expect("命令可运行");
         assert!(success.contains("退出状态：0\nhello"));
-        let failure = run_with_timeout(&cwd, "exit 7", Duration::from_secs(1))
+        let failure = run_with_timeout(Path::new("bash"), &cwd, "exit 7", Duration::from_secs(1))
             .await
             .expect("非零退出也返回结果");
         assert!(failure.contains("退出状态：7"));
-        let timeout = run_with_timeout(&cwd, "sleep 1", Duration::from_millis(20))
-            .await
-            .expect("超时返回结果");
+        let timeout = run_with_timeout(
+            Path::new("bash"),
+            &cwd,
+            "sleep 1",
+            Duration::from_millis(20),
+        )
+        .await
+        .expect("超时返回结果");
         assert!(timeout.contains("已终止"));
-        let long = run_with_timeout(&cwd, "yes x | head -c 20000", Duration::from_secs(1))
-            .await
-            .expect("大量输出可运行");
+        let long = run_with_timeout(
+            Path::new("bash"),
+            &cwd,
+            "yes x | head -c 20000",
+            Duration::from_secs(1),
+        )
+        .await
+        .expect("大量输出可运行");
         assert!(long.chars().count() <= 2000);
         assert!(long.contains("输出已截断"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn uses_configured_executable() {
+        use std::{fs, os::unix::fs::PermissionsExt};
+
+        let path =
+            std::env::temp_dir().join(format!("geer-agent-custom-bash-{}", std::process::id()));
+        fs::write(&path, "#!/bin/sh\nprintf custom-bash-selected\n").expect("创建测试可执行文件");
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o700)).expect("设置执行权限");
+        let cwd = std::env::current_dir().expect("工作目录存在");
+        let result = run_with_timeout(&path, &cwd, "printf ignored", Duration::from_secs(1)).await;
+        fs::remove_file(&path).expect("清理测试文件");
+        assert!(
+            result
+                .expect("执行自定义文件")
+                .contains("custom-bash-selected")
+        );
     }
 }

@@ -1,5 +1,6 @@
 mod agent;
 mod config;
+mod prompt;
 mod provider;
 mod repl;
 mod tools;

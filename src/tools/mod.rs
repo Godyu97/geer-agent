@@ -24,15 +24,17 @@ pub(crate) struct Spec {
 pub(crate) struct Tools {
     enabled: bool,
     cwd: PathBuf,
+    bash_bin: PathBuf,
     grants: HashSet<String>,
     confirm: ConfirmFn,
 }
 
 impl Tools {
-    pub(crate) fn new(enabled: bool) -> io::Result<Self> {
+    pub(crate) fn new(enabled: bool, bash_bin: PathBuf) -> io::Result<Self> {
         Ok(Self {
             enabled,
             cwd: std::env::current_dir()?,
+            bash_bin,
             grants: HashSet::new(),
             confirm: Box::new(confirm_cli),
         })
@@ -105,7 +107,7 @@ impl Tools {
                     return "bash 需要非空 command 字符串。".to_owned();
                 };
                 match self.authorize("bash", &format!("命令：{command}")) {
-                    Ok(true) => bash::run(&self.cwd, command).await,
+                    Ok(true) => bash::run(&self.bash_bin, &self.cwd, command).await,
                     Ok(false) => "用户拒绝授权，命令未执行。".to_owned(),
                     Err(error) => format!("无法确认 Bash 命令：{error}"),
                 }
@@ -179,14 +181,20 @@ mod tests {
 
     #[tokio::test]
     async fn disabled_and_invalid_arguments() {
-        let mut tools = Tools::new(false).expect("工作目录存在");
+        let mut tools = Tools::new(false, "bash".into()).expect("工作目录存在");
         assert!(tools.specs().is_empty());
-        assert_eq!(Tools::new(true).expect("工作目录存在").specs().len(), 5);
+        assert_eq!(
+            Tools::new(true, "bash".into())
+                .expect("工作目录存在")
+                .specs()
+                .len(),
+            5
+        );
         assert_eq!(
             tools.execute("get_current_time", "{}").await,
             "工具已关闭。"
         );
-        let mut tools = Tools::new(true).expect("工作目录存在");
+        let mut tools = Tools::new(true, "bash".into()).expect("工作目录存在");
         assert!(
             tools
                 .execute("get_current_time", "{")
@@ -210,7 +218,7 @@ mod tests {
 
     #[tokio::test]
     async fn grants_are_per_tool_and_reset_revokes_them() {
-        let mut tools = Tools::new(true).expect("工作目录存在");
+        let mut tools = Tools::new(true, "bash".into()).expect("工作目录存在");
         let prompts = Rc::new(Cell::new(0));
         let seen = Rc::clone(&prompts);
         tools.confirm = Box::new(move |prompt| {
@@ -248,7 +256,7 @@ mod tests {
         fs::write(&path, "hello").expect("准备文件");
         let path_json =
             serde_json::to_string(&path.to_string_lossy().to_string()).expect("编码路径");
-        let mut tools = Tools::new(true).expect("工作目录存在");
+        let mut tools = Tools::new(true, "bash".into()).expect("工作目录存在");
         let prompts = Rc::new(Cell::new(0));
         let seen = Rc::clone(&prompts);
         tools.confirm = Box::new(move |prompt| {

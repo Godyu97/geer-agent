@@ -51,6 +51,7 @@ fn run_repl(api: &str, replies: Vec<Reply>, input: &str) -> (Output, Vec<Value>)
         .env("OPENAI_BASE_URL", url)
         .env("OPENAI_API", api)
         .env("GEER_AGENT_TOOLS", "on")
+        .env_remove("GEER_AGENT_BASH_BIN")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -172,6 +173,12 @@ fn responses_api_returns_two_tool_results_before_final_answer() {
     assert!(stdout.contains("调用工具 get_current_time"));
     assert!(stdout.contains("done"));
     assert_eq!(bodies.len(), 2);
+    for body in &bodies {
+        let prompt = body["instructions"].as_str().expect("默认系统提示");
+        assert!(prompt.contains("<context_data>"));
+        assert!(prompt.contains("system_version:"));
+        assert!(prompt.contains("bash_version: GNU bash, version "));
+    }
     assert_eq!(bodies[0]["tools"].as_array().expect("工具清单").len(), 5);
     let input = bodies[1]["input"].as_array().expect("下一请求历史");
     assert_eq!(
@@ -201,6 +208,16 @@ fn chat_api_reassembles_fragments_and_pairs_tool_result() {
         String::from_utf8_lossy(&output.stderr)
     );
     assert_eq!(bodies[0]["tools"].as_array().expect("工具清单").len(), 5);
+    for body in &bodies {
+        let messages = body["messages"].as_array().expect("消息");
+        assert_eq!(messages[0]["role"], "system");
+        assert!(
+            messages[0]["content"]
+                .as_str()
+                .expect("系统提示")
+                .contains("<context_data>")
+        );
+    }
     let messages = bodies[1]["messages"].as_array().expect("历史消息");
     assert!(
         messages
@@ -213,6 +230,54 @@ fn chat_api_reassembles_fragments_and_pairs_tool_result() {
             .any(|item| item["role"] == "tool" && item["tool_call_id"] == "call_1")
     );
     assert!(String::from_utf8_lossy(&output.stdout).contains("done"));
+}
+
+#[test]
+fn reset_keeps_system_prompt_for_both_apis() {
+    for api in ["responses", "chat-completions"] {
+        let replies = if api == "responses" {
+            vec![Reply::ResponsesFinal; 2]
+        } else {
+            vec![Reply::ChatFinal; 2]
+        };
+        let (output, bodies) = run_repl(api, replies, "first\n/reset\nsecond\n/exit\n");
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(bodies.len(), 2);
+        if api == "responses" {
+            assert_eq!(bodies[0]["instructions"], bodies[1]["instructions"]);
+            assert!(
+                bodies[1]["instructions"]
+                    .as_str()
+                    .expect("系统提示")
+                    .contains("<context_data>")
+            );
+            let input = bodies[1]["input"].as_array().expect("消息");
+            assert_eq!(input.len(), 1);
+            assert_eq!(input[0]["content"], "second");
+        } else {
+            let first = bodies[0]["messages"].as_array().expect("消息");
+            let second = bodies[1]["messages"].as_array().expect("消息");
+            assert_eq!(first[0], second[0]);
+            assert_eq!(second.len(), 2);
+            assert_eq!(second[1]["content"], "second");
+        }
+    }
+}
+
+#[test]
+fn invalid_bash_path_fails_before_repl() {
+    let output = Command::new(env!("CARGO_BIN_EXE_geer-agent"))
+        .env("OPENAI_API_KEY", "test-key")
+        .env("OPENAI_MODEL", "test-model")
+        .env("GEER_AGENT_BASH_BIN", "/definitely/missing/geer-agent-bash")
+        .output()
+        .expect("启动程序");
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("无法运行 Bash"));
 }
 
 #[test]

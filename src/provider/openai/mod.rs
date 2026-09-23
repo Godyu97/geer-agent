@@ -56,10 +56,10 @@ enum Api {
 }
 
 impl Provider {
-    pub(crate) fn new(config: &Config) -> Self {
+    pub(crate) fn new(config: &Config, system_prompt: String) -> Self {
         let api = match config.api {
-            OpenAiApi::Responses => Api::Responses(Responses::new(config)),
-            OpenAiApi::ChatCompletions => Api::ChatCompletions(Chat::new(config)),
+            OpenAiApi::Responses => Api::Responses(Responses::new(config, system_prompt)),
+            OpenAiApi::ChatCompletions => Api::ChatCompletions(Chat::new(config, system_prompt)),
         };
         Self { api }
     }

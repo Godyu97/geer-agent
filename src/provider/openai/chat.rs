@@ -7,10 +7,11 @@ use async_openai::{
     types::chat::{
         ChatCompletionMessageToolCall, ChatCompletionMessageToolCalls,
         ChatCompletionRequestAssistantMessage, ChatCompletionRequestAssistantMessageContent,
-        ChatCompletionRequestMessage, ChatCompletionRequestToolMessage,
-        ChatCompletionRequestToolMessageContent, ChatCompletionRequestUserMessage,
-        ChatCompletionRequestUserMessageContent, CreateChatCompletionRequestArgs,
-        CreateChatCompletionStreamResponse, FinishReason, FunctionCall,
+        ChatCompletionRequestMessage, ChatCompletionRequestSystemMessage,
+        ChatCompletionRequestToolMessage, ChatCompletionRequestToolMessageContent,
+        ChatCompletionRequestUserMessage, ChatCompletionRequestUserMessageContent,
+        CreateChatCompletionRequestArgs, CreateChatCompletionStreamResponse, FinishReason,
+        FunctionCall,
     },
 };
 use futures_util::{Stream, StreamExt};
@@ -26,11 +27,12 @@ const REPLY_IDLE_TIMEOUT: Duration = Duration::from_secs(90);
 pub(crate) struct Chat {
     client: Client<OpenAIConfig>,
     model: String,
+    system_prompt: String,
     history: Vec<ChatCompletionRequestMessage>,
 }
 
 impl Chat {
-    pub(crate) fn new(config: &Config) -> Self {
+    pub(crate) fn new(config: &Config, system_prompt: String) -> Self {
         let client_config = OpenAIConfig::new()
             .with_api_key(config.api_key.clone())
             .with_api_base(config.base_url.clone());
@@ -38,6 +40,7 @@ impl Chat {
         Self {
             client: Client::with_config(client_config),
             model: config.model.clone(),
+            system_prompt,
             history: Vec::new(),
         }
     }
@@ -137,9 +140,14 @@ impl Chat {
         F: FnMut(&str) -> io::Result<()>,
     {
         let mut request = CreateChatCompletionRequestArgs::default();
-        request
-            .model(self.model.clone())
-            .messages(self.history.clone());
+        let mut messages = vec![ChatCompletionRequestMessage::System(
+            ChatCompletionRequestSystemMessage {
+                content: self.system_prompt.clone().into(),
+                name: None,
+            },
+        )];
+        messages.extend(self.history.iter().cloned());
+        request.model(self.model.clone()).messages(messages);
         if !tools.is_empty() {
             request.tools(super::chat_tools(tools));
         }
@@ -272,13 +280,17 @@ mod tests {
     use crate::config::{Config, OpenAiApi};
 
     fn test_chat() -> Chat {
-        Chat::new(&Config {
-            api_key: "test-key".to_owned(),
-            model: "test-model".to_owned(),
-            base_url: "https://example.invalid/v1".to_owned(),
-            api: OpenAiApi::ChatCompletions,
-            tools_enabled: true,
-        })
+        Chat::new(
+            &Config {
+                api_key: "test-key".to_owned(),
+                model: "test-model".to_owned(),
+                base_url: "https://example.invalid/v1".to_owned(),
+                api: OpenAiApi::ChatCompletions,
+                tools_enabled: true,
+                bash_bin: "bash".into(),
+            },
+            "test prompt".to_owned(),
+        )
     }
 
     #[test]

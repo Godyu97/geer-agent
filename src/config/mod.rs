@@ -1,6 +1,10 @@
 //! 配置层：可被任意业务模块引用。本模块不依赖其它业务模块。
 
-use std::{error::Error, io, path::Path};
+use std::{
+    error::Error,
+    io,
+    path::{Path, PathBuf},
+};
 
 const DEFAULT_BASE_URL: &str = "https://api.openai.com/v1";
 #[cfg(feature = "embed-env")]
@@ -19,6 +23,7 @@ pub(crate) struct Config {
     pub(crate) base_url: String,
     pub(crate) api: OpenAiApi,
     pub(crate) tools_enabled: bool,
+    pub(crate) bash_bin: PathBuf,
 }
 
 impl Config {
@@ -36,6 +41,7 @@ impl Config {
             std::env::var("OPENAI_BASE_URL").ok(),
             std::env::var("OPENAI_API").ok(),
             std::env::var("GEER_AGENT_TOOLS").ok(),
+            std::env::var("GEER_AGENT_BASH_BIN").ok(),
         )
         .map_err(|message| io::Error::new(io::ErrorKind::InvalidInput, message).into())
     }
@@ -46,6 +52,7 @@ impl Config {
         base_url: Option<String>,
         api: Option<String>,
         tools_enabled: Option<String>,
+        bash_bin: Option<String>,
     ) -> Result<Self, String> {
         let api_key = required_value(api_key, "OPENAI_API_KEY")?;
         let model = required_value(model, "OPENAI_MODEL")?;
@@ -73,12 +80,28 @@ impl Config {
             }
         };
 
+        let bash_bin = bash_bin
+            .map(|value| value.trim().to_owned())
+            .filter(|value| !value.is_empty())
+            .map_or_else(
+                || Ok(PathBuf::from("bash")),
+                |value| {
+                    let path = PathBuf::from(value);
+                    if path.is_absolute() {
+                        Ok(path)
+                    } else {
+                        Err("GEER_AGENT_BASH_BIN 必须是 Bash 可执行文件的绝对路径。".to_owned())
+                    }
+                },
+            )?;
+
         Ok(Self {
             api_key,
             model,
             base_url,
             api,
             tools_enabled,
+            bash_bin,
         })
     }
 }
@@ -96,7 +119,7 @@ mod tests {
 
     #[test]
     fn rejects_missing_api_key() {
-        let error = Config::from_values(None, Some("gpt-test".to_owned()), None, None, None)
+        let error = Config::from_values(None, Some("gpt-test".to_owned()), None, None, None, None)
             .expect_err("缺少 key 时应报错");
 
         assert!(error.contains("OPENAI_API_KEY"));
@@ -104,7 +127,7 @@ mod tests {
 
     #[test]
     fn rejects_missing_model() {
-        let error = Config::from_values(Some("secret".to_owned()), None, None, None, None)
+        let error = Config::from_values(Some("secret".to_owned()), None, None, None, None, None)
             .expect_err("缺少 model 时应报错");
 
         assert!(error.contains("OPENAI_MODEL"));
@@ -118,6 +141,7 @@ mod tests {
             Some("  ".to_owned()),
             None,
             None,
+            None,
         )
         .expect("key 与 model 已提供");
 
@@ -126,6 +150,7 @@ mod tests {
         assert_eq!(config.base_url, DEFAULT_BASE_URL);
         assert_eq!(config.api, OpenAiApi::Responses);
         assert!(config.tools_enabled);
+        assert_eq!(config.bash_bin, std::path::Path::new("bash"));
     }
 
     #[test]
@@ -136,12 +161,14 @@ mod tests {
             Some("https://proxy.example/v1".to_owned()),
             Some("chat-completions".to_owned()),
             Some("off".to_owned()),
+            Some("/usr/bin/bash".to_owned()),
         )
         .expect("自定义 endpoint 应被接受");
 
         assert_eq!(config.base_url, "https://proxy.example/v1");
         assert_eq!(config.api, OpenAiApi::ChatCompletions);
         assert!(!config.tools_enabled);
+        assert_eq!(config.bash_bin, std::path::Path::new("/usr/bin/bash"));
     }
 
     #[test]
@@ -152,8 +179,23 @@ mod tests {
             None,
             Some("other".to_owned()),
             None,
+            None,
         )
         .expect_err("未知接口应在进入 REPL 前报错");
         assert!(error.contains("OPENAI_API"));
+    }
+
+    #[test]
+    fn rejects_relative_bash_path() {
+        let error = Config::from_values(
+            Some("secret".to_owned()),
+            Some("gpt-test".to_owned()),
+            None,
+            None,
+            None,
+            Some("bin/bash".to_owned()),
+        )
+        .expect_err("自定义 Bash 路径必须为绝对路径");
+        assert!(error.contains("GEER_AGENT_BASH_BIN"));
     }
 }

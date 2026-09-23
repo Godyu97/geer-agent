@@ -4,6 +4,7 @@ use std::{error::Error, io};
 
 use crate::{
     config::Config,
+    prompt,
     provider::{ChatProvider, ToolSpec, openai::Provider},
     repl::{self, Session},
     tools::Tools,
@@ -13,9 +14,10 @@ const MAX_TOOL_ROUNDS: usize = 5;
 
 pub(crate) async fn run() -> Result<(), Box<dyn Error>> {
     let config = Config::load()?;
+    let system_prompt = prompt::load(&config.bash_bin).await?;
     let mut agent = Agent {
-        chat: Provider::new(&config),
-        tools: Tools::new(config.tools_enabled)?,
+        chat: Provider::new(&config, system_prompt),
+        tools: Tools::new(config.tools_enabled, config.bash_bin.clone())?,
     };
     repl::run(&mut agent).await
 }
@@ -177,7 +179,7 @@ mod tests {
     }
 
     async fn run(chat: &mut FakeProvider) -> Result<String, Box<dyn Error>> {
-        let mut tools = Tools::new(true).expect("工作目录存在");
+        let mut tools = Tools::new(true, "bash".into()).expect("工作目录存在");
         let mut printed = String::new();
         run_tool_loop(chat, &mut tools, "现在几点", &mut |delta| {
             printed.push_str(delta);
@@ -245,7 +247,7 @@ mod tests {
             steps: VecDeque::from([Err("boom".to_owned())]),
             events: Vec::new(),
         };
-        let mut tools = Tools::new(true).expect("工作目录存在");
+        let mut tools = Tools::new(true, "bash".into()).expect("工作目录存在");
         let error = run_tool_loop(&mut chat, &mut tools, "hi", &mut |_| Ok(()))
             .await
             .expect_err("应失败");
@@ -259,7 +261,7 @@ mod tests {
             steps: VecDeque::from([Ok(tool_step()), Err("boom".to_owned())]),
             events: Vec::new(),
         };
-        let mut tools = Tools::new(true).expect("工作目录存在");
+        let mut tools = Tools::new(true, "bash".into()).expect("工作目录存在");
         run_tool_loop(&mut chat, &mut tools, "hi", &mut |_| Ok(()))
             .await
             .expect_err("应失败");

@@ -26,13 +26,14 @@ const RETRY_DELAY: Duration = Duration::from_millis(200);
 pub(super) struct Responses {
     client: Client<OpenAIConfig>,
     model: String,
+    system_prompt: String,
     history: Vec<InputItem>,
     pending: Vec<InputItem>,
     last_output: Vec<OutputItem>,
 }
 
 impl Responses {
-    pub(super) fn new(config: &Config) -> Self {
+    pub(super) fn new(config: &Config, system_prompt: String) -> Self {
         let client_config = OpenAIConfig::new()
             .with_api_key(config.api_key.clone())
             .with_api_base(config.base_url.clone());
@@ -41,6 +42,7 @@ impl Responses {
             // SDK 默认会静默重试；这里由外层循环控制次数并显示进度。
             client: Client::with_config(client_config).with_http_service(ReqwestService::default()),
             model: config.model.clone(),
+            system_prompt,
             history: Vec::new(),
             pending: Vec::new(),
             last_output: Vec::new(),
@@ -137,7 +139,8 @@ impl Responses {
         let mut builder = CreateResponseArgs::default();
         builder
             .model(self.model.clone())
-            .input(InputParam::Items(input));
+            .input(InputParam::Items(input))
+            .instructions(self.system_prompt.clone());
         if !tools.is_empty() {
             builder.tools(super::response_tools(tools));
         }
@@ -282,13 +285,17 @@ mod tests {
     use crate::config::{Config, OpenAiApi};
 
     fn test_provider() -> Responses {
-        Responses::new(&Config {
-            api_key: "test-key".to_owned(),
-            model: "test-model".to_owned(),
-            base_url: "https://example.invalid/v1".to_owned(),
-            api: OpenAiApi::Responses,
-            tools_enabled: true,
-        })
+        Responses::new(
+            &Config {
+                api_key: "test-key".to_owned(),
+                model: "test-model".to_owned(),
+                base_url: "https://example.invalid/v1".to_owned(),
+                api: OpenAiApi::Responses,
+                tools_enabled: true,
+                bash_bin: "bash".into(),
+            },
+            "test prompt".to_owned(),
+        )
     }
 
     fn delta(text: &str) -> ResponseStreamEvent {
