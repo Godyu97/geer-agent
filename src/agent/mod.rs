@@ -10,13 +10,18 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 use tokio::time::{Instant, timeout_at};
+use uuid::Uuid;
 
 use crate::{
-    config::{Config, DEFAULT_RESOURCE_LIMITS, ResourceLimits},
+    config::{Config, DEFAULT_RESOURCE_LIMITS, OpenAiApi, ResourceLimits},
+    dao::TraceStore,
     prompt::{self, Prompt},
     provider::{ChatProvider, TokenUsage, ToolSpec, openai::Provider},
     repl::{self, Session},
     tools::Tools,
+    trace::{
+        TraceCapture, TraceRecord, TraceStatus, TraceWriter, now_unix_ms, redact_json, redact_text,
+    },
 };
 use guard::{LoopGuard, StopReason, call_fingerprint, result_fingerprint};
 
@@ -319,6 +324,17 @@ fn finalization_instruction(skipped_tool_batch: bool, reason: TerminationReason)
 
 pub(crate) async fn run() -> Result<(), Box<dyn Error>> {
     let config = Config::load()?;
+    let trace_store = if let Some(database) = &config.trace_database {
+        match TraceStore::connect(database).await {
+            Ok(store) => Some(store),
+            Err(_) => {
+                eprintln!("Trace 数据库连接或初始化失败，已关闭本次持久化。");
+                None
+            }
+        }
+    } else {
+        None
+    };
     let system_prompt = prompt::load(&config.bash_bin).await?;
     let mut prompt = Prompt::new(config.api, system_prompt);
     let mut agent = Agent {
@@ -329,6 +345,15 @@ pub(crate) async fn run() -> Result<(), Box<dyn Error>> {
             ..DEFAULT_AGENT_BUDGET
         },
         model: config.model.clone(),
+        session_id: Uuid::new_v4().to_string(),
+        trace_store,
+        api: config.api,
+        api_key: config.api_key.clone(),
+        base_url: config.base_url.clone(),
+        trace_database_url: config
+            .trace_database
+            .as_ref()
+            .map(|database| database.url.clone()),
     };
     repl::run(&mut agent, &mut prompt).await
 }
@@ -338,9 +363,29 @@ struct Agent {
     tools: Tools,
     budget: AgentBudget,
     model: String,
+    session_id: String,
+    trace_store: Option<TraceStore>,
+    api: OpenAiApi,
+    api_key: String,
+    base_url: String,
+    trace_database_url: Option<String>,
+}
+
+struct TraceContext<'a> {
+    session_id: &'a str,
+    api: OpenAiApi,
+    model: &'a str,
+    api_key: &'a str,
+    base_url: &'a str,
+    database_url: Option<&'a str>,
+    store: Option<&'a TraceStore>,
 }
 
 impl Session for Agent {
+    fn session_id(&self) -> &str {
+        &self.session_id
+    }
+
     async fn handle_message<F>(
         &mut self,
         prompt: &mut Prompt,
@@ -349,6 +394,15 @@ impl Session for Agent {
     where
         F: FnMut(&str) -> io::Result<()>,
     {
+        let trace = TraceContext {
+            session_id: &self.session_id,
+            api: self.api,
+            model: &self.model,
+            api_key: &self.api_key,
+            base_url: &self.base_url,
+            database_url: self.trace_database_url.as_deref(),
+            store: self.trace_store.as_ref(),
+        };
         run_tool_loop_with_budget(
             &mut self.chat,
             &mut self.tools,
@@ -356,6 +410,7 @@ impl Session for Agent {
             &mut on_delta,
             self.budget,
             &self.model,
+            Some(&trace),
         )
         .await
         .map(|_| ())
@@ -363,6 +418,7 @@ impl Session for Agent {
 
     fn reset(&mut self) {
         self.tools.reset();
+        self.session_id = Uuid::new_v4().to_string();
     }
 }
 
@@ -385,6 +441,7 @@ async fn run_tool_loop_with_budget<P, F>(
     on_delta: &mut F,
     budget: AgentBudget,
     model: &str,
+    trace: Option<&TraceContext<'_>>,
 ) -> Result<AgentMetrics, Box<dyn Error>>
 where
     P: ChatProvider,
@@ -396,8 +453,16 @@ where
 
     loop {
         if let Some(reason) = runtime.limit_reason() {
-            return finalize_without_tools(chat, prompt, on_delta, &mut runtime, false, reason)
-                .await;
+            return finalize_without_tools(
+                chat,
+                prompt,
+                on_delta,
+                &mut runtime,
+                false,
+                reason,
+                trace,
+            )
+            .await;
         }
 
         let mut hints = Vec::new();
@@ -413,17 +478,22 @@ where
             None => prompt.messages(),
         };
         let deadline = runtime.started_at + budget.limits.max_duration;
-        let step = match timeout_at(
-            deadline,
-            chat.complete_step(messages, &specs, &mut *on_delta),
+        let step = match traced_step(
+            chat,
+            messages,
+            &specs,
+            on_delta,
+            Some(deadline),
+            trace,
+            &runtime.run_id,
         )
         .await
         {
-            Ok(Ok(step)) => {
+            Ok(Some(step)) => {
                 runtime.record_turn();
                 step
             }
-            Err(_) => {
+            Ok(None) => {
                 return finalize_without_tools(
                     chat,
                     prompt,
@@ -431,10 +501,11 @@ where
                     &mut runtime,
                     false,
                     TerminationReason::MaxDuration,
+                    trace,
                 )
                 .await;
             }
-            Ok(Err(error)) => {
+            Err(error) => {
                 if used_tools {
                     prompt.commit_turn();
                 } else {
@@ -451,8 +522,16 @@ where
         }
 
         if let Some(reason) = runtime.record_usage(step.usage) {
-            return finalize_without_tools(chat, prompt, on_delta, &mut runtime, true, reason)
-                .await;
+            return finalize_without_tools(
+                chat,
+                prompt,
+                on_delta,
+                &mut runtime,
+                true,
+                reason,
+                trace,
+            )
+            .await;
         }
 
         if !runtime.try_record_tool_calls(step.calls.len()) {
@@ -463,6 +542,7 @@ where
                 &mut runtime,
                 true,
                 TerminationReason::MaxToolCalls,
+                trace,
             )
             .await;
         }
@@ -503,6 +583,7 @@ where
                 &mut runtime,
                 false,
                 reason.into(),
+                trace,
             )
             .await;
         }
@@ -516,6 +597,7 @@ async fn finalize_without_tools<P, F>(
     runtime: &mut AgentRuntime,
     skipped_tool_batch: bool,
     reason: TerminationReason,
+    trace: Option<&TraceContext<'_>>,
 ) -> Result<AgentMetrics, Box<dyn Error>>
 where
     P: ChatProvider,
@@ -523,16 +605,19 @@ where
 {
     let mut instruction = finalization_instruction(skipped_tool_batch, reason);
     instruction.push_str(&format!(" 停止原因：{}。", reason.as_str()));
-    let step = chat
-        .complete_step(
-            prompt.messages_with_runtime_instruction(Some(&instruction)),
-            &[],
-            &mut *on_delta,
-        )
-        .await;
+    let step = traced_step(
+        chat,
+        prompt.messages_with_runtime_instruction(Some(&instruction)),
+        &[],
+        on_delta,
+        None,
+        trace,
+        &runtime.run_id,
+    )
+    .await;
 
     match step {
-        Ok(step) => {
+        Ok(Some(step)) => {
             runtime.record_turn();
             runtime.record_usage(step.usage);
             // provider 已分别校验两种协议的最终文本；Responses 的文本保存在 output 而非 text。
@@ -543,7 +628,7 @@ where
                 on_delta(FINALIZATION_FALLBACK)?;
             }
         }
-        Err(_) => {
+        Err(_) | Ok(None) => {
             prompt.commit_turn();
             on_delta(FINALIZATION_FALLBACK)?;
         }
@@ -552,19 +637,137 @@ where
     Ok(runtime.finish(reason))
 }
 
+async fn traced_step<P, F>(
+    chat: &mut P,
+    messages: crate::provider::Messages,
+    tools: &[ToolSpec],
+    on_delta: &mut F,
+    deadline: Option<Instant>,
+    trace: Option<&TraceContext<'_>>,
+    agent_run_id: &str,
+) -> Result<Option<crate::provider::ModelStep>, Box<dyn Error>>
+where
+    P: ChatProvider,
+    F: FnMut(&str) -> io::Result<()>,
+{
+    let request_id = Uuid::new_v4().to_string();
+    let started_at_ms = now_unix_ms();
+    let started = Instant::now();
+    let mut capture = TraceCapture::new();
+    let result = match deadline {
+        Some(deadline) => {
+            timeout_at(
+                deadline,
+                chat.complete_step(messages, tools, &mut capture, &mut *on_delta),
+            )
+            .await
+        }
+        None => Ok(chat
+            .complete_step(messages, tools, &mut capture, &mut *on_delta)
+            .await),
+    };
+    if let Some(trace) = trace
+        && let Some(store) = trace.store
+    {
+        let (status, usage, error) = match &result {
+            Ok(Ok(step)) => (TraceStatus::Completed, step.usage, None),
+            Ok(Err(error)) => {
+                let status = if error
+                    .downcast_ref::<io::Error>()
+                    .is_some_and(|error| error.kind() == io::ErrorKind::TimedOut)
+                {
+                    TraceStatus::TimedOut
+                } else {
+                    TraceStatus::Failed
+                };
+                (status, None, Some(redact_error(&error.to_string(), trace)))
+            }
+            Err(_) => (
+                TraceStatus::TimedOut,
+                None,
+                Some("Agent 调用时限已到".to_owned()),
+            ),
+        };
+        let mut response = capture.response();
+        let mut request = capture.request.clone();
+        let secrets = [trace.api_key, trace.database_url.unwrap_or_default()];
+        redact_json(&mut request, &secrets);
+        if let Some(response) = &mut response {
+            redact_json(response, &secrets);
+        }
+        let input_tokens = usage
+            .and_then(|usage| i64::try_from(usage.input).ok())
+            .or_else(|| {
+                response.as_ref().and_then(|response| {
+                    response
+                        .pointer("/usage/input_tokens")
+                        .and_then(serde_json::Value::as_i64)
+                })
+            });
+        let output_tokens = usage
+            .and_then(|usage| i64::try_from(usage.output).ok())
+            .or_else(|| {
+                response.as_ref().and_then(|response| {
+                    response
+                        .pointer("/usage/output_tokens")
+                        .and_then(serde_json::Value::as_i64)
+                })
+            });
+        let record = TraceRecord {
+            request_id: request_id.clone(),
+            session_id: trace.session_id.to_owned(),
+            agent_run_id: agent_run_id.to_owned(),
+            provider_response_id: capture.provider_response_id.clone(),
+            api: trace.api.as_str().to_owned(),
+            model: trace.model.to_owned(),
+            started_at_ms,
+            duration_ms: i64::try_from(started.elapsed().as_millis()).unwrap_or(i64::MAX),
+            attempts: capture.attempts(),
+            status,
+            input_tokens,
+            output_tokens,
+            request,
+            response,
+            error,
+        };
+        if store.write_one(&record).await.is_err() {
+            eprintln!("Trace 写入失败（request_id={request_id}）。");
+        }
+    }
+    match result {
+        Ok(Ok(step)) => Ok(Some(step)),
+        Ok(Err(error)) => Err(error),
+        Err(_) => Ok(None),
+    }
+}
+
+fn redact_error(message: &str, trace: &TraceContext<'_>) -> String {
+    redact_text(
+        message,
+        &[
+            trace.api_key,
+            trace.base_url,
+            trace.database_url.unwrap_or_default(),
+        ],
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use std::{collections::VecDeque, error::Error, fs, io, time::SystemTime};
 
     use super::{
         AgentBudget, AgentMetrics, AgentRuntime, DEFAULT_AGENT_BUDGET, FINALIZATION_FALLBACK,
-        SOFT_BUDGET_HINT, TerminationReason, run_record, run_tool_loop_with_budget, tool_record,
+        SOFT_BUDGET_HINT, TerminationReason, TraceContext, run_record, run_tool_loop_with_budget,
+        tool_record,
     };
     use crate::{
-        config::{OpenAiApi, ResourceLimits},
+        config::{OpenAiApi, ResourceLimits, TraceDatabase, TraceDatabaseConfig},
+        dao::TraceStore,
         prompt::Prompt,
         provider::{ChatProvider, Messages, ModelStep, TokenUsage, ToolCall, ToolSpec},
         tools::{ToolExecution, ToolOutput, Tools},
+        trace::{TraceCapture, TraceReader, TraceStatus},
     };
 
     struct FakeProvider {
@@ -578,6 +781,7 @@ mod tests {
             &mut self,
             messages: Messages,
             tools: &[ToolSpec],
+            _capture: &mut crate::trace::TraceCapture,
             _on_delta: F,
         ) -> Result<ModelStep, Box<dyn Error>>
         where
@@ -672,6 +876,7 @@ mod tests {
             },
             budget,
             "test-model",
+            None,
         )
         .await?;
         Ok((printed, metrics))
@@ -683,6 +888,98 @@ mod tests {
             snapshots: Vec::new(),
             tool_counts: Vec::new(),
         }
+    }
+
+    #[tokio::test]
+    async fn budget_timeout_persists_partial_output_and_finalization() {
+        struct SlowThenFinal {
+            calls: usize,
+        }
+        impl ChatProvider for SlowThenFinal {
+            async fn complete_step<F>(
+                &mut self,
+                _messages: Messages,
+                _tools: &[ToolSpec],
+                capture: &mut TraceCapture,
+                mut on_delta: F,
+            ) -> Result<ModelStep, Box<dyn Error>>
+            where
+                F: FnMut(&str) -> io::Result<()>,
+            {
+                self.calls += 1;
+                capture.set_request(&serde_json::json!({"step": self.calls}))?;
+                if self.calls == 1 {
+                    capture.append_text("partial");
+                    on_delta("partial")?;
+                    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                    Ok(text_step("too late"))
+                } else {
+                    capture.set_response(&serde_json::json!({"text": "final"}))?;
+                    on_delta("final")?;
+                    Ok(text_step("final"))
+                }
+            }
+        }
+
+        let path = std::env::temp_dir().join(format!(
+            "geer-agent-timeout-{}.sqlite",
+            uuid::Uuid::new_v4()
+        ));
+        let store = TraceStore::connect(&TraceDatabaseConfig {
+            kind: TraceDatabase::Sqlite,
+            url: format!("sqlite://{}?mode=rwc", path.display()),
+        })
+        .await
+        .unwrap();
+        let session = uuid::Uuid::new_v4().to_string();
+        let trace = TraceContext {
+            session_id: &session,
+            api: OpenAiApi::ChatCompletions,
+            model: "test-model",
+            api_key: "test-key",
+            base_url: "http://localhost",
+            database_url: None,
+            store: Some(&store),
+        };
+        let mut budget = DEFAULT_AGENT_BUDGET;
+        budget.limits.max_duration = std::time::Duration::from_millis(10);
+        let mut provider = SlowThenFinal { calls: 0 };
+        let mut tools = Tools::new(false, "bash".into()).unwrap();
+        let mut prompt = prompt();
+        let metrics = run_tool_loop_with_budget(
+            &mut provider,
+            &mut tools,
+            &mut prompt,
+            &mut |_| Ok(()),
+            budget,
+            "test-model",
+            Some(&trace),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            metrics.termination_reason,
+            Some(TerminationReason::MaxDuration)
+        );
+        let page = store.list_session_page(&session, None, 10).await.unwrap();
+        assert_eq!(page.items.len(), 2);
+        assert_ne!(page.items[0].request_id, page.items[1].request_id);
+        assert_eq!(page.items[0].agent_run_id, page.items[1].agent_run_id);
+        let timed_out = page
+            .items
+            .iter()
+            .find(|item| item.request["step"] == 1)
+            .unwrap();
+        let final_call = page
+            .items
+            .iter()
+            .find(|item| item.request["step"] == 2)
+            .unwrap();
+        assert_eq!(timed_out.status, TraceStatus::TimedOut);
+        assert_eq!(timed_out.response.as_ref().unwrap()["text"], "partial");
+        assert_eq!(final_call.status, TraceStatus::Completed);
+        drop(store);
+        std::fs::remove_file(path).unwrap();
     }
 
     #[test]
@@ -804,6 +1101,7 @@ mod tests {
             &mut |_| Ok(()),
             DEFAULT_AGENT_BUDGET,
             "test-model",
+            None,
         )
         .await
         .expect("批次成功");

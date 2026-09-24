@@ -2,7 +2,7 @@
 
 use std::{
     error::Error,
-    io,
+    fmt, io,
     path::{Path, PathBuf},
     time::Duration,
 };
@@ -26,6 +26,100 @@ pub(crate) enum OpenAiApi {
     ChatCompletions,
 }
 
+impl OpenAiApi {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::Responses => "responses",
+            Self::ChatCompletions => "chat-completions",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TraceDatabase {
+    Sqlite,
+    Postgres,
+    Mysql,
+    Mongodb,
+}
+
+#[derive(Clone)]
+pub(crate) struct TraceDatabaseConfig {
+    pub(crate) kind: TraceDatabase,
+    pub(crate) url: String,
+}
+
+impl fmt::Debug for TraceDatabaseConfig {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("TraceDatabaseConfig")
+            .field("kind", &self.kind)
+            .field("url", &"[REDACTED]")
+            .finish()
+    }
+}
+
+impl TraceDatabaseConfig {
+    fn from_values(database: Option<String>, url: Option<String>) -> Result<Option<Self>, String> {
+        let database = database.as_deref().map(str::trim).unwrap_or_default();
+        let url = url.as_deref().map(str::trim).unwrap_or_default();
+        if database.is_empty() {
+            return if url.is_empty() {
+                Ok(None)
+            } else {
+                Err(
+                    "GEER_AGENT_TRACE_DATABASE_URL 需要同时设置 GEER_AGENT_TRACE_DATABASE。"
+                        .to_owned(),
+                )
+            };
+        }
+        let kind = match database {
+            "sqlite" => TraceDatabase::Sqlite,
+            "postgres" => TraceDatabase::Postgres,
+            "mysql" => TraceDatabase::Mysql,
+            "mongodb" => TraceDatabase::Mongodb,
+            _ => {
+                return Err(
+                    "GEER_AGENT_TRACE_DATABASE 只能是 sqlite、postgres、mysql 或 mongodb。"
+                        .to_owned(),
+                );
+            }
+        };
+        if url.is_empty() {
+            return Err("启用 Trace 时必须设置 GEER_AGENT_TRACE_DATABASE_URL。".to_owned());
+        }
+        let protocol_valid = match kind {
+            TraceDatabase::Sqlite => url.starts_with("sqlite:"),
+            TraceDatabase::Postgres => {
+                url.starts_with("postgres://") || url.starts_with("postgresql://")
+            }
+            TraceDatabase::Mysql => url.starts_with("mysql://"),
+            TraceDatabase::Mongodb => {
+                url.starts_with("mongodb://") || url.starts_with("mongodb+srv://")
+            }
+        };
+        if !protocol_valid {
+            return Err("GEER_AGENT_TRACE_DATABASE_URL 与数据库类型的协议不匹配。".to_owned());
+        }
+        if kind == TraceDatabase::Mongodb {
+            let authority_and_path = url
+                .split_once("://")
+                .map(|(_, rest)| rest)
+                .unwrap_or_default();
+            let database_name = authority_and_path
+                .split_once('/')
+                .map(|(_, path)| path.split('?').next().unwrap_or_default())
+                .unwrap_or_default();
+            if database_name.is_empty() {
+                return Err("MongoDB Trace URI 必须包含数据库名。".to_owned());
+            }
+        }
+        Ok(Some(Self {
+            kind,
+            url: url.to_owned(),
+        }))
+    }
+}
+
 #[derive(Debug, Clone)]
 pub(crate) struct Config {
     pub(crate) api_key: String,
@@ -35,6 +129,7 @@ pub(crate) struct Config {
     pub(crate) tools_enabled: bool,
     pub(crate) bash_bin: PathBuf,
     pub(crate) limits: ResourceLimits,
+    pub(crate) trace_database: Option<TraceDatabaseConfig>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -164,6 +259,11 @@ impl Config {
             std::env::var("GEER_AGENT_MAX_DURATION_SECONDS").ok(),
         ])
         .map_err(|message| io::Error::new(io::ErrorKind::InvalidInput, message))?;
+        config.trace_database = TraceDatabaseConfig::from_values(
+            std::env::var("GEER_AGENT_TRACE_DATABASE").ok(),
+            std::env::var("GEER_AGENT_TRACE_DATABASE_URL").ok(),
+        )
+        .map_err(|message| io::Error::new(io::ErrorKind::InvalidInput, message))?;
         Ok(config)
     }
 
@@ -224,6 +324,7 @@ impl Config {
             tools_enabled,
             bash_bin,
             limits: ResourceLimits::default(),
+            trace_database: None,
         })
     }
 }
@@ -237,7 +338,52 @@ fn required_value(value: Option<String>, name: &str) -> Result<String, String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{Config, DEFAULT_BASE_URL, OpenAiApi, ResourceLimits};
+    use super::{
+        Config, DEFAULT_BASE_URL, OpenAiApi, ResourceLimits, TraceDatabase, TraceDatabaseConfig,
+    };
+
+    #[test]
+    fn trace_database_config_requires_selected_backend_and_matching_url() {
+        assert!(
+            TraceDatabaseConfig::from_values(None, None)
+                .unwrap()
+                .is_none()
+        );
+        assert!(TraceDatabaseConfig::from_values(None, Some("sqlite::memory:".into())).is_err());
+        for (database, url, expected) in [
+            ("sqlite", "sqlite::memory:", TraceDatabase::Sqlite),
+            (
+                "postgres",
+                "postgres://localhost/trace",
+                TraceDatabase::Postgres,
+            ),
+            ("mysql", "mysql://localhost/trace", TraceDatabase::Mysql),
+            (
+                "mongodb",
+                "mongodb://localhost/trace",
+                TraceDatabase::Mongodb,
+            ),
+        ] {
+            let config = TraceDatabaseConfig::from_values(Some(database.into()), Some(url.into()))
+                .unwrap()
+                .unwrap();
+            assert_eq!(config.kind, expected);
+            assert!(!format!("{config:?}").contains(url));
+        }
+        assert!(TraceDatabaseConfig::from_values(Some("other".into()), Some("x".into())).is_err());
+        assert!(TraceDatabaseConfig::from_values(Some("mysql".into()), None).is_err());
+        assert!(
+            TraceDatabaseConfig::from_values(Some("mysql".into()), Some("sqlite::memory:".into()))
+                .is_err()
+        );
+        assert!(
+            TraceDatabaseConfig::from_values(
+                Some("mongodb".into()),
+                Some("mongodb://localhost/".into())
+            )
+            .is_err()
+        );
+    }
 
     #[test]
     fn rejects_missing_api_key() {

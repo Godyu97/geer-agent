@@ -4,6 +4,8 @@ use super::color::Color;
 use crate::prompt::Prompt;
 
 pub(crate) trait Session {
+    fn session_id(&self) -> &str;
+
     async fn handle_message<F>(
         &mut self,
         prompt: &mut Prompt,
@@ -23,6 +25,7 @@ pub(crate) async fn run(
     let stdin = io::stdin();
 
     println!("GeekAgent —— 最简单的 Agent");
+    println!("Session ID: {}", session.session_id());
     println!("输入 /help 查看命令。\n");
 
     loop {
@@ -51,6 +54,7 @@ pub(crate) async fn run(
                 prompt.reset();
                 session.reset();
                 println!("（已清空对话记忆）");
+                println!("Session ID: {}", session.session_id());
             }
             Input::Exit => {
                 println!("bye");

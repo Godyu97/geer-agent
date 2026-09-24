@@ -15,6 +15,7 @@ use tokio::time::{Instant, sleep, timeout, timeout_at};
 use crate::{
     config::Config,
     provider::{ModelStep, TokenUsage, ToolCall, ToolSpec},
+    trace::TraceCapture,
 };
 
 const REPLY_IDLE_TIMEOUT: Duration = Duration::from_secs(90);
@@ -44,13 +45,14 @@ impl Responses {
         instructions: String,
         input: Vec<InputItem>,
         tools: &[ToolSpec],
+        capture: &mut TraceCapture,
         mut on_delta: F,
     ) -> Result<ModelStep, Box<dyn Error>>
     where
         F: FnMut(&str) -> io::Result<()>,
     {
         let response = self
-            .request_reply(instructions, input, tools, &mut on_delta)
+            .request_reply(instructions, input, tools, capture, &mut on_delta)
             .await?;
         let calls: Vec<ToolCall> = response
             .output
@@ -90,6 +92,7 @@ impl Responses {
         instructions: String,
         input: Vec<InputItem>,
         tools: &[ToolSpec],
+        capture: &mut TraceCapture,
         on_delta: &mut F,
     ) -> Result<Response, Box<dyn Error>>
     where
@@ -104,8 +107,12 @@ impl Responses {
             builder.tools(super::response_tools(tools));
         }
         let request = builder.build()?;
+        capture.set_request(&request)?;
+        capture.request["stream"] = serde_json::Value::Bool(true);
         let mut retries = 0;
         loop {
+            capture.clear_partial();
+            capture.attempts = i32::try_from(retries + 1).unwrap_or(i32::MAX);
             let mut emitted_text = false;
             let result = match timeout(
                 REPLY_IDLE_TIMEOUT,
@@ -116,6 +123,7 @@ impl Responses {
                 Ok(Ok(stream)) => {
                     collect_reply(
                         stream,
+                        capture,
                         &mut |delta| {
                             // 已交给终端的正文不能在下一次尝试中重复显示。
                             emitted_text = true;
@@ -144,6 +152,7 @@ impl Responses {
 
 async fn collect_reply<S, F>(
     mut stream: S,
+    capture: &mut TraceCapture,
     on_delta: &mut F,
     idle_timeout: Duration,
 ) -> Result<Response, Box<dyn Error>>
@@ -163,8 +172,35 @@ where
             })??;
 
         match event {
+            ResponseStreamEvent::ResponseCreated(event) => {
+                capture.provider_response_id = Some(event.response.id);
+            }
+            ResponseStreamEvent::ResponseInProgress(event) => {
+                capture.provider_response_id = Some(event.response.id);
+            }
+            ResponseStreamEvent::ResponseOutputItemAdded(event) => {
+                if let OutputItem::FunctionCall(call) = event.item {
+                    capture.replace_call(
+                        event.output_index,
+                        &call.call_id,
+                        &call.name,
+                        &call.arguments,
+                    );
+                }
+            }
+            ResponseStreamEvent::ResponseOutputItemDone(event) => {
+                if let OutputItem::FunctionCall(call) = event.item {
+                    capture.replace_call(
+                        event.output_index,
+                        &call.call_id,
+                        &call.name,
+                        &call.arguments,
+                    );
+                }
+            }
             ResponseStreamEvent::ResponseOutputTextDelta(event) => {
                 if !event.delta.is_empty() {
+                    capture.append_text(&event.delta);
                     on_delta(&event.delta)?;
                     answer.push_str(&event.delta);
                     if !event.delta.trim().is_empty() {
@@ -172,10 +208,15 @@ where
                     }
                 }
             }
-            ResponseStreamEvent::ResponseFunctionCallArgumentsDelta(_) => {
+            ResponseStreamEvent::ResponseFunctionCallArgumentsDelta(event) => {
+                capture.append_call_delta(event.output_index, None, None, Some(&event.delta));
                 deadline = Instant::now() + idle_timeout;
             }
+            ResponseStreamEvent::ResponseRefusalDelta(event) => {
+                capture.append_text(&event.delta);
+            }
             ResponseStreamEvent::ResponseCompleted(event) => {
+                capture.provider_response_id = Some(event.response.id.clone());
                 if answer.trim().is_empty()
                     && !event
                         .response
@@ -183,20 +224,26 @@ where
                         .iter()
                         .any(|item| matches!(item, OutputItem::FunctionCall(_)))
                 {
+                    capture.set_failure_response(&event.response)?;
                     return Err(io::Error::new(
                         io::ErrorKind::InvalidData,
                         "模型已结束，但没有返回可显示的文本。",
                     )
                     .into());
                 }
+                capture.set_response(&event.response)?;
                 return Ok(event.response);
             }
             ResponseStreamEvent::ResponseFailed(event) => {
+                capture.provider_response_id = Some(event.response.id.clone());
+                capture.set_failure_response(&event.response)?;
                 return Err(
                     io::Error::other(format!("模型响应失败：{:?}", event.response.error)).into(),
                 );
             }
             ResponseStreamEvent::ResponseIncomplete(event) => {
+                capture.provider_response_id = Some(event.response.id.clone());
+                capture.set_failure_response(&event.response)?;
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
                     format!("模型响应未完成：{:?}", event.response.incomplete_details),
@@ -230,7 +277,19 @@ mod tests {
     };
     use futures_util::{StreamExt, stream};
 
-    use super::collect_reply;
+    use crate::trace::TraceCapture;
+
+    async fn collect_reply<S, F>(
+        stream: S,
+        on_delta: &mut F,
+        idle_timeout: Duration,
+    ) -> Result<Response, Box<dyn std::error::Error>>
+    where
+        S: futures_util::Stream<Item = Result<ResponseStreamEvent, OpenAIError>> + Unpin,
+        F: FnMut(&str) -> io::Result<()>,
+    {
+        super::collect_reply(stream, &mut TraceCapture::new(), on_delta, idle_timeout).await
+    }
 
     fn delta(text: &str) -> ResponseStreamEvent {
         ResponseStreamEvent::ResponseOutputTextDelta(ResponseTextDeltaEvent {
@@ -399,6 +458,30 @@ mod tests {
             .await;
             assert!(result.is_err());
         }
+    }
+
+    #[tokio::test]
+    async fn failed_event_keeps_earlier_stream_text_in_trace() {
+        let events = stream::iter([
+            Ok(delta("part")),
+            Ok(ResponseStreamEvent::ResponseFailed(ResponseFailedEvent {
+                sequence_number: 2,
+                response: response(""),
+            })),
+        ]);
+        let mut capture = TraceCapture::new();
+        let result = super::collect_reply(
+            events,
+            &mut capture,
+            &mut |_| Ok(()),
+            Duration::from_secs(1),
+        )
+        .await;
+        assert!(result.is_err());
+        assert_eq!(
+            capture.response().unwrap()["received_before_failure"]["text"],
+            "part"
+        );
     }
 
     #[tokio::test]

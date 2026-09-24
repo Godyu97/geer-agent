@@ -1,9 +1,19 @@
-use std::{collections::BTreeMap, error::Error, io, time::Duration};
+use std::{
+    collections::BTreeMap,
+    error::Error,
+    io,
+    sync::{
+        Arc,
+        atomic::{AtomicI32, Ordering},
+    },
+    time::Duration,
+};
 
 use async_openai::{
     Client,
     config::OpenAIConfig,
     error::OpenAIError,
+    middleware::{HttpRequestFactory, ReqwestService, retry::OpenAIRetryLayer},
     types::chat::{
         ChatCompletionRequestMessage, ChatCompletionStreamOptions, CreateChatCompletionRequestArgs,
         CreateChatCompletionStreamResponse, FinishReason,
@@ -11,10 +21,12 @@ use async_openai::{
 };
 use futures_util::{Stream, StreamExt};
 use tokio::time::{Instant, timeout_at};
+use tower::{ServiceBuilder, ServiceExt, service_fn};
 
 use crate::{
     config::Config,
     provider::{ModelStep, TokenUsage, ToolCall, ToolSpec},
+    trace::TraceCapture,
 };
 
 const REPLY_IDLE_TIMEOUT: Duration = Duration::from_secs(90);
@@ -22,6 +34,7 @@ const REPLY_IDLE_TIMEOUT: Duration = Duration::from_secs(90);
 pub(crate) struct Chat {
     client: Client<OpenAIConfig>,
     model: String,
+    attempt_counter: Arc<AtomicI32>,
 }
 
 impl Chat {
@@ -30,9 +43,18 @@ impl Chat {
             .with_api_key(config.api_key.clone())
             .with_api_base(config.base_url.clone());
 
+        let attempt_counter = Arc::new(AtomicI32::new(0));
+        let count = Arc::clone(&attempt_counter);
+        let service = ServiceBuilder::new()
+            .layer(OpenAIRetryLayer::default())
+            .service(service_fn(move |factory: HttpRequestFactory| {
+                count.fetch_add(1, Ordering::Relaxed);
+                ReqwestService::default().oneshot(factory)
+            }));
         Self {
-            client: Client::with_config(client_config),
+            client: Client::with_config(client_config).with_http_service(service),
             model: config.model.clone(),
+            attempt_counter,
         }
     }
 
@@ -40,18 +62,23 @@ impl Chat {
         &mut self,
         messages: Vec<ChatCompletionRequestMessage>,
         tools: &[ToolSpec],
+        capture: &mut TraceCapture,
         mut on_delta: F,
     ) -> Result<ModelStep, Box<dyn Error>>
     where
         F: FnMut(&str) -> io::Result<()>,
     {
-        self.request_reply(messages, tools, &mut on_delta).await
+        self.attempt_counter.store(0, Ordering::Relaxed);
+        capture.count_attempts_with(Arc::clone(&self.attempt_counter));
+        self.request_reply(messages, tools, capture, &mut on_delta)
+            .await
     }
 
     async fn request_reply<F>(
         &self,
         messages: Vec<ChatCompletionRequestMessage>,
         tools: &[ToolSpec],
+        capture: &mut TraceCapture,
         on_delta: &mut F,
     ) -> Result<ModelStep, Box<dyn Error>>
     where
@@ -69,17 +96,27 @@ impl Chat {
             request.tools(super::chat_tools(tools));
         }
         let request = request.build()?;
+        capture.set_request(&request)?;
+        capture.request["stream"] = serde_json::Value::Bool(true);
         let deadline = Instant::now() + REPLY_IDLE_TIMEOUT;
         let stream = timeout_at(deadline, self.client.chat().create_stream(request))
             .await
             .map_err(|_| timeout_error())??;
 
-        collect_reply(stream, on_delta, REPLY_IDLE_TIMEOUT, deadline).await
+        let step = collect_reply(stream, capture, on_delta, REPLY_IDLE_TIMEOUT, deadline).await?;
+        capture.set_response(&serde_json::json!({
+            "text": step.text,
+            "tool_calls": step.calls.iter().map(|call| serde_json::json!({
+                "id": call.id, "name": call.name, "arguments": call.args,
+            })).collect::<Vec<_>>(),
+        }))?;
+        Ok(step)
     }
 }
 
 async fn collect_reply<S, F>(
     mut stream: S,
+    capture: &mut TraceCapture,
     on_delta: &mut F,
     idle_timeout: Duration,
     mut deadline: Instant,
@@ -99,6 +136,7 @@ where
                 io::Error::new(io::ErrorKind::UnexpectedEof, "模型响应未完成便断开。")
             })??;
 
+        capture.provider_response_id = Some(chunk.id.clone());
         let chunk_usage = chunk.usage.map(|usage| TokenUsage {
             input: u64::from(usage.prompt_tokens),
             output: u64::from(usage.completion_tokens),
@@ -111,6 +149,7 @@ where
             if let Some(content) = choice.delta.content.or(choice.delta.refusal)
                 && !content.is_empty()
             {
+                capture.append_text(&content);
                 on_delta(&content)?;
                 answer.push_str(&content);
                 if !content.trim().is_empty() {
@@ -121,6 +160,12 @@ where
             if let Some(deltas) = choice.delta.tool_calls {
                 for delta in deltas {
                     let call = calls.entry(delta.index).or_default();
+                    capture.append_call_delta(
+                        delta.index,
+                        delta.id.as_deref(),
+                        delta.function.as_ref().and_then(|f| f.name.as_deref()),
+                        delta.function.as_ref().and_then(|f| f.arguments.as_deref()),
+                    );
                     if let Some(id) = delta.id {
                         call.id.push_str(&id);
                     }
@@ -225,7 +270,28 @@ mod tests {
     use futures_util::{StreamExt, stream};
     use tokio::time::Instant;
 
-    use super::collect_reply;
+    use crate::{provider::ModelStep, trace::TraceCapture};
+
+    async fn collect_reply<S, F>(
+        stream: S,
+        on_delta: &mut F,
+        idle_timeout: Duration,
+        deadline: Instant,
+    ) -> Result<ModelStep, Box<dyn std::error::Error>>
+    where
+        S: futures_util::Stream<Item = Result<CreateChatCompletionStreamResponse, OpenAIError>>
+            + Unpin,
+        F: FnMut(&str) -> io::Result<()>,
+    {
+        super::collect_reply(
+            stream,
+            &mut TraceCapture::new(),
+            on_delta,
+            idle_timeout,
+            deadline,
+        )
+        .await
+    }
 
     #[allow(deprecated)]
     fn chunk(

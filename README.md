@@ -37,6 +37,19 @@ REPL 向模型提供 `get_current_time`、`read`、`write`、`edit`、`bash`。�
 
 启用 Token 或费用上限后，兼容接口若不返回 Token 用量，程序会停止继续执行工具并尝试最终回答。Chat Completions 会请求流式用量尾包；兼容接口可能不支持。每次运行及工具调用的结构化指标写到 stderr，含结束原因、用量、耗时和摘要，不含工具参数、结果正文或 API key。
 
+## LLM 调用 Trace
+
+启动时会显示 `Session ID`，输入 `/reset` 后生成并显示新 ID。每个模型步骤有独立的 `request_id`，同一步骤的重试合并为一条逻辑记录。默认不持久化；设置以下两项可选择一种数据库：
+
+```sh
+GEER_AGENT_TRACE_DATABASE=sqlite
+GEER_AGENT_TRACE_DATABASE_URL='sqlite://trace.sqlite?mode=rwc'
+```
+
+`GEER_AGENT_TRACE_DATABASE` 支持 `sqlite`、`postgres`、`mysql`、`mongodb`，相应 URL 使用 `sqlite:`、`postgres://` 或 `postgresql://`、`mysql://`、`mongodb://` 或 `mongodb+srv://` 协议；MongoDB URI 必须带数据库名。可在 `.env` 或进程环境变量中配置，一次只选择一个数据库。SQL 数据库首次连接时自动运行版本化迁移；MongoDB 自动建立索引。Reader 提供代码接口，包括按 Request ID 读取和按 Session 游标分页，本次没有终端查询命令。
+
+启用后，所选数据库会保存每次模型调用的**完整请求、合并后的响应或失败前已收到的内容**，其中可能包含对话历史、用户输入、工具参数与工具结果。已配置的 API key 与数据库连接串即使出现在内容中也会替换为 `[REDACTED]`。请保护数据库文件、服务与备份；本版不自动清理记录。记录不含 HTTP 认证头。数据库连接或写入失败会在终端报 Trace 告警，模型对话继续。
+
 需要将配置随单个二进制携带时，在项目根目录准备 `.env`，然后运行：
 
 ```sh

@@ -1,3 +1,5 @@
 /target
 /.pi
 /.env
+/trace.sqlite
+/trace.sqlite-*

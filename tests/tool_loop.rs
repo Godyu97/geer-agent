@@ -6,7 +6,9 @@ use std::{
     time::{Duration, Instant},
 };
 
+use sea_orm::{ConnectionTrait, Database, DbBackend, Statement};
 use serde_json::{Value, json};
+use uuid::Uuid;
 
 #[derive(Clone)]
 enum Reply {
@@ -15,6 +17,7 @@ enum Reply {
     ChatCalls(usize),
     ChatBash(String),
     ChatFinal,
+    ChatFinalDropTrace(String),
     ReadBatch {
         api: &'static str,
     },
@@ -26,6 +29,8 @@ enum Reply {
         usage: bool,
     },
     Error,
+    RetryableError,
+    ChatPartial,
 }
 
 fn run_repl(api: &str, replies: Vec<Reply>, input: &str) -> (Output, Vec<Value>) {
@@ -121,11 +126,36 @@ fn read_body(stream: &mut TcpStream) -> Value {
 }
 
 fn write_reply(stream: &mut TcpStream, reply: Reply) {
+    if let Reply::ChatFinalDropTrace(path) = &reply {
+        let path = path.clone();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let db = Database::connect(format!("sqlite://{path}?mode=rw"))
+                .await
+                .unwrap();
+            db.execute_unprepared("DROP TABLE llm_traces")
+                .await
+                .unwrap();
+        });
+    }
     let (status, kind, body) = match reply {
         Reply::Error => (
             "400 Bad Request",
             "application/json",
             r#"{"error":{"message":"boom","type":"invalid_request_error"}}"#.to_owned(),
+        ),
+        Reply::RetryableError => (
+            "500 Internal Server Error",
+            "application/json",
+            r#"{"error":{"message":"temporary failure","type":"server_error"}}"#.to_owned(),
+        ),
+        Reply::ChatPartial => (
+            "200 OK",
+            "text/event-stream",
+            chat_chunk(json!({"content":"part"}), Value::Null),
         ),
         Reply::ResponsesCalls => {
             let response = json!({"created_at":0,"completed_at":0,"id":"resp_1","model":"test-model","object":"response","output":[
@@ -162,7 +192,7 @@ fn write_reply(stream: &mut TcpStream, reply: Reply) {
             );
             ("200 OK", "text/event-stream", body)
         }
-        Reply::ChatFinal => (
+        Reply::ChatFinal | Reply::ChatFinalDropTrace(_) => (
             "200 OK",
             "text/event-stream",
             chat_chunk(json!({"content":"done"}), json!("stop")),
@@ -786,4 +816,239 @@ fn successful_tool_breaks_consecutive_error_chain() {
         assert_eq!(bodies.len(), 6, "{api}");
         assert_eq!(run_reason(&output), "completed");
     }
+}
+
+#[tokio::test]
+async fn trace_records_each_model_step_and_session_reset_for_both_apis() {
+    for api in ["chat-completions", "responses"] {
+        let path = std::env::temp_dir().join(format!("geer-trace-e2e-{}.sqlite", Uuid::new_v4()));
+        let url = format!("sqlite://{}?mode=rwc", path.display());
+        let replies = if api == "responses" {
+            vec![
+                Reply::ResponsesCalls,
+                Reply::ResponsesFinal,
+                Reply::ResponsesFinal,
+                Reply::ResponsesFinal,
+            ]
+        } else {
+            vec![
+                Reply::ChatCalls(1),
+                Reply::ChatFinal,
+                Reply::ChatFinal,
+                Reply::ChatFinal,
+            ]
+        };
+        let (output, bodies) = run_repl_with_env(
+            api,
+            replies,
+            "first\nsecond\n/reset\nthird\n/exit\n",
+            &[
+                ("GEER_AGENT_TRACE_DATABASE", "sqlite"),
+                ("GEER_AGENT_TRACE_DATABASE_URL", &url),
+            ],
+        );
+        assert!(
+            output.status.success(),
+            "{api}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(bodies.len(), 4, "{api}");
+        let stdout = String::from_utf8(output.stdout).unwrap();
+        let shown_sessions: Vec<_> = stdout
+            .lines()
+            .filter_map(|line| line.strip_prefix("Session ID: "))
+            .collect();
+        assert_eq!(shown_sessions.len(), 2, "{stdout}");
+        assert_ne!(shown_sessions[0], shown_sessions[1]);
+
+        let db = Database::connect(format!("sqlite://{}?mode=rw", path.display()))
+            .await
+            .unwrap();
+        let rows = db.query_all_raw(Statement::from_string(DbBackend::Sqlite,
+            "SELECT request_id, session_id, agent_run_id, attempts, status, request, response FROM llm_traces"))
+            .await.unwrap();
+        assert_eq!(rows.len(), 4, "{api}");
+        let mut records = Vec::new();
+        for body in &bodies {
+            let row = rows
+                .iter()
+                .find(|row| row.try_get::<Value>("", "request").unwrap() == *body)
+                .expect("存储的完整请求应与实际 HTTP 请求体一致");
+            let id: String = row.try_get("", "request_id").unwrap();
+            let session: String = row.try_get("", "session_id").unwrap();
+            let run: String = row.try_get("", "agent_run_id").unwrap();
+            let attempts: i32 = row.try_get("", "attempts").unwrap();
+            let status: String = row.try_get("", "status").unwrap();
+            let response: Value = row.try_get("", "response").unwrap();
+            assert_eq!(attempts, 1);
+            assert_eq!(status, "completed");
+            assert!(!response.is_null());
+            records.push((id, session, run));
+        }
+        assert_eq!(records[0].1, shown_sessions[0]);
+        assert_eq!(records[1].1, shown_sessions[0]);
+        assert_eq!(records[2].1, shown_sessions[0]);
+        assert_eq!(records[3].1, shown_sessions[1]);
+        assert_eq!(records[0].2, records[1].2);
+        assert_ne!(records[1].2, records[2].2);
+        assert_eq!(
+            records
+                .iter()
+                .map(|record| &record.0)
+                .collect::<std::collections::HashSet<_>>()
+                .len(),
+            4
+        );
+        drop(db);
+        std::fs::remove_file(path).unwrap();
+    }
+}
+
+#[test]
+fn unreachable_trace_database_warns_without_blocking_model_or_exposing_uri() {
+    let secret_url = "postgres://trace_user:private_password@127.0.0.1:1/trace";
+    let (output, bodies) = run_repl_with_env(
+        "chat-completions",
+        vec![Reply::ChatFinal],
+        "hello\n/exit\n",
+        &[
+            ("GEER_AGENT_TRACE_DATABASE", "postgres"),
+            ("GEER_AGENT_TRACE_DATABASE_URL", secret_url),
+        ],
+    );
+    assert!(output.status.success());
+    assert_eq!(bodies.len(), 1);
+    assert!(String::from_utf8_lossy(&output.stdout).contains("done"));
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(stderr.contains("Trace 数据库连接或初始化失败"), "{stderr}");
+    assert!(!stderr.contains("private_password"));
+    assert!(!stderr.contains(secret_url));
+}
+
+#[test]
+fn trace_write_failure_warns_and_preserves_model_answer() {
+    let path = std::env::temp_dir().join(format!(
+        "geer-trace-write-failure-{}.sqlite",
+        Uuid::new_v4()
+    ));
+    let url = format!("sqlite://{}?mode=rwc", path.display());
+    let (output, bodies) = run_repl_with_env(
+        "chat-completions",
+        vec![Reply::ChatFinalDropTrace(path.display().to_string())],
+        "hello\n/exit\n",
+        &[
+            ("GEER_AGENT_TRACE_DATABASE", "sqlite"),
+            ("GEER_AGENT_TRACE_DATABASE_URL", &url),
+        ],
+    );
+    assert!(output.status.success());
+    assert_eq!(bodies.len(), 1);
+    assert!(String::from_utf8_lossy(&output.stdout).contains("done"));
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(stderr.contains("Trace 写入失败（request_id="), "{stderr}");
+    assert!(!stderr.contains(&url));
+    let _ = std::fs::remove_file(path);
+}
+
+#[test]
+fn invalid_trace_database_selection_fails_before_repl() {
+    let output = Command::new(env!("CARGO_BIN_EXE_geer-agent"))
+        .env("OPENAI_API_KEY", "test-key")
+        .env("OPENAI_MODEL", "test-model")
+        .env("GEER_AGENT_TRACE_DATABASE", "unknown")
+        .env(
+            "GEER_AGENT_TRACE_DATABASE_URL",
+            "sqlite://trace.sqlite?mode=rwc",
+        )
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("GEER_AGENT_TRACE_DATABASE 只能是"));
+}
+
+#[tokio::test]
+async fn chat_trace_counts_transport_retry_and_keeps_partial_failure() {
+    let path = std::env::temp_dir().join(format!("geer-trace-chat-{}.sqlite", Uuid::new_v4()));
+    let url = format!("sqlite://{}?mode=rwc", path.display());
+    let (output, bodies) = run_repl_with_env(
+        "chat-completions",
+        vec![Reply::RetryableError, Reply::ChatFinal, Reply::ChatPartial],
+        "first\nsecond\n/exit\n",
+        &[
+            ("GEER_AGENT_TRACE_DATABASE", "sqlite"),
+            ("GEER_AGENT_TRACE_DATABASE_URL", &url),
+        ],
+    );
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(bodies.len(), 3);
+    assert_eq!(bodies[0], bodies[1]);
+    let db = Database::connect(format!("sqlite://{}?mode=rw", path.display()))
+        .await
+        .unwrap();
+    let rows = db
+        .query_all_raw(Statement::from_string(
+            DbBackend::Sqlite,
+            "SELECT request, response, status, attempts FROM llm_traces",
+        ))
+        .await
+        .unwrap();
+    assert_eq!(rows.len(), 2);
+    let completed = rows
+        .iter()
+        .find(|row| row.try_get::<Value>("", "request").unwrap() == bodies[0])
+        .unwrap();
+    let failed = rows
+        .iter()
+        .find(|row| row.try_get::<Value>("", "request").unwrap() == bodies[2])
+        .unwrap();
+    assert_eq!(
+        completed.try_get::<String>("", "status").unwrap(),
+        "completed"
+    );
+    assert_eq!(completed.try_get::<i32>("", "attempts").unwrap(), 2);
+    assert_eq!(failed.try_get::<String>("", "status").unwrap(), "failed");
+    assert_eq!(failed.try_get::<i32>("", "attempts").unwrap(), 1);
+    assert_eq!(
+        failed.try_get::<Value>("", "response").unwrap()["text"],
+        "part"
+    );
+    drop(db);
+    std::fs::remove_file(path).unwrap();
+}
+
+#[tokio::test]
+async fn trace_redacts_configured_api_key_even_when_it_appears_in_user_input() {
+    let path = std::env::temp_dir().join(format!("geer-trace-secret-{}.sqlite", Uuid::new_v4()));
+    let url = format!("sqlite://{}?mode=rwc", path.display());
+    let (output, bodies) = run_repl_with_env(
+        "chat-completions",
+        vec![Reply::ChatFinal],
+        "test-key\n/exit\n",
+        &[
+            ("GEER_AGENT_TRACE_DATABASE", "sqlite"),
+            ("GEER_AGENT_TRACE_DATABASE_URL", &url),
+        ],
+    );
+    assert!(output.status.success());
+    assert!(bodies[0].to_string().contains("test-key"));
+    let db = Database::connect(format!("sqlite://{}?mode=rw", path.display()))
+        .await
+        .unwrap();
+    let rows = db
+        .query_all_raw(Statement::from_string(
+            DbBackend::Sqlite,
+            "SELECT request, response FROM llm_traces",
+        ))
+        .await
+        .unwrap();
+    assert_eq!(rows.len(), 1);
+    let stored_request: Value = rows[0].try_get("", "request").unwrap();
+    assert!(!stored_request.to_string().contains("test-key"));
+    assert!(stored_request.to_string().contains("[REDACTED]"));
+    drop(db);
+    std::fs::remove_file(path).unwrap();
 }

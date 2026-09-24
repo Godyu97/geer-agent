@@ -4,6 +4,7 @@ pub(crate) mod openai;
 
 use std::{error::Error, io};
 
+use crate::trace::TraceCapture;
 use async_openai::types::responses::OutputItem;
 use async_openai::types::{chat::ChatCompletionRequestMessage, responses::InputItem};
 use serde_json::Value;
@@ -52,6 +53,7 @@ pub(crate) trait ChatProvider {
         &mut self,
         messages: Messages,
         tools: &[ToolSpec],
+        capture: &mut TraceCapture,
         on_delta: F,
     ) -> Result<ModelStep, Box<dyn Error>>
     where

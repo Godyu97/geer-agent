@@ -1,3 +1,5 @@
+use sea_orm::{ConnectionTrait, Database, DbBackend, Statement};
+use serde_json::Value;
 use std::{
     io::{Read, Write},
     net::{TcpListener, TcpStream},
@@ -5,6 +7,7 @@ use std::{
     thread,
     time::{Duration, Instant},
 };
+use uuid::Uuid;
 
 #[derive(Clone)]
 enum Reply {
@@ -14,6 +17,14 @@ enum Reply {
 }
 
 fn run_repl(replies: Vec<Reply>, input: &str) -> (Output, Vec<String>) {
+    run_repl_with_trace(replies, input, None)
+}
+
+fn run_repl_with_trace(
+    replies: Vec<Reply>,
+    input: &str,
+    trace_url: Option<&str>,
+) -> (Output, Vec<String>) {
     let listener = TcpListener::bind("127.0.0.1:0").expect("绑定测试端口");
     listener.set_nonblocking(true).expect("设置非阻塞监听");
     let url = format!("http://{}/v1", listener.local_addr().expect("读取测试端口"));
@@ -40,7 +51,8 @@ fn run_repl(replies: Vec<Reply>, input: &str) -> (Output, Vec<String>) {
         bodies
     });
 
-    let mut child = Command::new(env!("CARGO_BIN_EXE_geer-agent"))
+    let mut command = Command::new(env!("CARGO_BIN_EXE_geer-agent"));
+    command
         .env("OPENAI_API_KEY", "test-key")
         .env("OPENAI_MODEL", "test-model")
         .env("OPENAI_BASE_URL", url)
@@ -48,9 +60,13 @@ fn run_repl(replies: Vec<Reply>, input: &str) -> (Output, Vec<String>) {
         .env("GEER_AGENT_TOOLS", "off")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .expect("启动 REPL");
+        .stderr(Stdio::piped());
+    if let Some(trace_url) = trace_url {
+        command
+            .env("GEER_AGENT_TRACE_DATABASE", "sqlite")
+            .env("GEER_AGENT_TRACE_DATABASE_URL", trace_url);
+    }
+    let mut child = command.spawn().expect("启动 REPL");
     child
         .stdin
         .take()
@@ -178,4 +194,62 @@ fn partial_text_failure_is_not_retried() {
     assert!(!stdout.contains("retry"), "{stdout}");
     assert!(stderr.contains("模型请求失败"), "{stderr}");
     assert_eq!(bodies.len(), 1);
+}
+
+#[tokio::test]
+async fn trace_retries_once_logically_and_retains_partial_failure() {
+    let path = std::env::temp_dir().join(format!("geer-trace-retry-{}.sqlite", Uuid::new_v4()));
+    let url = format!("sqlite://{}?mode=rwc", path.display());
+    let (output, bodies) = run_repl_with_trace(
+        vec![Reply::Error, Reply::Error, Reply::Completed, Reply::Partial],
+        "first\nsecond\n/exit\n",
+        Some(&url),
+    );
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(bodies.len(), 4);
+    let db = Database::connect(format!("sqlite://{}?mode=rw", path.display()))
+        .await
+        .unwrap();
+    let rows = db
+        .query_all_raw(Statement::from_string(
+            DbBackend::Sqlite,
+            "SELECT request_id, request, response, status, attempts, error FROM llm_traces",
+        ))
+        .await
+        .unwrap();
+    assert_eq!(rows.len(), 2);
+    let first_request: Value = serde_json::from_str(&bodies[0]).unwrap();
+    let second_request: Value = serde_json::from_str(&bodies[3]).unwrap();
+    let first = rows
+        .iter()
+        .find(|row| row.try_get::<Value>("", "request").unwrap() == first_request)
+        .unwrap();
+    let second = rows
+        .iter()
+        .find(|row| row.try_get::<Value>("", "request").unwrap() == second_request)
+        .unwrap();
+    assert_ne!(
+        first.try_get::<String>("", "request_id").unwrap(),
+        second.try_get::<String>("", "request_id").unwrap()
+    );
+    assert_eq!(first.try_get::<i32>("", "attempts").unwrap(), 3);
+    assert_eq!(first.try_get::<String>("", "status").unwrap(), "completed");
+    assert_eq!(second.try_get::<i32>("", "attempts").unwrap(), 1);
+    assert_eq!(second.try_get::<String>("", "status").unwrap(), "failed");
+    assert_eq!(
+        second.try_get::<Value>("", "response").unwrap()["text"],
+        "hello"
+    );
+    assert!(
+        !second
+            .try_get::<String>("", "error")
+            .unwrap()
+            .contains("test-key")
+    );
+    drop(db);
+    std::fs::remove_file(path).unwrap();
 }

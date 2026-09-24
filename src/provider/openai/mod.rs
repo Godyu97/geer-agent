@@ -11,6 +11,7 @@ use async_openai::types::{
 use crate::{
     config::{Config, OpenAiApi},
     provider::{ChatProvider, Messages, ModelStep, ToolSpec},
+    trace::TraceCapture,
 };
 
 use chat::Chat;
@@ -70,6 +71,7 @@ impl ChatProvider for Provider {
         &mut self,
         messages: Messages,
         tools: &[ToolSpec],
+        capture: &mut TraceCapture,
         on_delta: F,
     ) -> Result<ModelStep, Box<dyn Error>>
     where
@@ -83,11 +85,11 @@ impl ChatProvider for Provider {
                     input,
                 },
             ) => {
-                api.complete_step(instructions, input, tools, on_delta)
+                api.complete_step(instructions, input, tools, capture, on_delta)
                     .await
             }
             (Api::ChatCompletions(api), Messages::Chat(messages)) => {
-                api.complete_step(messages, tools, on_delta).await
+                api.complete_step(messages, tools, capture, on_delta).await
             }
             _ => Err(
                 io::Error::new(io::ErrorKind::InvalidInput, "模型接口与消息类型不匹配。").into(),
