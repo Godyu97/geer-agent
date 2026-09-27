@@ -1107,15 +1107,21 @@ mod tests {
         .expect("批次成功");
         assert_eq!((metrics.turns, metrics.tool_calls), (2, 4));
         let messages = chat.snapshots[1].as_array().expect("第二轮消息");
-        assert_eq!(messages[3]["content"], "before");
-        assert_eq!(messages[4]["content"], "other");
-        assert!(
-            messages[5]["content"]
+        let read_body = |index: usize| {
+            messages[index]["content"]
                 .as_str()
-                .expect("写入结果")
-                .contains("已写入")
-        );
-        assert_eq!(messages[6]["content"], "after");
+                .expect("读取结果")
+                .split_once("\n\n")
+                .expect("元信息与正文分隔")
+                .1
+        };
+        assert_eq!(read_body(3), "before");
+        assert_eq!(read_body(4), "other");
+        let write: serde_json::Value =
+            serde_json::from_str(messages[5]["content"].as_str().expect("写入结果"))
+                .expect("写入元信息");
+        assert_eq!(write["changed"], true);
+        assert_eq!(read_body(6), "after");
         fs::remove_dir_all(dir).expect("清理目录");
     }
 
@@ -1148,7 +1154,7 @@ mod tests {
         assert_eq!(metrics.turns, 3);
         assert_eq!(metrics.tool_calls, 99);
         assert_eq!(printed.matches("[调用工具 get_current_time]").count(), 99);
-        assert_eq!(chat.tool_counts, vec![5, 5, 0]);
+        assert_eq!(chat.tool_counts, vec![8, 8, 0]);
         assert!(
             chat.snapshots[2][0]["content"]
                 .as_str()
@@ -1171,7 +1177,7 @@ mod tests {
         assert_eq!(metrics.turns, 3);
         assert_eq!(metrics.tool_calls, 100);
         assert_eq!(printed.matches("[调用工具 get_current_time]").count(), 100);
-        assert_eq!(chat.tool_counts, vec![5, 5, 0]);
+        assert_eq!(chat.tool_counts, vec![8, 8, 0]);
     }
 
     #[tokio::test]
@@ -1207,7 +1213,7 @@ mod tests {
         assert_eq!(metrics.turns, 30);
         assert_eq!(metrics.tool_calls, 29);
         assert_eq!(chat.tool_counts.len(), 30);
-        assert!(chat.tool_counts[..29].iter().all(|count| *count == 5));
+        assert!(chat.tool_counts[..29].iter().all(|count| *count == 8));
         assert_eq!(chat.tool_counts[29], 0);
         assert!(
             chat.snapshots[29][0]["content"]
@@ -1241,7 +1247,7 @@ mod tests {
 
         assert_eq!(metrics.turns, 2);
         assert_eq!(metrics.tool_calls, 1);
-        assert_eq!(chat.tool_counts, vec![5, 0]);
+        assert_eq!(chat.tool_counts, vec![8, 0]);
         assert!(printed.contains(FINALIZATION_FALLBACK.trim()));
         let Messages::Chat(messages) = prompt.messages() else {
             panic!("Chat 消息")
@@ -1265,7 +1271,7 @@ mod tests {
 
         assert_eq!(metrics.turns, 1);
         assert_eq!(metrics.tool_calls, 1);
-        assert_eq!(chat.tool_counts, vec![5, 0]);
+        assert_eq!(chat.tool_counts, vec![8, 0]);
         assert!(printed.contains(FINALIZATION_FALLBACK.trim()));
         let Messages::Chat(messages) = prompt.messages() else {
             panic!("Chat 消息")
@@ -1311,7 +1317,7 @@ mod tests {
             metrics.termination_reason,
             Some(TerminationReason::RepeatedToolLoop)
         );
-        assert_eq!(chat.tool_counts, vec![5, 5, 5, 5, 0]);
+        assert_eq!(chat.tool_counts, vec![8, 8, 8, 8, 0]);
         assert!(
             chat.snapshots[3][0]["content"]
                 .as_str()
@@ -1394,7 +1400,7 @@ mod tests {
                 .expect("应收敛");
             assert_eq!(metrics.termination_reason, Some(reason));
             assert_eq!(metrics.tool_calls, 0);
-            assert_eq!(chat.tool_counts, vec![5, 0]);
+            assert_eq!(chat.tool_counts, vec![8, 0]);
         }
     }
 

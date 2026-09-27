@@ -1,4 +1,4 @@
-use std::{io, path::Path, process::Stdio, time::Duration};
+use std::{ffi::OsString, io, path::Path, process::Stdio, time::Duration};
 
 use tokio::{
     io::{AsyncRead, AsyncReadExt},
@@ -9,7 +9,7 @@ use tokio::{
 
 const COMMAND_TIMEOUT: Duration = Duration::from_secs(10);
 const MAX_CAPTURE_BYTES: usize = 8 * 1024;
-const MAX_RESULT_CHARS: usize = 2000;
+pub(super) const MAX_RESULT_CHARS: usize = 2000;
 
 pub(super) async fn run_with_status(bash_bin: &Path, cwd: &Path, command: &str) -> (String, bool) {
     match run_with_timeout_status(bash_bin, cwd, command, COMMAND_TIMEOUT).await {
@@ -36,9 +36,61 @@ async fn run_with_timeout_status(
     command: &str,
     limit: Duration,
 ) -> io::Result<(String, bool)> {
-    let mut child = Command::new(bash_bin)
-        .arg("-c")
-        .arg(command)
+    let output = run_command(bash_bin, cwd, command, &[], limit).await?;
+    let success = !output.timed_out && output.exit_code == Some(0);
+    let mut result = if output.timed_out {
+        "命令超过时间限制，已终止。\n".to_owned()
+    } else {
+        format!(
+            "退出状态：{}\n",
+            output
+                .exit_code
+                .map_or_else(|| "由信号终止".to_owned(), |code| code.to_string())
+        )
+    };
+    result.push_str(&String::from_utf8_lossy(&output.stdout.bytes));
+    if !output.stderr.bytes.is_empty() {
+        if !output.stdout.bytes.is_empty() {
+            result.push('\n');
+        }
+        result.push_str(&String::from_utf8_lossy(&output.stderr.bytes));
+    }
+    if output.stdout.truncated || output.stderr.truncated {
+        result.push_str("\n[输出已截断]");
+    }
+    Ok((truncate_chars(result, MAX_RESULT_CHARS), success))
+}
+
+pub(super) struct CommandOutput {
+    pub exit_code: Option<i32>,
+    pub timed_out: bool,
+    pub stdout: Capture,
+    pub stderr: Capture,
+}
+
+pub(super) async fn run_fixed(
+    bash_bin: &Path,
+    cwd: &Path,
+    script: &str,
+    args: &[OsString],
+) -> io::Result<CommandOutput> {
+    run_command(bash_bin, cwd, script, args, COMMAND_TIMEOUT).await
+}
+
+async fn run_command(
+    bash_bin: &Path,
+    cwd: &Path,
+    script: &str,
+    args: &[OsString],
+    limit: Duration,
+) -> io::Result<CommandOutput> {
+    let mut command = Command::new(bash_bin);
+    command.arg("-c").arg(script);
+    if !args.is_empty() {
+        // bash -c 后的第一个参数是 $0；用户数据只进入后续位置参数。
+        command.arg("geer-file-query").args(args);
+    }
+    let mut child = command
         .current_dir(cwd)
         .env_remove("OPENAI_API_KEY")
         .stdin(Stdio::null())
@@ -63,35 +115,17 @@ async fn run_with_timeout_status(
             None
         }
     };
-    let stdout = join_capture(&mut stdout_task).await?;
-    let stderr = join_capture(&mut stderr_task).await?;
-    let success = status.is_some_and(|status| status.success());
-    let mut result = if let Some(status) = status {
-        format!(
-            "退出状态：{}\n",
-            status
-                .code()
-                .map_or_else(|| "由信号终止".to_owned(), |code| code.to_string())
-        )
-    } else {
-        "命令超过时间限制，已终止。\n".to_owned()
-    };
-    result.push_str(&String::from_utf8_lossy(&stdout.bytes));
-    if !stderr.bytes.is_empty() {
-        if !stdout.bytes.is_empty() {
-            result.push('\n');
-        }
-        result.push_str(&String::from_utf8_lossy(&stderr.bytes));
-    }
-    if stdout.truncated || stderr.truncated {
-        result.push_str("\n[输出已截断]");
-    }
-    Ok((truncate_chars(result, MAX_RESULT_CHARS), success))
+    Ok(CommandOutput {
+        exit_code: status.and_then(|status| status.code()),
+        timed_out: status.is_none(),
+        stdout: join_capture(&mut stdout_task).await?,
+        stderr: join_capture(&mut stderr_task).await?,
+    })
 }
 
-struct Capture {
-    bytes: Vec<u8>,
-    truncated: bool,
+pub(super) struct Capture {
+    pub bytes: Vec<u8>,
+    pub truncated: bool,
 }
 
 async fn read_bounded(mut reader: impl AsyncRead + Unpin) -> io::Result<Capture> {
@@ -135,7 +169,7 @@ fn truncate_chars(text: String, max: usize) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::run_with_timeout;
+    use super::{run_command, run_with_timeout};
     use std::{path::Path, time::Duration};
 
     #[tokio::test]
@@ -175,22 +209,39 @@ mod tests {
         assert!(long.contains("输出已截断"));
     }
 
+    #[tokio::test]
+    async fn fixed_arguments_keep_literal_values_and_raw_status() {
+        let args = ["$(exit 88)", "a ' \" b", "--files"].map(Into::into);
+        let result = run_command(
+            Path::new("bash"),
+            Path::new("."),
+            r#"printf '%s\n' "$1" "$2" "$3"; printf 'diagnostic' >&2; exit 7"#,
+            &args,
+            Duration::from_secs(1),
+        )
+        .await
+        .expect("执行固定脚本");
+        assert_eq!(result.exit_code, Some(7));
+        assert!(!result.timed_out);
+        assert_eq!(
+            String::from_utf8(result.stdout.bytes).unwrap(),
+            "$(exit 88)\na ' \" b\n--files\n"
+        );
+        assert_eq!(result.stderr.bytes, b"diagnostic");
+    }
+
     #[cfg(unix)]
     #[tokio::test]
     async fn uses_configured_executable() {
-        use std::{fs, os::unix::fs::PermissionsExt};
-
-        let path =
-            std::env::temp_dir().join(format!("geer-agent-custom-bash-{}", std::process::id()));
-        fs::write(&path, "#!/bin/sh\nprintf custom-bash-selected\n").expect("创建测试可执行文件");
-        fs::set_permissions(&path, fs::Permissions::from_mode(0o700)).expect("设置执行权限");
+        let path = std::env::split_paths(&std::env::var_os("PATH").expect("PATH 存在"))
+            .map(|directory| directory.join("false"))
+            .find(|path| path.is_file())
+            .expect("PATH 中存在 false 可执行文件");
         let cwd = std::env::current_dir().expect("工作目录存在");
-        let result = run_with_timeout(&path, &cwd, "printf ignored", Duration::from_secs(1)).await;
-        fs::remove_file(&path).expect("清理测试文件");
-        assert!(
-            result
-                .expect("执行自定义文件")
-                .contains("custom-bash-selected")
-        );
+        let result = run_with_timeout(&path, &cwd, "printf ignored", Duration::from_secs(1))
+            .await
+            .expect("执行配置的可执行文件");
+        assert!(result.contains("退出状态：1"), "{result}");
+        assert!(!result.contains("ignored"), "不得改用默认 Bash：{result}");
     }
 }

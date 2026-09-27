@@ -307,7 +307,7 @@ fn responses_api_returns_two_tool_results_before_final_answer() {
         assert!(prompt.contains("system_version:"));
         assert!(prompt.contains("bash_version: GNU bash, version "));
     }
-    assert_eq!(bodies[0]["tools"].as_array().expect("工具清单").len(), 5);
+    assert_eq!(bodies[0]["tools"].as_array().expect("工具清单").len(), 8);
     let input = bodies[1]["input"].as_array().expect("下一请求历史");
     assert_eq!(
         input
@@ -335,7 +335,7 @@ fn chat_api_reassembles_fragments_and_pairs_tool_result() {
         "{}",
         String::from_utf8_lossy(&output.stderr)
     );
-    assert_eq!(bodies[0]["tools"].as_array().expect("工具清单").len(), 5);
+    assert_eq!(bodies[0]["tools"].as_array().expect("工具清单").len(), 8);
     for body in &bodies {
         let messages = body["messages"].as_array().expect("消息");
         assert_eq!(messages[0]["role"], "system");
@@ -358,6 +358,167 @@ fn chat_api_reassembles_fragments_and_pairs_tool_result() {
             .any(|item| item["role"] == "tool" && item["tool_call_id"] == "call_1")
     );
     assert!(String::from_utf8_lossy(&output.stdout).contains("done"));
+}
+
+#[test]
+fn both_apis_expose_same_file_contract_and_pair_parameter_errors() {
+    let mut declarations = Vec::new();
+    for api in ["responses", "chat-completions"] {
+        let final_reply = if api == "responses" {
+            Reply::ResponsesFinal
+        } else {
+            Reply::ChatFinal
+        };
+        let (output, bodies) = run_repl(
+            api,
+            vec![
+                named(api, "rg", r#"{"pattern":"x","unknown":1}"#, 1, false),
+                final_reply,
+            ],
+            "search\n/exit\n",
+        );
+        assert!(
+            output.status.success(),
+            "{api}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let tools = bodies[0]["tools"].as_array().expect("工具清单");
+        assert_eq!(tools.len(), 8);
+        let normalized: Vec<_> = tools
+            .iter()
+            .map(|tool| {
+                let function = if api == "responses" {
+                    tool
+                } else {
+                    &tool["function"]
+                };
+                json!({
+                    "name": function["name"],
+                    "description": function["description"],
+                    "parameters": function["parameters"],
+                })
+            })
+            .collect();
+        let names: Vec<_> = normalized
+            .iter()
+            .map(|tool| tool["name"].as_str().expect("工具名"))
+            .collect();
+        assert_eq!(
+            names,
+            [
+                "get_current_time",
+                "bash",
+                "ls",
+                "glob",
+                "rg",
+                "read",
+                "write",
+                "edit"
+            ]
+        );
+        for tool in normalized.iter().skip(2) {
+            assert!(!tool["description"].as_str().expect("用途").is_empty());
+            assert_eq!(tool["parameters"]["additionalProperties"], false);
+        }
+        assert_eq!(normalized[3]["parameters"]["required"], json!(["pattern"]));
+        assert_eq!(
+            normalized[4]["parameters"]["properties"]["output"]["default"],
+            "content"
+        );
+        assert_eq!(
+            normalized[4]["parameters"]["properties"]["fixed_strings"]["default"],
+            false
+        );
+        assert_eq!(
+            normalized[5]["parameters"]["properties"]["offset"]["default"],
+            1
+        );
+        assert_eq!(
+            normalized[5]["parameters"]["properties"]["limit"]["default"],
+            2000
+        );
+        let prompt = if api == "responses" {
+            bodies[0]["instructions"].as_str().expect("系统提示")
+        } else {
+            bodies[0]["messages"][0]["content"]
+                .as_str()
+                .expect("系统提示")
+        };
+        assert!(prompt.contains("next_offset"));
+        assert!(prompt.contains("ls"));
+        let text = if api == "responses" {
+            bodies[1]["input"]
+                .as_array()
+                .expect("历史")
+                .iter()
+                .find(|item| item["type"] == "function_call_output" && item["call_id"] == "call_1")
+                .and_then(|item| item["output"].as_str())
+        } else {
+            bodies[1]["messages"]
+                .as_array()
+                .expect("历史")
+                .iter()
+                .find(|item| item["role"] == "tool" && item["tool_call_id"] == "call_1")
+                .and_then(|item| item["content"].as_str())
+        }
+        .expect("调用结果与标识配对");
+        let meta: Value =
+            serde_json::from_str(text.split_once("\n\n").expect("元信息").0).expect("错误 JSON");
+        assert_eq!(meta["code"], "invalid_argument");
+        assert_eq!(meta["field"], "unknown");
+        declarations.push(normalized);
+    }
+    assert_eq!(
+        declarations[0], declarations[1],
+        "两种协议的参数语义必须一致"
+    );
+}
+
+#[test]
+fn queries_stay_disabled_without_tools_and_denied_calls_are_paired() {
+    for api in ["responses", "chat-completions"] {
+        let final_reply = if api == "responses" {
+            Reply::ResponsesFinal
+        } else {
+            Reply::ChatFinal
+        };
+        let (output, bodies) = run_repl_with_env(
+            api,
+            vec![final_reply.clone()],
+            "disabled\n/exit\n",
+            &[("GEER_AGENT_TOOLS", "off")],
+        );
+        assert!(output.status.success());
+        assert!(
+            bodies[0]["tools"].is_null()
+                || bodies[0]["tools"].as_array().is_some_and(Vec::is_empty)
+        );
+        let (output, bodies) = run_repl(
+            api,
+            vec![named(api, "ls", "{}", 1, false), final_reply],
+            "list\n/exit\n",
+        );
+        assert!(output.status.success());
+        let text = if api == "responses" {
+            bodies[1]["input"]
+                .as_array()
+                .expect("历史")
+                .iter()
+                .find(|item| item["type"] == "function_call_output" && item["call_id"] == "call_1")
+                .and_then(|item| item["output"].as_str())
+        } else {
+            bodies[1]["messages"]
+                .as_array()
+                .expect("历史")
+                .iter()
+                .find(|item| item["role"] == "tool" && item["tool_call_id"] == "call_1")
+                .and_then(|item| item["content"].as_str())
+        }
+        .expect("拒绝结果与标识配对");
+        let meta: Value =
+            serde_json::from_str(text.split_once("\n\n").expect("元信息").0).expect("错误 JSON");
+        assert_eq!(meta["code"], "authorization_denied");
+    }
 }
 
 #[test]
@@ -584,7 +745,7 @@ fn both_apis_finalize_without_tools_and_keep_final_text() {
         );
         assert_eq!(
             next_turn["tools"].as_array().expect("下一轮恢复工具").len(),
-            5,
+            8,
             "{api}"
         );
 

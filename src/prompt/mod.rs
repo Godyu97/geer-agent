@@ -126,7 +126,7 @@ fn format_system_version(os: &str, release: &str, kernel: &str) -> String {
 
 fn compose(system: &str, bash: &str, current_dir: &str) -> String {
     format!(
-        "你是本机运行的助手。回答和建议的命令应参考以下环境信息。\n<context_data>\nsystem_version: {}\nbash_version: {}\ncurrent_dir: {}\n</context_data>",
+        "你是本机运行的助手。回答和建议的命令应参考以下环境信息。\n<context_data>\nsystem_version: {}\nbash_version: {}\ncurrent_dir: {}\n</context_data>\n若提供文件工具：按线索直接选择目录 ls、路径 glob、正文 rg，不必依次调用。搜索结果先用 read 获取原文，再以 edit 局部修改；整体覆盖用 write。read 元信息与正文分开，续读用 next_offset（行号），勿把元信息或搜索行号复制进 oldText。各文件工具分别首次授权；查询限 10 秒/2000 字符，truncated 时缩小范围，changed=false 表示文件未变。拒绝授权后停止，不要换工具绕过。",
         escape_xml(system),
         escape_xml(bash),
         escape_xml(current_dir),

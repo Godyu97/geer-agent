@@ -175,7 +175,10 @@ fn canonical_json(value: &serde_json::Value) -> String {
 #[cfg(test)]
 mod tests {
     use super::{LoopGuard, StopReason, call_fingerprint};
-    use crate::{provider::ToolCall, tools::ToolOutput};
+    use crate::{
+        provider::ToolCall,
+        tools::{ToolOutput, Tools},
+    };
 
     fn call(name: &str, args: &str) -> ToolCall {
         ToolCall {
@@ -285,5 +288,36 @@ mod tests {
             );
         }
         assert_eq!(guard.soft_turn_limit(12), 15);
+    }
+
+    #[tokio::test]
+    async fn real_noop_file_operations_do_not_advance_modification_count() {
+        let dir = std::env::temp_dir().join(format!("geer-guard-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).expect("测试目录");
+        let path = dir.join("a.txt");
+        let mut tools = Tools::new(true, "bash".into()).expect("初始化工具");
+        tools.allow_all_for_test();
+        let write_args = serde_json::json!({"path":path,"content":"hello"}).to_string();
+        let created = tools.execute_recorded("write", &write_args).await;
+        assert!(created.success && created.changed);
+
+        let mut guard = LoopGuard::default();
+        let unchanged_write = tools.execute_recorded("write", &write_args).await;
+        assert!(unchanged_write.success && !unchanged_write.changed);
+        guard.observe_turn(&[call("write", &write_args)], &[unchanged_write]);
+        let edit_args =
+            serde_json::json!({"path":path,"edits":[{"oldText":"hello","newText":"hello"}]})
+                .to_string();
+        for turn in 0..4 {
+            let unchanged_edit = tools.execute_recorded("edit", &edit_args).await;
+            assert!(unchanged_edit.success && !unchanged_edit.changed);
+            assert_eq!(
+                guard.observe_turn(&[call("edit", &edit_args)], &[unchanged_edit]),
+                (turn == 3).then_some(StopReason::RepeatedToolLoop)
+            );
+        }
+        assert_eq!(guard.metrics.files_modified, 0);
+        assert_eq!(std::fs::read_to_string(&path).expect("读取文件"), "hello");
+        std::fs::remove_dir_all(dir).expect("清理测试目录");
     }
 }
