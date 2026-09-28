@@ -1,0 +1,248 @@
+use std::{
+    io::{Read, Write},
+    net::{TcpListener, TcpStream},
+    process::{Command, Output, Stdio},
+    thread,
+    time::{Duration, Instant},
+};
+
+use sea_orm::{ConnectionTrait, Database, DbBackend, Statement};
+use serde_json::{Value, json};
+use uuid::Uuid;
+
+fn body(stream: &mut TcpStream) -> Value {
+    let mut bytes = Vec::new();
+    let mut block = [0_u8; 4096];
+    let end = loop {
+        let count = stream.read(&mut block).unwrap();
+        assert!(count > 0);
+        bytes.extend_from_slice(&block[..count]);
+        if let Some(position) = bytes.windows(4).position(|window| window == b"\r\n\r\n") {
+            break position + 4;
+        }
+    };
+    let headers = String::from_utf8_lossy(&bytes[..end]);
+    let length = headers
+        .lines()
+        .find_map(|line| {
+            let (name, value) = line.split_once(':')?;
+            name.eq_ignore_ascii_case("content-length")
+                .then(|| value.trim().parse::<usize>().unwrap())
+        })
+        .unwrap();
+    while bytes.len() - end < length {
+        let count = stream.read(&mut block).unwrap();
+        assert!(count > 0);
+        bytes.extend_from_slice(&block[..count]);
+    }
+    serde_json::from_slice(&bytes[end..end + length]).unwrap()
+}
+
+fn reply(stream: &mut TcpStream, api: &str, text: &str, index: usize) {
+    let body = if api == "chat-completions" {
+        let chunk = json!({
+            "id": format!("chat_{index}"), "object": "chat.completion.chunk", "created": 0,
+            "model": "test-model", "choices": [{"index": 0, "delta": {"content": text}, "finish_reason": "stop"}]
+        });
+        format!("data: {chunk}\n\n")
+    } else {
+        let response = json!({
+            "created_at": 0, "completed_at": 0, "id": format!("resp_{index}"),
+            "model": "test-model", "object": "response", "status": "completed",
+            "output": [{"type": "message", "id": format!("msg_{index}"), "role": "assistant",
+                "status": "completed", "content": [{"type": "output_text", "annotations": [], "text": text}]}]
+        });
+        format!(
+            "data: {}\n\ndata: {}\n\n",
+            json!({"type":"response.output_text.delta", "sequence_number":1, "item_id":format!("msg_{index}"), "output_index":0,"content_index":0,"delta":text}),
+            json!({"type": "response.completed", "sequence_number": 2, "response": response})
+        )
+    };
+    write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
+}
+
+fn run(api: &str, base_url: &str, db_url: &str, input: &str) -> Output {
+    run_with_model(api, base_url, db_url, "test-model", input)
+}
+
+fn run_with_model(api: &str, base_url: &str, db_url: &str, model: &str, input: &str) -> Output {
+    let mut child = Command::new(env!("CARGO_BIN_EXE_geer-agent"))
+        .env("OPENAI_API_KEY", "mock-key")
+        .env("OPENAI_MODEL", model)
+        .env("OPENAI_BASE_URL", base_url)
+        .env("OPENAI_API", api)
+        .env("GEER_AGENT_TOOLS", "off")
+        .env("GEER_AGENT_AUTO_COMPACT", "off")
+        .env("GEER_AGENT_SESSION_DATABASE", "sqlite")
+        .env("GEER_AGENT_SESSION_DATABASE_URL", db_url)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(input.as_bytes())
+        .unwrap();
+    child.wait_with_output().unwrap()
+}
+
+async fn cross_process(api: &str) {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let base_url = format!("http://{}/v1", listener.local_addr().unwrap());
+    let api_owned = api.to_owned();
+    let server = thread::spawn(move || {
+        let mut requests = Vec::new();
+        let deadline = Instant::now() + Duration::from_secs(20);
+        for (index, text) in [
+            "first-response",
+            "second-response",
+            "summary-of-first",
+            "continued-response",
+        ]
+        .iter()
+        .enumerate()
+        {
+            let (mut stream, _) = loop {
+                match listener.accept() {
+                    Ok(value) => break value,
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        assert!(
+                            Instant::now() < deadline,
+                            "模拟服务等待第 {} 次请求超时",
+                            index + 1
+                        );
+                        thread::sleep(Duration::from_millis(10));
+                    }
+                    Err(error) => panic!("模拟服务连接失败：{error}"),
+                }
+            };
+            stream
+                .set_read_timeout(Some(Duration::from_secs(3)))
+                .unwrap();
+            requests.push(body(&mut stream));
+            reply(&mut stream, &api_owned, text, index);
+        }
+        requests
+    });
+    let path = std::env::temp_dir().join(format!("geer-cross-process-{}.sqlite", Uuid::new_v4()));
+    let db_url = format!("sqlite://{}?mode=rwc", path.display());
+    let first = run(
+        api,
+        &base_url,
+        &db_url,
+        "first fact 111\nsecond fact 222\n/compact\n/sessions\n/exit\n",
+    );
+    assert!(
+        first.status.success(),
+        "{}",
+        String::from_utf8_lossy(&first.stderr)
+    );
+    let first_stdout = String::from_utf8_lossy(&first.stdout);
+    assert!(
+        first_stdout.contains("已压缩"),
+        "{first_stdout}\nstderr: {}",
+        String::from_utf8_lossy(&first.stderr)
+    );
+    let id = first_stdout
+        .lines()
+        .find_map(|line| line.strip_prefix("Session ID: "))
+        .unwrap();
+    assert!(first_stdout.contains(&format!("{id}  ")), "{first_stdout}");
+
+    let incompatible = run_with_model(
+        api,
+        &base_url,
+        &db_url,
+        "different-model",
+        &format!("/resume {id}\n/exit\n"),
+    );
+    let incompatible_stderr = String::from_utf8_lossy(&incompatible.stderr);
+    assert!(incompatible.status.success());
+    assert!(
+        incompatible_stderr.contains("不兼容"),
+        "{incompatible_stderr}"
+    );
+    assert!(
+        !String::from_utf8_lossy(&incompatible.stdout)
+            .contains(&format!("已恢复会话。\nSession ID: {id}"))
+    );
+
+    // 模拟进程在工具批次检查点之后退出；恢复只提示不确定性并等待下一条输入。
+    let db = Database::connect(format!("sqlite://{}?mode=rw", path.display()))
+        .await
+        .unwrap();
+    db.execute_unprepared(&format!(
+        "UPDATE agent_sessions SET uncertain_tools = 1 WHERE id = '{id}'"
+    ))
+    .await
+    .unwrap();
+    drop(db);
+
+    let second = run(
+        api,
+        &base_url,
+        &db_url,
+        &format!("/resume {id}\n/reset\n/resume {id}\nthird question\n/exit\n"),
+    );
+    assert!(
+        second.status.success(),
+        "{}",
+        String::from_utf8_lossy(&second.stderr)
+    );
+    let second_stdout = String::from_utf8_lossy(&second.stdout);
+    assert!(second_stdout.contains("已恢复会话"), "{second_stdout}");
+    assert!(second_stdout.contains("已清空对话记忆"), "{second_stdout}");
+    assert_eq!(second_stdout.matches("已恢复会话").count(), 2);
+    assert!(second_stdout.contains("状态未确认"), "{second_stdout}");
+    assert!(
+        second_stdout.contains("continued-response"),
+        "{second_stdout}"
+    );
+    let requests = server.join().unwrap();
+    assert_eq!(requests.len(), 4);
+    let continued = requests[3].to_string();
+    assert!(continued.contains("summary-of-first"), "{continued}");
+    assert!(continued.contains("second fact 222"), "{continued}");
+    assert!(continued.contains("third question"), "{continued}");
+    assert!(!continued.contains("first fact 111"), "{continued}");
+    assert!(!continued.contains("/compact"), "{continued}");
+    assert!(!continued.contains("/resume"), "{continued}");
+    assert!(!continued.contains("/reset"), "{continued}");
+
+    let db = Database::connect(format!("sqlite://{}?mode=rw", path.display()))
+        .await
+        .unwrap();
+    let rows = db
+        .query_all_raw(Statement::from_string(
+            DbBackend::Sqlite,
+            format!("SELECT kind, payload FROM agent_session_events WHERE session_id = '{id}'"),
+        ))
+        .await
+        .unwrap();
+    assert!(
+        rows.iter()
+            .any(|row| row.try_get::<String>("", "kind").unwrap() == "compaction")
+    );
+    assert!(rows.iter().any(|row| {
+        row.try_get::<Value>("", "payload")
+            .unwrap()
+            .to_string()
+            .contains("first fact 111")
+    }));
+    drop(db);
+    std::fs::remove_file(path).unwrap();
+}
+
+#[tokio::test]
+async fn chat_session_compacts_exits_resumes_and_continues() {
+    cross_process("chat-completions").await;
+}
+
+#[tokio::test]
+async fn responses_session_compacts_exits_resumes_and_continues() {
+    cross_process("responses").await;
+}

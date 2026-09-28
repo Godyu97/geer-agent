@@ -153,6 +153,16 @@ impl Tools {
         self.confirm = Box::new(|_| Ok(true));
     }
 
+    #[cfg(test)]
+    pub(crate) fn grant_for_test(&mut self, name: &str) {
+        self.grants.insert(name.to_owned());
+    }
+
+    #[cfg(test)]
+    pub(crate) fn granted_for_test(&self, name: &str) -> bool {
+        self.grants.contains(name)
+    }
+
     pub(crate) fn execution_mode(name: &str) -> ExecutionMode {
         ToolKind::find(name).map_or(ExecutionMode::Sequential, ToolKind::mode)
     }

@@ -60,16 +60,22 @@ impl fmt::Debug for TraceDatabaseConfig {
 
 impl TraceDatabaseConfig {
     fn from_values(database: Option<String>, url: Option<String>) -> Result<Option<Self>, String> {
+        Self::from_named_values(database, url, "GEER_AGENT_TRACE_DATABASE")
+    }
+
+    fn from_named_values(
+        database: Option<String>,
+        url: Option<String>,
+        name: &str,
+    ) -> Result<Option<Self>, String> {
+        let url_name = format!("{name}_URL");
         let database = database.as_deref().map(str::trim).unwrap_or_default();
         let url = url.as_deref().map(str::trim).unwrap_or_default();
         if database.is_empty() {
             return if url.is_empty() {
                 Ok(None)
             } else {
-                Err(
-                    "GEER_AGENT_TRACE_DATABASE_URL 需要同时设置 GEER_AGENT_TRACE_DATABASE。"
-                        .to_owned(),
-                )
+                Err(format!("{url_name} 需要同时设置 {name}。"))
             };
         }
         let kind = match database {
@@ -78,14 +84,13 @@ impl TraceDatabaseConfig {
             "mysql" => TraceDatabase::Mysql,
             "mongodb" => TraceDatabase::Mongodb,
             _ => {
-                return Err(
-                    "GEER_AGENT_TRACE_DATABASE 只能是 sqlite、postgres、mysql 或 mongodb。"
-                        .to_owned(),
-                );
+                return Err(format!(
+                    "{name} 只能是 sqlite、postgres、mysql 或 mongodb。"
+                ));
             }
         };
         if url.is_empty() {
-            return Err("启用 Trace 时必须设置 GEER_AGENT_TRACE_DATABASE_URL。".to_owned());
+            return Err(format!("启用数据库时必须设置 {url_name}。"));
         }
         let protocol_valid = match kind {
             TraceDatabase::Sqlite => url.starts_with("sqlite:"),
@@ -98,7 +103,7 @@ impl TraceDatabaseConfig {
             }
         };
         if !protocol_valid {
-            return Err("GEER_AGENT_TRACE_DATABASE_URL 与数据库类型的协议不匹配。".to_owned());
+            return Err(format!("{url_name} 与数据库类型的协议不匹配。"));
         }
         if kind == TraceDatabase::Mongodb {
             let authority_and_path = url
@@ -120,6 +125,52 @@ impl TraceDatabaseConfig {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct CompactionConfig {
+    pub(crate) context_window_tokens: u64,
+    pub(crate) auto: bool,
+}
+
+impl Default for CompactionConfig {
+    fn default() -> Self {
+        Self {
+            context_window_tokens: 272_000,
+            auto: true,
+        }
+    }
+}
+
+impl CompactionConfig {
+    fn from_values(window: Option<String>, auto: Option<String>) -> Result<Self, String> {
+        let context_window_tokens =
+            parse_positive_u64(window, "GEER_AGENT_CONTEXT_WINDOW_TOKENS")?.unwrap_or(272_000);
+        if context_window_tokens < 1_024 {
+            return Err("GEER_AGENT_CONTEXT_WINDOW_TOKENS 不得小于 1024。".to_owned());
+        }
+        let auto = match auto.as_deref().map(str::trim) {
+            None | Some("") | Some("on") => true,
+            Some("off") => false,
+            _ => return Err("GEER_AGENT_AUTO_COMPACT 只能是 on 或 off。".to_owned()),
+        };
+        Ok(Self {
+            context_window_tokens,
+            auto,
+        })
+    }
+
+    pub(crate) fn trigger_tokens(self) -> u64 {
+        self.context_window_tokens.saturating_mul(9) / 10
+    }
+
+    pub(crate) fn recent_tokens(self) -> u64 {
+        20_000.min(self.context_window_tokens / 4)
+    }
+
+    pub(crate) fn summary_tokens(self) -> u64 {
+        4_096.min(self.context_window_tokens / 16)
+    }
+}
+
 #[derive(Debug, Clone)]
 pub(crate) struct Config {
     pub(crate) api_key: String,
@@ -130,6 +181,8 @@ pub(crate) struct Config {
     pub(crate) bash_bin: PathBuf,
     pub(crate) limits: ResourceLimits,
     pub(crate) trace_database: Option<TraceDatabaseConfig>,
+    pub(crate) session_database: Option<TraceDatabaseConfig>,
+    pub(crate) compaction: CompactionConfig,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -264,6 +317,17 @@ impl Config {
             std::env::var("GEER_AGENT_TRACE_DATABASE_URL").ok(),
         )
         .map_err(|message| io::Error::new(io::ErrorKind::InvalidInput, message))?;
+        config.session_database = TraceDatabaseConfig::from_named_values(
+            std::env::var("GEER_AGENT_SESSION_DATABASE").ok(),
+            std::env::var("GEER_AGENT_SESSION_DATABASE_URL").ok(),
+            "GEER_AGENT_SESSION_DATABASE",
+        )
+        .map_err(|message| io::Error::new(io::ErrorKind::InvalidInput, message))?;
+        config.compaction = CompactionConfig::from_values(
+            std::env::var("GEER_AGENT_CONTEXT_WINDOW_TOKENS").ok(),
+            std::env::var("GEER_AGENT_AUTO_COMPACT").ok(),
+        )
+        .map_err(|message| io::Error::new(io::ErrorKind::InvalidInput, message))?;
         Ok(config)
     }
 
@@ -325,6 +389,8 @@ impl Config {
             bash_bin,
             limits: ResourceLimits::default(),
             trace_database: None,
+            session_database: None,
+            compaction: CompactionConfig::default(),
         })
     }
 }
@@ -339,8 +405,60 @@ fn required_value(value: Option<String>, name: &str) -> Result<String, String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        Config, DEFAULT_BASE_URL, OpenAiApi, ResourceLimits, TraceDatabase, TraceDatabaseConfig,
+        CompactionConfig, Config, DEFAULT_BASE_URL, OpenAiApi, ResourceLimits, TraceDatabase,
+        TraceDatabaseConfig,
     };
+
+    #[test]
+    fn compaction_defaults_and_overrides() {
+        let defaults = CompactionConfig::from_values(None, None).unwrap();
+        assert_eq!(defaults.context_window_tokens, 272_000);
+        assert_eq!(defaults.trigger_tokens(), 244_800);
+        assert_eq!(defaults.recent_tokens(), 20_000);
+        assert_eq!(defaults.summary_tokens(), 4_096);
+        assert!(defaults.auto);
+
+        let small = CompactionConfig::from_values(Some("4096".into()), Some("off".into())).unwrap();
+        assert_eq!(small.trigger_tokens(), 3_686);
+        assert_eq!(small.recent_tokens(), 1_024);
+        assert_eq!(small.summary_tokens(), 256);
+        assert!(!small.auto);
+        assert!(CompactionConfig::from_values(Some("1023".into()), None).is_err());
+        assert!(CompactionConfig::from_values(Some("invalid".into()), None).is_err());
+        assert!(CompactionConfig::from_values(None, Some("yes".into())).is_err());
+    }
+
+    #[test]
+    fn session_database_uses_existing_backends_without_trace_requirement() {
+        assert!(
+            TraceDatabaseConfig::from_named_values(None, None, "GEER_AGENT_SESSION_DATABASE")
+                .unwrap()
+                .is_none()
+        );
+        let selected = TraceDatabaseConfig::from_named_values(
+            Some("sqlite".into()),
+            Some("sqlite::memory:".into()),
+            "GEER_AGENT_SESSION_DATABASE",
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(selected.kind, TraceDatabase::Sqlite);
+        let error = TraceDatabaseConfig::from_named_values(
+            None,
+            Some("sqlite::memory:".into()),
+            "GEER_AGENT_SESSION_DATABASE",
+        )
+        .unwrap_err();
+        assert!(error.contains("GEER_AGENT_SESSION_DATABASE_URL"));
+        assert!(
+            TraceDatabaseConfig::from_named_values(
+                Some("sqlite".into()),
+                Some("mongodb://localhost/db".into()),
+                "GEER_AGENT_SESSION_DATABASE",
+            )
+            .is_err()
+        );
+    }
 
     #[test]
     fn trace_database_config_requires_selected_backend_and_matching_url() {

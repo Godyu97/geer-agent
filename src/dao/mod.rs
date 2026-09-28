@@ -7,10 +7,81 @@ use std::collections::{HashMap, HashSet};
 
 use crate::{
     config::{TraceDatabase, TraceDatabaseConfig},
+    session::{SessionEvent, SessionRecord},
     trace::{
         BatchWriteItem, TraceCursor, TraceError, TracePage, TraceReader, TraceRecord, TraceWriter,
     },
 };
+
+pub(crate) enum SessionStore {
+    Sql(sql::SqlStore),
+    Mongo(mongo::MongoStore),
+}
+
+impl SessionStore {
+    pub(crate) async fn connect(config: &TraceDatabaseConfig) -> Result<Self, TraceError> {
+        match config.kind {
+            TraceDatabase::Sqlite | TraceDatabase::Postgres | TraceDatabase::Mysql => {
+                sql::SqlStore::connect(&config.url).await.map(Self::Sql)
+            }
+            TraceDatabase::Mongodb => mongo::MongoStore::connect(&config.url)
+                .await
+                .map(Self::Mongo),
+        }
+    }
+
+    pub(crate) async fn save(
+        &self,
+        record: &SessionRecord,
+        events: &[SessionEvent],
+        expected_revision: Option<i64>,
+    ) -> Result<(), TraceError> {
+        match self {
+            Self::Sql(store) => store.save_session(record, events, expected_revision).await,
+            Self::Mongo(store) => store.save_session(record, events, expected_revision).await,
+        }
+    }
+
+    pub(crate) async fn load(&self, id: &str) -> Result<Option<SessionRecord>, TraceError> {
+        match self {
+            Self::Sql(store) => store.load_session(id).await,
+            Self::Mongo(store) => store.load_session(id).await,
+        }
+    }
+
+    pub(crate) async fn list(&self, workspace: &str) -> Result<Vec<SessionRecord>, TraceError> {
+        match self {
+            Self::Sql(store) => store.list_sessions(workspace).await,
+            Self::Mongo(store) => store.list_sessions(workspace).await,
+        }
+    }
+
+    pub(crate) async fn history(
+        &self,
+        record: &SessionRecord,
+    ) -> Result<Vec<SessionEvent>, TraceError> {
+        let mut next = record.head_event_id.clone();
+        let mut seen = HashSet::new();
+        let mut reversed = Vec::new();
+        while let Some(id) = next {
+            if !seen.insert(id.clone()) {
+                return Err(TraceError("会话事件链存在循环".into()));
+            }
+            let event = match self {
+                Self::Sql(store) => store.load_session_event(&id).await?,
+                Self::Mongo(store) => store.load_session_event(&id).await?,
+            }
+            .ok_or_else(|| TraceError("会话事件链缺失".into()))?;
+            if event.session_id != record.id {
+                return Err(TraceError("会话事件关联错误".into()));
+            }
+            next = event.parent_id.clone();
+            reversed.push(event);
+        }
+        reversed.reverse();
+        Ok(reversed)
+    }
+}
 
 pub(crate) enum TraceStore {
     Sql(sql::SqlStore),
@@ -202,6 +273,8 @@ mod tests {
     use serde_json::json;
     use uuid::Uuid;
 
+    use crate::session::{SessionEvent, SessionRecord};
+
     fn record(id: &str, session: &str, time: i64) -> TraceRecord {
         TraceRecord {
             request_id: id.into(),
@@ -288,6 +361,92 @@ mod tests {
             .unwrap();
         assert_eq!(next.items, vec![third]);
         assert!(next.next_cursor.is_none());
+    }
+
+    async fn session_contract(config: TraceDatabaseConfig) {
+        let store = SessionStore::connect(&config)
+            .await
+            .expect("会话数据库连接和迁移");
+        let id = Uuid::new_v4().to_string();
+        let event_id = Uuid::new_v4().to_string();
+        let event = SessionEvent {
+            id: event_id.clone(),
+            parent_id: None,
+            session_id: id.clone(),
+            kind: "user".into(),
+            payload: json!({"text": "first"}),
+        };
+        let first = SessionRecord {
+            id: id.clone(),
+            workspace: "/tmp/workspace-a".into(),
+            api: "chat-completions".into(),
+            model: "test".into(),
+            endpoint: "https://example.test/v1".into(),
+            snapshot: json!({"version": 1, "messages": ["first"]}),
+            head_event_id: Some(event_id),
+            revision: 0,
+            updated_at_ms: 100,
+            uncertain_tools: false,
+        };
+        store
+            .save(&first, std::slice::from_ref(&event), None)
+            .await
+            .unwrap();
+        assert_eq!(store.load(&id).await.unwrap(), Some(first.clone()));
+        assert_eq!(store.history(&first).await.unwrap(), vec![event.clone()]);
+        let listed = store.list("/tmp/workspace-a").await.unwrap();
+        assert!(listed.iter().any(|item| item.id == id));
+        assert!(
+            !store
+                .list("/tmp/workspace-b")
+                .await
+                .unwrap()
+                .iter()
+                .any(|item| item.id == id)
+        );
+        let mut newer = first.clone();
+        newer.revision = 1;
+        newer.updated_at_ms = 101;
+        newer.uncertain_tools = true;
+        store.save(&newer, &[], Some(0)).await.unwrap();
+        assert!(store.save(&first, &[], Some(0)).await.is_err());
+        let orphan = SessionEvent {
+            id: Uuid::new_v4().to_string(),
+            parent_id: newer.head_event_id.clone(),
+            session_id: id.clone(),
+            kind: "user".into(),
+            payload: json!({"text": "unpublished"}),
+        };
+        let mut stale = newer.clone();
+        stale.revision = 2;
+        stale.head_event_id = Some(orphan.id.clone());
+        assert!(store.save(&stale, &[orphan], Some(0)).await.is_err());
+        assert_eq!(store.history(&newer).await.unwrap(), vec![event]);
+        assert_eq!(store.load(&id).await.unwrap(), Some(newer));
+    }
+
+    #[tokio::test]
+    async fn sqlite_session_contract() {
+        let path = std::env::temp_dir().join(format!("geer-session-{}.sqlite", Uuid::new_v4()));
+        session_contract(TraceDatabaseConfig {
+            kind: TraceDatabase::Sqlite,
+            url: format!("sqlite://{}?mode=rwc", path.display()),
+        })
+        .await;
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[tokio::test]
+    async fn external_session_contracts() {
+        for (key, kind) in [
+            ("GEER_AGENT_TEST_POSTGRES_URL", TraceDatabase::Postgres),
+            ("GEER_AGENT_TEST_MYSQL_URL", TraceDatabase::Mysql),
+            ("GEER_AGENT_TEST_MONGODB_URL", TraceDatabase::Mongodb),
+        ] {
+            if let Ok(url) = std::env::var(key) {
+                session_contract(TraceDatabaseConfig { kind, url }).await;
+            }
+        }
     }
 
     #[tokio::test]

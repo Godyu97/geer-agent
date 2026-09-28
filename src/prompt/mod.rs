@@ -6,7 +6,7 @@ use tokio::{process::Command, time::timeout};
 
 mod conversation;
 
-pub(crate) use conversation::Prompt;
+pub(crate) use conversation::{CompactionPlan, Prompt, PromptSnapshot};
 
 const BASH_VERSION_TIMEOUT: Duration = Duration::from_secs(3);
 

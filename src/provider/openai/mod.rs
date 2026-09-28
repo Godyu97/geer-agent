@@ -10,7 +10,7 @@ use async_openai::types::{
 
 use crate::{
     config::{Config, OpenAiApi},
-    provider::{ChatProvider, Messages, ModelStep, ToolSpec},
+    provider::{ChatProvider, Messages, ModelStep, SummaryStep, ToolSpec},
     trace::TraceCapture,
 };
 
@@ -95,5 +95,37 @@ impl ChatProvider for Provider {
                 io::Error::new(io::ErrorKind::InvalidInput, "模型接口与消息类型不匹配。").into(),
             ),
         }
+    }
+
+    async fn summarize(
+        &mut self,
+        messages: Messages,
+        max_output_tokens: u32,
+        capture: &mut TraceCapture,
+    ) -> Result<SummaryStep, Box<dyn Error>> {
+        let step = match (&mut self.api, messages) {
+            (
+                Api::Responses(api),
+                Messages::Responses {
+                    instructions,
+                    input,
+                },
+            ) => {
+                api.complete_summary(instructions, input, max_output_tokens, capture)
+                    .await?
+            }
+            (Api::ChatCompletions(api), Messages::Chat(messages)) => {
+                api.complete_summary(messages, max_output_tokens, capture)
+                    .await?
+            }
+            _ => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "摘要接口与消息类型不匹配。",
+                )
+                .into());
+            }
+        };
+        step.try_into().map_err(Into::into)
     }
 }

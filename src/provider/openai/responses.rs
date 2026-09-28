@@ -52,7 +52,7 @@ impl Responses {
         F: FnMut(&str) -> io::Result<()>,
     {
         let response = self
-            .request_reply(instructions, input, tools, capture, &mut on_delta)
+            .request_reply(instructions, input, tools, capture, &mut on_delta, None)
             .await?;
         let calls: Vec<ToolCall> = response
             .output
@@ -87,6 +87,45 @@ impl Responses {
         })
     }
 
+    pub(crate) async fn complete_summary(
+        &mut self,
+        instructions: String,
+        input: Vec<InputItem>,
+        limit: u32,
+        capture: &mut TraceCapture,
+    ) -> Result<ModelStep, Box<dyn Error>> {
+        let response = self
+            .request_reply(
+                instructions,
+                input,
+                &[],
+                capture,
+                &mut |_| Ok(()),
+                Some(limit),
+            )
+            .await?;
+        Ok(ModelStep {
+            text: String::new(),
+            calls: response
+                .output
+                .iter()
+                .filter_map(|item| match item {
+                    OutputItem::FunctionCall(call) => Some(ToolCall {
+                        id: call.call_id.clone(),
+                        name: call.name.clone(),
+                        args: call.arguments.clone(),
+                    }),
+                    _ => None,
+                })
+                .collect(),
+            usage: response.usage.as_ref().map(|usage| TokenUsage {
+                input: u64::from(usage.input_tokens),
+                output: u64::from(usage.output_tokens),
+            }),
+            output: response.output,
+        })
+    }
+
     async fn request_reply<F>(
         &self,
         instructions: String,
@@ -94,6 +133,7 @@ impl Responses {
         tools: &[ToolSpec],
         capture: &mut TraceCapture,
         on_delta: &mut F,
+        summary_limit: Option<u32>,
     ) -> Result<Response, Box<dyn Error>>
     where
         F: FnMut(&str) -> io::Result<()>,
@@ -103,6 +143,9 @@ impl Responses {
             .model(self.model.clone())
             .input(InputParam::Items(input))
             .instructions(instructions);
+        if let Some(limit) = summary_limit {
+            builder.max_output_tokens(limit);
+        }
         if !tools.is_empty() {
             builder.tools(super::response_tools(tools));
         }

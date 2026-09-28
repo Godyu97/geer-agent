@@ -15,6 +15,14 @@ pub(crate) trait Session {
         F: FnMut(&str) -> io::Result<()>;
 
     fn reset(&mut self);
+
+    async fn flush(&mut self, prompt: &mut Prompt);
+
+    async fn compact(&mut self, prompt: &mut Prompt) -> Result<String, Box<dyn Error>>;
+
+    async fn sessions(&self) -> Result<Vec<String>, Box<dyn Error>>;
+
+    async fn resume(&mut self, prompt: &mut Prompt, id: &str) -> Result<String, Box<dyn Error>>;
 }
 
 pub(crate) async fn run(
@@ -42,6 +50,7 @@ pub(crate) async fn run(
                 continue;
             }
             InputLine::Eof => {
+                session.flush(prompt).await;
                 println!("bye");
                 break;
             }
@@ -51,14 +60,41 @@ pub(crate) async fn run(
             Input::Empty => {}
             Input::Help => print_help(),
             Input::Reset => {
+                session.flush(prompt).await;
                 prompt.reset();
                 session.reset();
                 println!("（已清空对话记忆）");
                 println!("Session ID: {}", session.session_id());
             }
             Input::Exit => {
+                session.flush(prompt).await;
                 println!("bye");
                 break;
+            }
+            Input::Compact => match session.compact(prompt).await {
+                Ok(message) => println!("{message}"),
+                Err(error) => eprintln!("上下文压缩失败：{error}"),
+            },
+            Input::Sessions => match session.sessions().await {
+                Ok(items) if items.is_empty() => {
+                    println!("没有可列出的会话（或未配置会话数据库）。")
+                }
+                Ok(items) => {
+                    for item in items {
+                        println!("{item}");
+                    }
+                }
+                Err(error) => eprintln!("会话列表读取失败：{error}"),
+            },
+            Input::Resume(id) => {
+                session.flush(prompt).await;
+                match session.resume(prompt, &id).await {
+                    Ok(message) => {
+                        println!("{message}");
+                        println!("Session ID: {}", session.session_id());
+                    }
+                    Err(error) => eprintln!("会话恢复失败：{error}"),
+                }
             }
             Input::Unknown(command) => {
                 println!("未知命令：{command}（输入 /help 查看可用命令）");
@@ -97,7 +133,9 @@ pub(crate) async fn run(
 }
 
 fn print_help() {
-    println!("可用命令：\n  /help   显示帮助\n  /reset  清空对话记忆\n  /exit   退出程序");
+    println!(
+        "可用命令：\n  /help                 显示帮助\n  /compact              压缩旧对话\n  /sessions             列出当前目录的近期会话\n  /resume <session-id>  恢复会话\n  /reset                开始新会话\n  /exit                 退出程序"
+    );
 }
 
 enum InputLine {
@@ -122,6 +160,9 @@ enum Input {
     Empty,
     Help,
     Reset,
+    Compact,
+    Sessions,
+    Resume(String),
     Exit,
     Unknown(String),
     Message(String),
@@ -133,6 +174,11 @@ fn parse_input(line: &str) -> Input {
         "" => Input::Empty,
         "/help" => Input::Help,
         "/reset" => Input::Reset,
+        "/compact" => Input::Compact,
+        "/sessions" => Input::Sessions,
+        input if input.starts_with("/resume ") && !input[8..].trim().is_empty() => {
+            Input::Resume(input[8..].trim().to_owned())
+        }
         "/exit" => Input::Exit,
         input if input.starts_with('/') => Input::Unknown(input.to_owned()),
         input => Input::Message(input.to_owned()),
@@ -147,6 +193,9 @@ mod tests {
     fn parses_supported_commands() {
         assert!(matches!(parse_input("/help"), Input::Help));
         assert!(matches!(parse_input("/reset"), Input::Reset));
+        assert!(matches!(parse_input("/compact"), Input::Compact));
+        assert!(matches!(parse_input("/sessions"), Input::Sessions));
+        assert!(matches!(parse_input("/resume abc"), Input::Resume(id) if id == "abc"));
         assert!(matches!(parse_input("/exit"), Input::Exit));
     }
 

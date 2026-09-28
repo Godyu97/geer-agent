@@ -4,7 +4,10 @@ use futures_util::TryStreamExt;
 use mongodb::{Client, Collection, IndexModel, bson::doc, options::ClientOptions};
 use serde::{Deserialize, Serialize};
 
-use crate::trace::{TraceCursor, TraceError, TracePage, TraceRecord};
+use crate::{
+    session::{SessionEvent, SessionRecord},
+    trace::{TraceCursor, TraceError, TracePage, TraceRecord},
+};
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct TraceDocument {
@@ -23,8 +26,24 @@ impl From<&TraceRecord> for TraceDocument {
     }
 }
 
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+struct SessionDocument {
+    #[serde(rename = "_id")]
+    id: String,
+    record: SessionRecord,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+struct SessionEventDocument {
+    #[serde(rename = "_id")]
+    id: String,
+    event: SessionEvent,
+}
+
 pub(crate) struct MongoStore {
     collection: Collection<TraceDocument>,
+    sessions: Collection<SessionDocument>,
+    session_events: Collection<SessionEventDocument>,
 }
 
 impl MongoStore {
@@ -51,7 +70,115 @@ impl MongoStore {
             )
             .await
             .map_err(|_| TraceError("MongoDB 索引创建失败".into()))?;
-        Ok(Self { collection })
+        let sessions = database.collection::<SessionDocument>("agent_sessions");
+        sessions
+            .create_index(
+                IndexModel::builder()
+                    .keys(doc! {"record.workspace": 1, "record.updated_at_ms": -1})
+                    .build(),
+            )
+            .await
+            .map_err(|_| TraceError("MongoDB 会话索引创建失败".into()))?;
+        let session_events = database.collection::<SessionEventDocument>("agent_session_events");
+        session_events
+            .create_index(
+                IndexModel::builder()
+                    .keys(doc! {"event.session_id": 1})
+                    .build(),
+            )
+            .await
+            .map_err(|_| TraceError("MongoDB 会话事件索引创建失败".into()))?;
+        Ok(Self {
+            collection,
+            sessions,
+            session_events,
+        })
+    }
+
+    pub(super) async fn save_session(
+        &self,
+        record: &SessionRecord,
+        events: &[SessionEvent],
+        expected_revision: Option<i64>,
+    ) -> Result<(), TraceError> {
+        for event in events {
+            let doc = SessionEventDocument {
+                id: event.id.clone(),
+                event: event.clone(),
+            };
+            if self.session_events.insert_one(&doc).await.is_err() {
+                let stored = self
+                    .session_events
+                    .find_one(doc! {"_id": &event.id})
+                    .await
+                    .map_err(|_| TraceError("MongoDB 会话事件读取失败".into()))?;
+                if stored != Some(doc) {
+                    return Err(TraceError("MongoDB 会话事件写入冲突".into()));
+                }
+            }
+        }
+        let doc = SessionDocument {
+            id: record.id.clone(),
+            record: record.clone(),
+        };
+        if let Some(expected) = expected_revision {
+            if record.revision != expected + 1 {
+                return Err(TraceError("会话 revision 无效".into()));
+            }
+            let outcome = self
+                .sessions
+                .replace_one(doc! {"_id": &record.id, "record.revision": expected}, doc)
+                .await
+                .map_err(|_| TraceError("MongoDB 会话检查点更新失败".into()))?;
+            if outcome.matched_count != 1 {
+                return Err(TraceError("会话 revision 冲突".into()));
+            }
+        } else {
+            if record.revision != 0 {
+                return Err(TraceError("初始会话 revision 无效".into()));
+            }
+            self.sessions
+                .insert_one(doc)
+                .await
+                .map_err(|_| TraceError("MongoDB 会话检查点创建失败或 ID 冲突".into()))?;
+        }
+        Ok(())
+    }
+
+    pub(super) async fn load_session(&self, id: &str) -> Result<Option<SessionRecord>, TraceError> {
+        self.sessions
+            .find_one(doc! {"_id": id})
+            .await
+            .map(|doc| doc.map(|doc| doc.record))
+            .map_err(|_| TraceError("MongoDB 会话读取失败".into()))
+    }
+
+    pub(super) async fn load_session_event(
+        &self,
+        id: &str,
+    ) -> Result<Option<SessionEvent>, TraceError> {
+        self.session_events
+            .find_one(doc! {"_id": id})
+            .await
+            .map(|doc| doc.map(|doc| doc.event))
+            .map_err(|_| TraceError("MongoDB 会话事件读取失败".into()))
+    }
+
+    pub(super) async fn list_sessions(
+        &self,
+        workspace: &str,
+    ) -> Result<Vec<SessionRecord>, TraceError> {
+        let docs: Vec<SessionDocument> = self
+            .sessions
+            .find(doc! {"record.workspace": workspace})
+            .sort(doc! {"record.updated_at_ms": -1, "_id": -1})
+            .limit(20)
+            .await
+            .map_err(|_| TraceError("MongoDB 会话列表读取失败".into()))?
+            .try_collect()
+            .await
+            .map_err(|_| TraceError("MongoDB 会话列表读取失败".into()))?;
+        Ok(docs.into_iter().map(|doc| doc.record).collect())
     }
 
     pub(super) async fn insert_one(&self, record: &TraceRecord) -> Result<(), TraceError> {

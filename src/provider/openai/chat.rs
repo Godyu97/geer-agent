@@ -70,7 +70,19 @@ impl Chat {
     {
         self.attempt_counter.store(0, Ordering::Relaxed);
         capture.count_attempts_with(Arc::clone(&self.attempt_counter));
-        self.request_reply(messages, tools, capture, &mut on_delta)
+        self.request_reply(messages, tools, capture, &mut on_delta, None)
+            .await
+    }
+
+    pub(crate) async fn complete_summary(
+        &mut self,
+        messages: Vec<ChatCompletionRequestMessage>,
+        limit: u32,
+        capture: &mut TraceCapture,
+    ) -> Result<ModelStep, Box<dyn Error>> {
+        self.attempt_counter.store(0, Ordering::Relaxed);
+        capture.count_attempts_with(Arc::clone(&self.attempt_counter));
+        self.request_reply(messages, &[], capture, &mut |_| Ok(()), Some(limit))
             .await
     }
 
@@ -80,6 +92,7 @@ impl Chat {
         tools: &[ToolSpec],
         capture: &mut TraceCapture,
         on_delta: &mut F,
+        summary_limit: Option<u32>,
     ) -> Result<ModelStep, Box<dyn Error>>
     where
         F: FnMut(&str) -> io::Result<()>,
@@ -92,6 +105,9 @@ impl Chat {
                 include_usage: Some(true),
                 include_obfuscation: None,
             });
+        if let Some(limit) = summary_limit {
+            request.max_completion_tokens(limit);
+        }
         if !tools.is_empty() {
             request.tools(super::chat_tools(tools));
         }
@@ -103,7 +119,15 @@ impl Chat {
             .await
             .map_err(|_| timeout_error())??;
 
-        let step = collect_reply(stream, capture, on_delta, REPLY_IDLE_TIMEOUT, deadline).await?;
+        let step = collect_reply_with_policy(
+            stream,
+            capture,
+            on_delta,
+            REPLY_IDLE_TIMEOUT,
+            deadline,
+            summary_limit.is_some(),
+        )
+        .await?;
         capture.set_response(&serde_json::json!({
             "text": step.text,
             "tool_calls": step.calls.iter().map(|call| serde_json::json!({
@@ -114,12 +138,28 @@ impl Chat {
     }
 }
 
+#[cfg(test)]
 async fn collect_reply<S, F>(
+    stream: S,
+    capture: &mut TraceCapture,
+    on_delta: &mut F,
+    idle_timeout: Duration,
+    deadline: Instant,
+) -> Result<ModelStep, Box<dyn Error>>
+where
+    S: Stream<Item = Result<CreateChatCompletionStreamResponse, OpenAIError>> + Unpin,
+    F: FnMut(&str) -> io::Result<()>,
+{
+    collect_reply_with_policy(stream, capture, on_delta, idle_timeout, deadline, false).await
+}
+
+async fn collect_reply_with_policy<S, F>(
     mut stream: S,
     capture: &mut TraceCapture,
     on_delta: &mut F,
     idle_timeout: Duration,
     mut deadline: Instant,
+    reject_length: bool,
 ) -> Result<ModelStep, Box<dyn Error>>
 where
     S: Stream<Item = Result<CreateChatCompletionStreamResponse, OpenAIError>> + Unpin,
@@ -182,6 +222,11 @@ where
             }
 
             if let Some(reason) = choice.finish_reason {
+                if reject_length && reason == FinishReason::Length {
+                    return Err(
+                        io::Error::new(io::ErrorKind::InvalidData, "摘要输出被截断。").into(),
+                    );
+                }
                 if !calls.is_empty()
                     && matches!(reason, FinishReason::ToolCalls | FinishReason::Stop)
                 {
@@ -341,6 +386,22 @@ mod tests {
             }),
         }]);
         chunk
+    }
+
+    #[tokio::test]
+    async fn summary_rejects_length_truncation() {
+        let events = stream::iter([Ok(chunk(Some("partial"), Some(FinishReason::Length)))]);
+        let error = super::collect_reply_with_policy(
+            events,
+            &mut TraceCapture::new(),
+            &mut |_| Ok(()),
+            Duration::from_secs(1),
+            Instant::now() + Duration::from_secs(1),
+            true,
+        )
+        .await
+        .expect_err("截断摘要不可提交");
+        assert!(error.to_string().contains("截断"));
     }
 
     #[tokio::test]

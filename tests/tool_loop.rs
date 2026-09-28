@@ -29,6 +29,7 @@ enum Reply {
         usage: bool,
     },
     Error,
+    ContextOverflow,
     RetryableError,
     ChatPartial,
 }
@@ -146,6 +147,11 @@ fn write_reply(stream: &mut TcpStream, reply: Reply) {
             "400 Bad Request",
             "application/json",
             r#"{"error":{"message":"boom","type":"invalid_request_error"}}"#.to_owned(),
+        ),
+        Reply::ContextOverflow => (
+            "400 Bad Request",
+            "application/json",
+            r#"{"error":{"message":"maximum context length exceeded","type":"invalid_request_error","code":"context_length_exceeded"}}"#.to_owned(),
         ),
         Reply::RetryableError => (
             "500 Internal Server Error",
@@ -1212,4 +1218,32 @@ async fn trace_redacts_configured_api_key_even_when_it_appears_in_user_input() {
     assert!(stored_request.to_string().contains("[REDACTED]"));
     drop(db);
     std::fs::remove_file(path).unwrap();
+}
+
+#[test]
+fn context_overflow_compacts_and_retries_only_the_current_model_request() {
+    let old = "old-context-".repeat(1000);
+    let input = format!("{old}\nlatest question\n/exit\n");
+    let (output, bodies) = run_repl_with_env(
+        "chat-completions",
+        vec![
+            Reply::ChatFinal,
+            Reply::ContextOverflow,
+            Reply::ChatFinal,
+            Reply::ChatFinal,
+        ],
+        &input,
+        &[("GEER_AGENT_AUTO_COMPACT", "off")],
+    );
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(bodies.len(), 4);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("重试当前模型请求"), "{stdout}");
+    assert!(bodies[1].to_string().contains("old-context-"));
+    assert!(!bodies[3].to_string().contains("old-context-"));
+    assert!(bodies[3].to_string().contains("latest question"));
 }
