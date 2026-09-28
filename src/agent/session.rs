@@ -6,6 +6,7 @@ use uuid::Uuid;
 use crate::{
     config::OpenAiApi,
     dao::{SESSION_REVISION_CONFLICT, SessionStore},
+    interaction::emit_diagnostic,
     prompt::{Prompt, PromptSnapshot},
     session::{SessionEvent, SessionRecord},
     trace::{now_unix_ms, redact_json},
@@ -111,7 +112,7 @@ impl SessionRuntime {
         let mut snapshot = match serde_json::to_value(prompt.snapshot()) {
             Ok(snapshot) => snapshot,
             Err(_) => {
-                eprintln!("会话快照编码失败；本次对话继续在内存中运行。");
+                emit_diagnostic("会话快照编码失败；本次对话继续在内存中运行。");
                 self.status = SaveStatus::Pending;
                 return self.status;
             }
@@ -166,10 +167,10 @@ impl SessionRuntime {
             } else {
                 SaveStatus::Pending
             };
-            eprintln!(
+            emit_diagnostic(format!(
                 "会话保存失败（Session ID: {id}，状态：{}）；继续运行，后续检查点将重试补写。",
                 self.status.label()
-            );
+            ));
         }
         self.status
     }
@@ -409,7 +410,9 @@ impl SessionManager {
                         );
                     }
                 }
-                Err(error) => eprintln!("会话存档列表读取失败：{error}；仅显示本进程会话。"),
+                Err(error) => {
+                    emit_diagnostic(format!("会话存档列表读取失败：{error}；仅显示本进程会话。"))
+                }
             }
         }
         for state in std::iter::once(&self.active).chain(self.parked.values()) {

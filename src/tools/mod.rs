@@ -148,6 +148,10 @@ pub(crate) struct Tools {
 }
 
 impl Tools {
+    pub(crate) fn set_confirm(&mut self, confirm: impl FnMut(&str) -> io::Result<bool> + 'static) {
+        self.confirm = Box::new(confirm);
+    }
+
     #[cfg(test)]
     pub(crate) fn allow_all_for_test(&mut self) {
         self.confirm = Box::new(|_| Ok(true));
