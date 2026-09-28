@@ -1,4 +1,4 @@
-//! 主业务：带工具的 REPL。可引用 `repl`、`tools` 与 `provider`。
+//! 主业务：提供会话能力，不选择具体界面。
 
 mod guard;
 mod session;
@@ -16,9 +16,9 @@ use uuid::Uuid;
 use crate::{
     config::{CompactionConfig, Config, DEFAULT_RESOURCE_LIMITS, OpenAiApi, ResourceLimits},
     dao::{SessionStore, TraceStore},
+    interaction::{Session, SessionStatus, Usage, emit_diagnostic},
     prompt::{self, Prompt},
     provider::{ChatProvider, TokenUsage, ToolSpec, openai::Provider},
-    repl::{self, Session},
     tools::Tools,
     trace::{
         TraceCapture, TraceRecord, TraceStatus, TraceWriter, now_unix_ms, redact_json, redact_text,
@@ -254,7 +254,7 @@ impl AgentRuntime {
         self.metrics.consecutive_no_progress_turns =
             self.guard.metrics.consecutive_no_progress_turns;
         let metrics = std::mem::take(&mut self.metrics);
-        eprintln!("{}", run_record(&self.run_id, &self.model, &metrics));
+        emit_diagnostic(run_record(&self.run_id, &self.model, &metrics).to_string());
         metrics
     }
 
@@ -326,7 +326,7 @@ fn finalization_instruction(skipped_tool_batch: bool, reason: TerminationReason)
     )
 }
 
-pub(crate) async fn run() -> Result<(), Box<dyn Error>> {
+pub(crate) async fn create() -> Result<Agent, Box<dyn Error>> {
     let config = Config::load()?;
     let shared_database =
         config.session_database.is_some() && config.session_database == config.trace_database;
@@ -334,7 +334,7 @@ pub(crate) async fn run() -> Result<(), Box<dyn Error>> {
         match SessionStore::connect(database).await {
             Ok(store) => Some(store),
             Err(_) => {
-                eprintln!("会话数据库连接或初始化失败，本次会话仅保存在内存中。");
+                emit_diagnostic("会话数据库连接或初始化失败，本次会话仅保存在内存中。");
                 None
             }
         }
@@ -347,7 +347,7 @@ pub(crate) async fn run() -> Result<(), Box<dyn Error>> {
         match TraceStore::connect(database).await {
             Ok(store) => Some(store),
             Err(_) => {
-                eprintln!("Trace 数据库连接或初始化失败，已关闭本次持久化。");
+                emit_diagnostic("Trace 数据库连接或初始化失败，已关闭本次持久化。");
                 None
             }
         }
@@ -379,7 +379,7 @@ pub(crate) async fn run() -> Result<(), Box<dyn Error>> {
         )
     });
     let system_prompt = prompt::load(&config.bash_bin).await?;
-    let mut agent = Agent {
+    let agent = Agent {
         chat: Provider::new(&config),
         tools: Tools::new(config.tools_enabled, config.bash_bin.clone())?,
         budget: AgentBudget {
@@ -401,11 +401,14 @@ pub(crate) async fn run() -> Result<(), Box<dyn Error>> {
             .session_database
             .as_ref()
             .map(|database| database.url.clone()),
+        turn_tokens: 0,
+        total_tokens: 0,
+        usage_complete: true,
     };
-    repl::run(&mut agent).await
+    Ok(agent)
 }
 
-struct Agent {
+pub(crate) struct Agent {
     chat: Provider,
     tools: Tools,
     budget: AgentBudget,
@@ -418,6 +421,21 @@ struct Agent {
     base_url: String,
     trace_database_url: Option<String>,
     session_database_url: Option<String>,
+    turn_tokens: u64,
+    total_tokens: u64,
+    usage_complete: bool,
+}
+
+impl Agent {
+    pub(crate) fn set_confirm(&mut self, confirm: impl FnMut(&str) -> io::Result<bool> + 'static) {
+        self.tools.set_confirm(confirm);
+    }
+
+    fn record_ui_usage(&mut self, metrics: &AgentMetrics) {
+        self.turn_tokens = metrics.input_tokens.saturating_add(metrics.output_tokens);
+        self.total_tokens = self.total_tokens.saturating_add(self.turn_tokens);
+        self.usage_complete &= metrics.usage_complete;
+    }
 }
 
 struct TraceContext<'a> {
@@ -436,14 +454,34 @@ impl Session for Agent {
         &self.sessions.active.id
     }
 
-    async fn handle_message<F>(
+    fn status(&self) -> SessionStatus {
+        let state = &self.sessions.active;
+        let specs = tool_specs(&self.tools);
+        SessionStatus {
+            model: self.model.clone(),
+            session_id: state.id.clone(),
+            context_tokens: state
+                .prompt
+                .estimated_context_tokens(tool_specs_size(&specs), None)
+                .saturating_add(state.context_token_bias),
+            context_window_tokens: self.compaction.context_window_tokens,
+            turn_tokens: self.turn_tokens,
+            total_tokens: self.total_tokens,
+            usage_complete: self.usage_complete,
+        }
+    }
+
+    async fn handle_message<F, U>(
         &mut self,
         input: &str,
         mut on_delta: F,
+        mut on_usage: U,
     ) -> Result<(), Box<dyn Error>>
     where
         F: FnMut(&str) -> io::Result<()>,
+        U: FnMut(Option<Usage>) -> io::Result<()>,
     {
+        self.turn_tokens = 0;
         let state = &mut self.sessions.active;
         state.prompt.begin_turn(input);
         state.changed();
@@ -460,11 +498,28 @@ impl Session for Agent {
             session_database_url: self.session_database_url.as_deref(),
             store: self.trace_store.as_ref(),
         };
+        let turn_tokens = &mut self.turn_tokens;
+        let total_tokens = &mut self.total_tokens;
+        let usage_complete = &mut self.usage_complete;
         let result = run_tool_loop_with_session(
             &mut self.chat,
             &mut self.tools,
             &mut state.prompt,
             &mut on_delta,
+            &mut |reported| {
+                let usage = reported.map(|reported| Usage {
+                    input: reported.input,
+                    output: reported.output,
+                });
+                if let Some(usage) = usage {
+                    let tokens = usage.input.saturating_add(usage.output);
+                    *turn_tokens = turn_tokens.saturating_add(tokens);
+                    *total_tokens = total_tokens.saturating_add(tokens);
+                } else {
+                    *usage_complete = false;
+                }
+                on_usage(usage)
+            },
             self.budget,
             &self.model,
             Some(&trace),
@@ -475,12 +530,22 @@ impl Session for Agent {
         )
         .await;
         state.save().await;
-        result.map(|_| ())
+        match result {
+            Ok(metrics) => {
+                self.usage_complete &= metrics.usage_complete;
+                Ok(())
+            }
+            Err(error) => {
+                self.usage_complete = false;
+                Err(error)
+            }
+        }
     }
 
     async fn new_session(&mut self) -> String {
         let id = self.sessions.new_session().await;
         self.tools.reset();
+        self.turn_tokens = 0;
         id
     }
 
@@ -503,6 +568,7 @@ impl Session for Agent {
     }
 
     async fn compact(&mut self) -> Result<String, Box<dyn Error>> {
+        self.turn_tokens = 0;
         let max_source = self
             .compaction
             .context_window_tokens
@@ -534,6 +600,7 @@ impl Session for Agent {
             self.compaction,
             &mut runtime,
             Some(&trace),
+            &mut |_| Ok(()),
         )
         .await;
         let message = match result {
@@ -546,10 +613,12 @@ impl Session for Agent {
             Ok(None) => "没有可压缩的历史。".to_owned(),
             Err(error) => {
                 runtime.finish(TerminationReason::ProviderError);
+                self.usage_complete = false;
                 return Err(io::Error::other(error).into());
             }
         };
-        runtime.finish(TerminationReason::Completed);
+        let metrics = runtime.finish(TerminationReason::Completed);
+        self.record_ui_usage(&metrics);
         Ok(message)
     }
 
@@ -566,6 +635,7 @@ impl Session for Agent {
             None => Ok("当前已是该会话。".to_owned()),
             Some(interrupted) => {
                 self.tools.reset();
+                self.turn_tokens = 0;
                 Ok(if interrupted {
                     "已恢复会话；上次工具执行可能已产生副作用，状态未确认。请核对后再继续。"
                         .to_owned()
@@ -612,6 +682,7 @@ async fn compact_once<P: ChatProvider>(
     config: CompactionConfig,
     runtime: &mut AgentRuntime,
     trace: Option<&TraceContext<'_>>,
+    on_usage: &mut dyn FnMut(Option<TokenUsage>) -> io::Result<()>,
 ) -> Result<Option<(u64, u64, usize)>, String> {
     if runtime.resource_reason().is_some() {
         return Err("请求资源预算已耗尽。".to_owned());
@@ -656,7 +727,9 @@ async fn compact_once<P: ChatProvider>(
         }
         Err(_) => return Err("摘要调用超时。".to_owned()),
     };
-    if let Some(reason) = runtime.record_usage(summary.usage) {
+    let resource_reason = runtime.record_usage(summary.usage);
+    on_usage(summary.usage).map_err(|error| error.to_string())?;
+    if let Some(reason) = resource_reason {
         return Err(format!("摘要后资源预算已耗尽：{}。", reason.as_str()));
     }
     prompt.apply_compaction(plan, summary.text)?;
@@ -714,6 +787,7 @@ where
         tools,
         prompt,
         on_delta,
+        &mut |_| Ok(()),
         budget,
         model,
         trace,
@@ -731,6 +805,7 @@ async fn run_tool_loop_with_session<P, F>(
     tools: &mut Tools,
     prompt: &mut Prompt,
     on_delta: &mut F,
+    on_usage: &mut dyn FnMut(Option<TokenUsage>) -> io::Result<()>,
     budget: AgentBudget,
     model: &str,
     trace: Option<&TraceContext<'_>>,
@@ -755,9 +830,12 @@ where
                 chat,
                 prompt,
                 on_delta,
+                on_usage,
                 &mut runtime,
-                false,
-                reason,
+                Finalization {
+                    reason,
+                    skipped_tool_batch: false,
+                },
                 trace,
             )
             .await;
@@ -794,7 +872,17 @@ where
                     break;
                 }
                 let cut = plan.cut;
-                match compact_once(chat, prompt, plan, compaction, &mut runtime, trace).await {
+                match compact_once(
+                    chat,
+                    prompt,
+                    plan,
+                    compaction,
+                    &mut runtime,
+                    trace,
+                    on_usage,
+                )
+                .await
+                {
                     Ok(Some((before, after, count))) => {
                         *context_token_bias = 0;
                         failed_prefix = None;
@@ -835,9 +923,12 @@ where
                 chat,
                 prompt,
                 on_delta,
+                on_usage,
                 &mut runtime,
-                false,
-                reason,
+                Finalization {
+                    reason,
+                    skipped_tool_batch: false,
+                },
                 trace,
             )
             .await;
@@ -874,9 +965,12 @@ where
                     chat,
                     prompt,
                     on_delta,
+                    on_usage,
                     &mut runtime,
-                    false,
-                    TerminationReason::MaxDuration,
+                    Finalization {
+                        reason: TerminationReason::MaxDuration,
+                        skipped_tool_batch: false,
+                    },
                     trace,
                 )
                 .await;
@@ -886,8 +980,16 @@ where
                     && !emitted
                     && is_context_overflow(error.as_ref())
                     && let Some(plan) = prompt.prepare_compaction_bounded(0, false, max_source)
-                    && let Ok(Some((before, after, count))) =
-                        compact_once(chat, prompt, plan, compaction, &mut runtime, trace).await
+                    && let Ok(Some((before, after, count))) = compact_once(
+                        chat,
+                        prompt,
+                        plan,
+                        compaction,
+                        &mut runtime,
+                        trace,
+                        on_usage,
+                    )
+                    .await
                 {
                     if let Some(session) = session.as_deref_mut() {
                         session.save(session_id, prompt, false).await;
@@ -911,18 +1013,24 @@ where
         retried_overflow = false;
         if step.calls.is_empty() {
             runtime.record_usage(step.usage);
+            on_usage(step.usage)?;
             prompt.finish_turn(step);
             return Ok(runtime.finish(TerminationReason::Completed));
         }
 
-        if let Some(reason) = runtime.record_usage(step.usage) {
+        let resource_reason = runtime.record_usage(step.usage);
+        on_usage(step.usage)?;
+        if let Some(reason) = resource_reason {
             return finalize_without_tools(
                 chat,
                 prompt,
                 on_delta,
+                on_usage,
                 &mut runtime,
-                true,
-                reason,
+                Finalization {
+                    reason,
+                    skipped_tool_batch: true,
+                },
                 trace,
             )
             .await;
@@ -933,9 +1041,12 @@ where
                 chat,
                 prompt,
                 on_delta,
+                on_usage,
                 &mut runtime,
-                true,
-                TerminationReason::MaxToolCalls,
+                Finalization {
+                    reason: TerminationReason::MaxToolCalls,
+                    skipped_tool_batch: true,
+                },
                 trace,
             )
             .await;
@@ -955,9 +1066,8 @@ where
             .collect();
         let executions = tools.execute_batch(&calls).await;
         for (call, execution) in step.calls.iter().zip(&executions) {
-            eprintln!(
-                "{}",
-                tool_record(&runtime.run_id, runtime.metrics.turns, call, execution)
+            emit_diagnostic(
+                tool_record(&runtime.run_id, runtime.metrics.turns, call, execution).to_string(),
             );
         }
         let outputs: Vec<_> = executions
@@ -980,9 +1090,12 @@ where
                 chat,
                 prompt,
                 on_delta,
+                on_usage,
                 &mut runtime,
-                false,
-                reason.into(),
+                Finalization {
+                    reason: reason.into(),
+                    skipped_tool_batch: false,
+                },
                 trace,
             )
             .await;
@@ -990,21 +1103,27 @@ where
     }
 }
 
+struct Finalization {
+    reason: TerminationReason,
+    skipped_tool_batch: bool,
+}
+
 async fn finalize_without_tools<P, F>(
     chat: &mut P,
     prompt: &mut Prompt,
     on_delta: &mut F,
+    on_usage: &mut dyn FnMut(Option<TokenUsage>) -> io::Result<()>,
     runtime: &mut AgentRuntime,
-    skipped_tool_batch: bool,
-    reason: TerminationReason,
+    finalization: Finalization,
     trace: Option<&TraceContext<'_>>,
 ) -> Result<AgentMetrics, Box<dyn Error>>
 where
     P: ChatProvider,
     F: FnMut(&str) -> io::Result<()>,
 {
-    let mut instruction = finalization_instruction(skipped_tool_batch, reason);
-    instruction.push_str(&format!(" 停止原因：{}。", reason.as_str()));
+    let mut instruction =
+        finalization_instruction(finalization.skipped_tool_batch, finalization.reason);
+    instruction.push_str(&format!(" 停止原因：{}。", finalization.reason.as_str()));
     let step = traced_step(
         chat,
         prompt.messages_with_runtime_instruction(Some(&instruction)),
@@ -1020,6 +1139,7 @@ where
         Ok(Some(step)) => {
             runtime.record_turn();
             runtime.record_usage(step.usage);
+            on_usage(step.usage)?;
             // provider 已分别校验两种协议的最终文本；Responses 的文本保存在 output 而非 text。
             if step.calls.is_empty() {
                 prompt.finish_turn(step);
@@ -1034,7 +1154,7 @@ where
         }
     }
 
-    Ok(runtime.finish(reason))
+    Ok(runtime.finish(finalization.reason))
 }
 
 async fn traced_step<P, F>(
@@ -1162,7 +1282,7 @@ async fn persist_trace(
         error: error.map(|message| redact_error(&message, trace)),
     };
     if store.write_one(&record).await.is_err() {
-        eprintln!("Trace 写入失败（request_id={request_id}）。");
+        emit_diagnostic(format!("Trace 写入失败（request_id={request_id}）。"));
     }
 }
 
@@ -1199,24 +1319,25 @@ fn is_context_overflow(error: &(dyn Error + 'static)) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use std::{collections::VecDeque, error::Error, fs, io, time::SystemTime};
+    use std::{cell::Cell, collections::VecDeque, error::Error, fs, io, rc::Rc, time::SystemTime};
 
     use super::session::{SessionManager, SessionRuntime};
     use super::{
         Agent, AgentBudget, AgentMetrics, AgentRuntime, DEFAULT_AGENT_BUDGET,
         FINALIZATION_FALLBACK, SOFT_BUDGET_HINT, TerminationReason, TraceContext, run_record,
-        run_tool_loop_with_budget, run_tool_loop_with_context, tool_record,
+        run_tool_loop_with_budget, run_tool_loop_with_context, run_tool_loop_with_session,
+        tool_record,
     };
     use crate::{
         config::{
             CompactionConfig, Config, OpenAiApi, ResourceLimits, TraceDatabase, TraceDatabaseConfig,
         },
         dao::{SessionStore, TraceStore},
+        interaction::Session,
         prompt::Prompt,
         provider::{
             ChatProvider, Messages, ModelStep, TokenUsage, ToolCall, ToolSpec, openai::Provider,
         },
-        repl::Session,
         tools::{ToolExecution, ToolOutput, Tools},
         trace::{TraceCapture, TraceReader, TraceStatus},
     };
@@ -1225,6 +1346,8 @@ mod tests {
         steps: VecDeque<Result<ModelStep, String>>,
         snapshots: Vec<serde_json::Value>,
         tool_counts: Vec<usize>,
+        observed_usage_count: Option<Rc<Cell<usize>>>,
+        usage_count_at_call: Vec<usize>,
     }
 
     impl ChatProvider for FakeProvider {
@@ -1243,6 +1366,9 @@ mod tests {
             };
             self.snapshots.push(serde_json::to_value(messages)?);
             self.tool_counts.push(tools.len());
+            if let Some(count) = &self.observed_usage_count {
+                self.usage_count_at_call.push(count.get());
+            }
             match self.steps.pop_front() {
                 Some(Ok(step)) => Ok(step),
                 Some(Err(error)) => Err(error.into()),
@@ -1302,6 +1428,52 @@ mod tests {
         let mut prompt = Prompt::new(OpenAiApi::ChatCompletions, "system".to_owned());
         prompt.begin_turn("现在几点");
         prompt
+    }
+
+    #[tokio::test]
+    async fn reports_each_model_steps_usage_before_the_next_step() {
+        let mut first = tool_step();
+        first.usage = Some(TokenUsage {
+            input: 10,
+            output: 2,
+        });
+        let mut second = text_step("done");
+        second.usage = Some(TokenUsage {
+            input: 20,
+            output: 9,
+        });
+        let mut provider = fake(vec![Ok(first), Ok(second)]);
+        let usage_count = Rc::new(Cell::new(0));
+        provider.observed_usage_count = Some(Rc::clone(&usage_count));
+        let mut tools = Tools::new(true, "bash".into()).unwrap();
+        let mut prompt = prompt();
+        let mut reported = Vec::new();
+        let metrics = run_tool_loop_with_session(
+            &mut provider,
+            &mut tools,
+            &mut prompt,
+            &mut |_| Ok(()),
+            &mut |usage| {
+                reported.push(usage);
+                usage_count.set(usage_count.get() + 1);
+                Ok(())
+            },
+            DEFAULT_AGENT_BUDGET,
+            "test-model",
+            None,
+            CompactionConfig::default(),
+            &mut 0,
+            None,
+            "",
+        )
+        .await
+        .unwrap();
+        assert_eq!(reported.len(), 2);
+        assert_eq!(provider.usage_count_at_call, vec![0, 1]);
+        assert_eq!(reported[0].unwrap().input, 10);
+        assert_eq!(reported[1].unwrap().output, 9);
+        assert_eq!(metrics.input_tokens, 30);
+        assert_eq!(metrics.output_tokens, 11);
     }
 
     #[tokio::test]
@@ -1518,8 +1690,19 @@ mod tests {
             base_url: config.base_url.clone(),
             trace_database_url: None,
             session_database_url: None,
+            turn_tokens: 0,
+            total_tokens: 0,
+            usage_complete: true,
         };
         assert!(agent.tools.granted_for_test("read"));
+        agent.record_ui_usage(&AgentMetrics {
+            input_tokens: 20,
+            output_tokens: 5,
+            usage_complete: true,
+            ..AgentMetrics::default()
+        });
+        assert_eq!(agent.status().turn_tokens, 25);
+        assert_eq!(agent.status().total_tokens, 25);
         let initial_id = agent.session_id().to_owned();
         assert!(agent.open("missing").await.is_err());
         assert_eq!(agent.session_id(), initial_id);
@@ -1532,6 +1715,15 @@ mod tests {
         assert!(agent.tools.granted_for_test("read"));
         agent.new_session().await;
         assert!(!agent.tools.granted_for_test("read"));
+        assert_eq!(agent.status().turn_tokens, 0);
+        assert_eq!(agent.status().total_tokens, 25);
+        agent.record_ui_usage(&AgentMetrics {
+            input_tokens: 7,
+            usage_complete: false,
+            ..AgentMetrics::default()
+        });
+        assert_eq!(agent.status().total_tokens, 32);
+        assert!(!agent.status().usage_complete);
         agent.tools.grant_for_test("read");
         agent.open(&saved_id).await.unwrap();
         assert!(!agent.tools.granted_for_test("read"));
@@ -1572,6 +1764,8 @@ mod tests {
             steps: steps.into(),
             snapshots: Vec::new(),
             tool_counts: Vec::new(),
+            observed_usage_count: None,
+            usage_count_at_call: Vec::new(),
         }
     }
 

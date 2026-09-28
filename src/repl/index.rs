@@ -1,24 +1,7 @@
 use std::{error::Error, io, io::BufRead, io::Write};
 
 use super::color::Color;
-
-pub(crate) trait Session {
-    fn session_id(&self) -> &str;
-
-    async fn handle_message<F>(&mut self, input: &str, on_delta: F) -> Result<(), Box<dyn Error>>
-    where
-        F: FnMut(&str) -> io::Result<()>;
-
-    async fn new_session(&mut self) -> String;
-
-    async fn flush(&mut self) -> String;
-
-    async fn compact(&mut self) -> Result<String, Box<dyn Error>>;
-
-    async fn sessions(&self) -> Result<Vec<String>, Box<dyn Error>>;
-
-    async fn open(&mut self, id: &str) -> Result<String, Box<dyn Error>>;
-}
+use crate::interaction::{Input, Session, help_text, parse_input};
 
 pub(crate) async fn run(session: &mut impl Session) -> Result<(), Box<dyn Error>> {
     let color = Color::detect();
@@ -106,16 +89,21 @@ pub(crate) async fn run(session: &mut impl Session) -> Result<(), Box<dyn Error>
                 }
 
                 let result = session
-                    .handle_message(&message, |delta| {
-                        let mut stdout = io::stdout().lock();
-                        if delta.starts_with("\n[调用工具") || delta.starts_with("\n[工具调用轮次")
-                        {
-                            color.write_tool_delta(&mut stdout, delta)?;
-                        } else {
-                            color.write_assistant_delta(&mut stdout, delta)?;
-                        }
-                        stdout.flush()
-                    })
+                    .handle_message(
+                        &message,
+                        |delta| {
+                            let mut stdout = io::stdout().lock();
+                            if delta.starts_with("\n[调用工具")
+                                || delta.starts_with("\n[工具调用轮次")
+                            {
+                                color.write_tool_delta(&mut stdout, delta)?;
+                            } else {
+                                color.write_assistant_delta(&mut stdout, delta)?;
+                            }
+                            stdout.flush()
+                        },
+                        |_| Ok(()),
+                    )
                     .await;
 
                 println!();
@@ -131,9 +119,7 @@ pub(crate) async fn run(session: &mut impl Session) -> Result<(), Box<dyn Error>
 }
 
 fn print_help() {
-    println!(
-        "可用命令：\n  /help                 显示帮助\n  /compact              压缩旧对话\n  /sessions             列出当前目录的近期会话\n  /open <session-id>    打开会话\n  /resume <session-id>  打开会话（兼容命令）\n  /new                  开始新会话\n  /reset                开始新会话\n  /save                 保存所有待写会话\n  /exit                 退出程序"
-    );
+    println!("{}", help_text());
 }
 
 enum InputLine {
@@ -154,45 +140,10 @@ fn read_input_line(reader: &mut impl BufRead) -> io::Result<InputLine> {
     }
 }
 
-enum Input {
-    Empty,
-    Help,
-    Reset,
-    New,
-    Save,
-    Compact,
-    Sessions,
-    Open(String),
-    Exit,
-    Unknown(String),
-    Message(String),
-}
-
-fn parse_input(line: &str) -> Input {
-    let input = line.trim();
-    match input {
-        "" => Input::Empty,
-        "/help" => Input::Help,
-        "/reset" => Input::Reset,
-        "/new" => Input::New,
-        "/save" => Input::Save,
-        "/compact" => Input::Compact,
-        "/sessions" => Input::Sessions,
-        input if input.starts_with("/resume ") && !input[8..].trim().is_empty() => {
-            Input::Open(input[8..].trim().to_owned())
-        }
-        input if input.starts_with("/open ") && !input[6..].trim().is_empty() => {
-            Input::Open(input[6..].trim().to_owned())
-        }
-        "/exit" => Input::Exit,
-        input if input.starts_with('/') => Input::Unknown(input.to_owned()),
-        input => Input::Message(input.to_owned()),
-    }
-}
-
 #[cfg(test)]
 mod tests {
-    use super::{Input, InputLine, parse_input, read_input_line};
+    use super::{InputLine, read_input_line};
+    use crate::interaction::{Input, parse_input};
 
     #[test]
     fn parses_supported_commands() {
