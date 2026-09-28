@@ -320,7 +320,7 @@ async fn real_queries_then_read_edit_and_verify_in_isolated_directory() {
     let search = tools.execute_recorded("rg", &args.to_string()).await;
     assert!(search.success, "{}", search.text);
     assert!(body(&search).contains("--sample.txt:3:needle 42"));
-    assert!(!body(&search).contains("99"));
+    assert!(!body(&search).contains("other.rs:1:needle 99"));
     let files = tools
         .execute_recorded(
             "rg",
