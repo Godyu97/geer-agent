@@ -20,7 +20,7 @@ REPL 向模型提供 `get_current_time`、`read`、`write`、`edit`、`bash`。�
 
 `GEER_AGENT_BASH_BIN` 可指定 Bash 可执行文件的绝对路径；未设置或为空时从 `PATH` 查找 `bash`。启动时会验证所选 Bash 并读取版本，路径或版本无效时直接报错退出。每次模型请求都会带默认系统提示，其中 `<context_data>` 包含系统版本和所选 Bash 版本；`/reset` 后仍会提供这些环境信息。
 
-四个本机工具各自在本次 REPL 会话首次使用时请求 `y/N` 授权。授权覆盖该工具本会话内的后续调用以及任意本机路径；`/reset` 清除对话和授权。非交互输入无法确认时默认拒绝执行。
+本机工具各自在当前会话首次使用时请求 `y/N` 授权。每次切换会话（包括切回旧会话）都会清空授权；打开失败或打开当前会话则保持授权。非交互输入无法确认时默认拒绝执行。
 
 ## 上下文压缩与会话恢复
 
@@ -30,16 +30,22 @@ REPL 向模型提供 `get_current_time`、`read`、`write`、`edit`、`bash`。�
 | --- | --- | --- |
 | `GEER_AGENT_CONTEXT_WINDOW_TOKENS` | `272000` | 当前模型的上下文窗口；请按实际模型调整 |
 | `GEER_AGENT_AUTO_COMPACT` | `on` | 设为 `off` 时仅保留手动 `/compact`；明确的上下文溢出仍可压缩并重试一次 |
-| `GEER_AGENT_SESSION_DATABASE` / `GEER_AGENT_SESSION_DATABASE_URL` | 未设置 | 启用可恢复会话；后端和 URL 格式与下文 Trace 数据库相同，且可使用同一数据库 |
+| `GEER_AGENT_SESSION_PERSISTENCE` | `on` | 设为 `off` 时只保留进程内多会话，不写会话检查点 |
 
-`/compact` 手动压缩已有完整历史；`/sessions` 列出当前目录最近 20 个已保存会话；`/resume <session-id>` 恢复。`/help` 显示命令。会话数据库未配置或连接失败时，压缩仍可使用，但会话只在当前进程内存中。保存失败会告警并在后续检查点补写；退出后仅能恢复最后一次成功保存的状态。`/reset` 开始新 Session ID，旧记录不会删除。
+`/new` 新建会话；`/open <session-id>` 打开进程内会话或当前目录存档；`/reset` 等同于 `/new`，`/resume <session-id>` 等同于 `/open`。`/sessions` 合并当前进程会话与最近 20 条存档，以 `*` 标记当前会话并显示保存状态。`/save` 重试所有待写会话。`/exit` 和 EOF 也会补写，并列出仍未保存的 UUID。启动时总是新建会话，历史会话需显式打开。`/help` 显示完整命令。
 
-会话存储将脱敏后的用户输入、模型输出、工具结果和摘要事件追加保存，并发布可恢复的检查点；压缩不会删除原始事件。恢复要求相同工作目录、模型、API 类型和端点，重新生成系统环境提示并清空工具授权。工具执行中断后会提示副作用未确认，不自动重跑工具。已知 API key、数据库 URL 和认证头在保存前脱敏；会话记录仍可能含其他敏感业务内容，请保护数据库及备份。本版不自动清理会话。配置示例：
+每条会话独立持有消息、摘要、上下文估算偏差及待写事件。数据库初始化失败时会告警并继续使用进程内多会话；写入失败时保留本地待写数据，切换会话也不会丢弃它。revision 冲突会显示在列表或保存结果中，程序不会自动覆盖数据库记录。跨进程只能恢复最后一次成功发布的检查点。同一工作目录中的文件仍由各会话共享。
+
+会话存储将脱敏后的用户输入、模型输出、工具结果和摘要事件追加保存，并发布可恢复的检查点；压缩不会删除原始事件。恢复要求相同工作目录、模型、API 类型和端点，重新生成系统环境提示并清空工具授权。工具执行中断后会提示副作用未确认，不自动重跑工具。已知 API key、数据库 URL 和认证头在保存前脱敏；会话记录仍可能含其他敏感业务内容，请保护数据库及备份。本版不自动清理会话。
+
+会话和 Trace 默认共用启动工作目录的 `./.db/geer.sqlite`，目录会自动创建且已加入 Git 忽略。可用公共配置改用其他数据库：
 
 ```sh
-GEER_AGENT_SESSION_DATABASE=sqlite
-GEER_AGENT_SESSION_DATABASE_URL='sqlite://sessions.sqlite?mode=rwc'
+GEER_AGENT_DATABASE=sqlite
+GEER_AGENT_DATABASE_URL='sqlite://.db/geer.sqlite?mode=rwc'
 ```
+
+`GEER_AGENT_DATABASE` 默认为 `sqlite`；选择其他后端时必须设置对应 URL。Trace 和会话共用这组数据库配置，可分别通过 `GEER_AGENT_TRACE` 和 `GEER_AGENT_SESSION_PERSISTENCE` 关闭。已有数据库可以通过公共配置指定原地址，无需迁移数据。
 
 ## 执行预算
 
@@ -58,14 +64,9 @@ GEER_AGENT_SESSION_DATABASE_URL='sqlite://sessions.sqlite?mode=rwc'
 
 ## LLM 调用 Trace
 
-启动时会显示 `Session ID`，输入 `/reset` 后生成并显示新 ID。每个模型步骤（包括摘要调用）有独立的 `request_id`，同一步骤的重试合并为一条逻辑记录。Trace 默认不持久化；设置以下两项可选择一种数据库：
+启动时会显示 `Session ID`，输入 `/new` 或 `/reset` 后生成并显示新 UUID。每个模型步骤（包括摘要调用）有独立的 `request_id`，同一步骤的重试合并为一条逻辑记录。Trace 默认写入上述共用 SQLite；设 `GEER_AGENT_TRACE=off` 可关闭。
 
-```sh
-GEER_AGENT_TRACE_DATABASE=sqlite
-GEER_AGENT_TRACE_DATABASE_URL='sqlite://trace.sqlite?mode=rwc'
-```
-
-`GEER_AGENT_TRACE_DATABASE` 支持 `sqlite`、`postgres`、`mysql`、`mongodb`，相应 URL 使用 `sqlite:`、`postgres://` 或 `postgresql://`、`mysql://`、`mongodb://` 或 `mongodb+srv://` 协议；MongoDB URI 必须带数据库名。可在 `.env` 或进程环境变量中配置，一次只选择一个数据库。SQL 数据库首次连接时自动运行版本化迁移；MongoDB 自动建立索引。Reader 提供代码接口，包括按 Request ID 读取和按 Session 游标分页，本次没有终端查询命令。
+数据库后端支持 `sqlite`、`postgres`、`mysql`、`mongodb`，相应 URL 使用 `sqlite:`、`postgres://` 或 `postgresql://`、`mysql://`、`mongodb://` 或 `mongodb+srv://` 协议；MongoDB URI 必须带数据库名。配置可写在 `.env` 或进程环境变量中。SQL 数据库首次连接时自动运行版本化迁移；MongoDB 自动建立索引。Reader 提供代码接口，包括按 Request ID 读取和按 Session 游标分页，本次没有终端查询命令。
 
 启用后，所选数据库会保存每次模型调用的**完整请求、合并后的响应或失败前已收到的内容**，其中可能包含对话历史、用户输入、工具参数与工具结果。已配置的 API key 与数据库连接串即使出现在内容中也会替换为 `[REDACTED]`。请保护数据库文件、服务与备份；本版不自动清理记录。记录不含 HTTP 认证头。数据库连接或写入失败会在终端报 Trace 告警，模型对话继续。
 

@@ -77,7 +77,17 @@ fn run_repl_with_env(
         .env("OPENAI_BASE_URL", url)
         .env("OPENAI_API", api)
         .env("GEER_AGENT_TOOLS", "on")
+        .env("GEER_AGENT_TRACE", "off")
+        .env("GEER_AGENT_SESSION_PERSISTENCE", "off")
+        .env_remove("GEER_AGENT_DATABASE")
+        .env_remove("GEER_AGENT_DATABASE_URL")
         .env_remove("GEER_AGENT_BASH_BIN");
+    if env
+        .iter()
+        .any(|(name, _)| *name == "GEER_AGENT_DATABASE" || *name == "GEER_AGENT_DATABASE_URL")
+    {
+        command.env("GEER_AGENT_TRACE", "on");
+    }
     for (name, value) in env {
         command.env(name, value);
     }
@@ -1010,8 +1020,8 @@ async fn trace_records_each_model_step_and_session_reset_for_both_apis() {
             replies,
             "first\nsecond\n/reset\nthird\n/exit\n",
             &[
-                ("GEER_AGENT_TRACE_DATABASE", "sqlite"),
-                ("GEER_AGENT_TRACE_DATABASE_URL", &url),
+                ("GEER_AGENT_DATABASE", "sqlite"),
+                ("GEER_AGENT_DATABASE_URL", &url),
             ],
         );
         assert!(
@@ -1079,8 +1089,8 @@ fn unreachable_trace_database_warns_without_blocking_model_or_exposing_uri() {
         vec![Reply::ChatFinal],
         "hello\n/exit\n",
         &[
-            ("GEER_AGENT_TRACE_DATABASE", "postgres"),
-            ("GEER_AGENT_TRACE_DATABASE_URL", secret_url),
+            ("GEER_AGENT_DATABASE", "postgres"),
+            ("GEER_AGENT_DATABASE_URL", secret_url),
         ],
     );
     assert!(output.status.success());
@@ -1104,8 +1114,8 @@ fn trace_write_failure_warns_and_preserves_model_answer() {
         vec![Reply::ChatFinalDropTrace(path.display().to_string())],
         "hello\n/exit\n",
         &[
-            ("GEER_AGENT_TRACE_DATABASE", "sqlite"),
-            ("GEER_AGENT_TRACE_DATABASE_URL", &url),
+            ("GEER_AGENT_DATABASE", "sqlite"),
+            ("GEER_AGENT_DATABASE_URL", &url),
         ],
     );
     assert!(output.status.success());
@@ -1118,19 +1128,16 @@ fn trace_write_failure_warns_and_preserves_model_answer() {
 }
 
 #[test]
-fn invalid_trace_database_selection_fails_before_repl() {
+fn invalid_database_selection_fails_before_repl() {
     let output = Command::new(env!("CARGO_BIN_EXE_geer-agent"))
         .env("OPENAI_API_KEY", "test-key")
         .env("OPENAI_MODEL", "test-model")
-        .env("GEER_AGENT_TRACE_DATABASE", "unknown")
-        .env(
-            "GEER_AGENT_TRACE_DATABASE_URL",
-            "sqlite://trace.sqlite?mode=rwc",
-        )
+        .env("GEER_AGENT_DATABASE", "unknown")
+        .env("GEER_AGENT_DATABASE_URL", "sqlite://trace.sqlite?mode=rwc")
         .output()
         .unwrap();
     assert!(!output.status.success());
-    assert!(String::from_utf8_lossy(&output.stderr).contains("GEER_AGENT_TRACE_DATABASE 只能是"));
+    assert!(String::from_utf8_lossy(&output.stderr).contains("GEER_AGENT_DATABASE 只能是"));
 }
 
 #[tokio::test]
@@ -1142,8 +1149,8 @@ async fn chat_trace_counts_transport_retry_and_keeps_partial_failure() {
         vec![Reply::RetryableError, Reply::ChatFinal, Reply::ChatPartial],
         "first\nsecond\n/exit\n",
         &[
-            ("GEER_AGENT_TRACE_DATABASE", "sqlite"),
-            ("GEER_AGENT_TRACE_DATABASE_URL", &url),
+            ("GEER_AGENT_DATABASE", "sqlite"),
+            ("GEER_AGENT_DATABASE_URL", &url),
         ],
     );
     assert!(
@@ -1196,8 +1203,8 @@ async fn trace_redacts_configured_api_key_even_when_it_appears_in_user_input() {
         vec![Reply::ChatFinal],
         "test-key\n/exit\n",
         &[
-            ("GEER_AGENT_TRACE_DATABASE", "sqlite"),
-            ("GEER_AGENT_TRACE_DATABASE_URL", &url),
+            ("GEER_AGENT_DATABASE", "sqlite"),
+            ("GEER_AGENT_DATABASE_URL", &url),
         ],
     );
     assert!(output.status.success());

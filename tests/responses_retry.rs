@@ -58,13 +58,20 @@ fn run_repl_with_trace(
         .env("OPENAI_BASE_URL", url)
         .env("OPENAI_API", "responses")
         .env("GEER_AGENT_TOOLS", "off")
+        .env("GEER_AGENT_SESSION_PERSISTENCE", "off")
+        .env(
+            "GEER_AGENT_TRACE",
+            if trace_url.is_some() { "on" } else { "off" },
+        )
+        .env_remove("GEER_AGENT_DATABASE")
+        .env_remove("GEER_AGENT_DATABASE_URL")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     if let Some(trace_url) = trace_url {
         command
-            .env("GEER_AGENT_TRACE_DATABASE", "sqlite")
-            .env("GEER_AGENT_TRACE_DATABASE_URL", trace_url);
+            .env("GEER_AGENT_DATABASE", "sqlite")
+            .env("GEER_AGENT_DATABASE_URL", trace_url);
     }
     let mut child = command.spawn().expect("启动 REPL");
     child

@@ -302,6 +302,7 @@ impl Prompt {
         self.current_user = None;
     }
 
+    #[cfg(test)]
     pub(crate) fn reset(&mut self) {
         self.summary = None;
         self.boundaries.clear();

@@ -8,6 +8,7 @@ use std::{
 };
 
 const DEFAULT_BASE_URL: &str = "https://api.openai.com/v1";
+const DEFAULT_DATABASE_URL: &str = "sqlite://.db/geer.sqlite?mode=rwc";
 const DEFAULT_MAX_DURATION: Duration = Duration::from_secs(600);
 pub(crate) const DEFAULT_RESOURCE_LIMITS: ResourceLimits = ResourceLimits {
     max_input_tokens: None,
@@ -43,7 +44,7 @@ pub(crate) enum TraceDatabase {
     Mongodb,
 }
 
-#[derive(Clone)]
+#[derive(Clone, PartialEq, Eq)]
 pub(crate) struct TraceDatabaseConfig {
     pub(crate) kind: TraceDatabase,
     pub(crate) url: String,
@@ -59,39 +60,29 @@ impl fmt::Debug for TraceDatabaseConfig {
 }
 
 impl TraceDatabaseConfig {
-    fn from_values(database: Option<String>, url: Option<String>) -> Result<Option<Self>, String> {
-        Self::from_named_values(database, url, "GEER_AGENT_TRACE_DATABASE")
-    }
-
-    fn from_named_values(
-        database: Option<String>,
-        url: Option<String>,
-        name: &str,
-    ) -> Result<Option<Self>, String> {
-        let url_name = format!("{name}_URL");
-        let database = database.as_deref().map(str::trim).unwrap_or_default();
-        let url = url.as_deref().map(str::trim).unwrap_or_default();
-        if database.is_empty() {
-            return if url.is_empty() {
-                Ok(None)
-            } else {
-                Err(format!("{url_name} 需要同时设置 {name}。"))
-            };
-        }
+    fn from_values(database: Option<String>, url: Option<String>) -> Result<Self, String> {
+        let database = database
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .unwrap_or("sqlite");
         let kind = match database {
             "sqlite" => TraceDatabase::Sqlite,
             "postgres" => TraceDatabase::Postgres,
             "mysql" => TraceDatabase::Mysql,
             "mongodb" => TraceDatabase::Mongodb,
             _ => {
-                return Err(format!(
-                    "{name} 只能是 sqlite、postgres、mysql 或 mongodb。"
-                ));
+                return Err(
+                    "GEER_AGENT_DATABASE 只能是 sqlite、postgres、mysql 或 mongodb。".to_owned(),
+                );
             }
         };
-        if url.is_empty() {
-            return Err(format!("启用数据库时必须设置 {url_name}。"));
-        }
+        let url = url
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .or_else(|| (kind == TraceDatabase::Sqlite).then_some(DEFAULT_DATABASE_URL))
+            .ok_or("选择非 SQLite 数据库时必须设置 GEER_AGENT_DATABASE_URL。")?;
         let protocol_valid = match kind {
             TraceDatabase::Sqlite => url.starts_with("sqlite:"),
             TraceDatabase::Postgres => {
@@ -103,7 +94,7 @@ impl TraceDatabaseConfig {
             }
         };
         if !protocol_valid {
-            return Err(format!("{url_name} 与数据库类型的协议不匹配。"));
+            return Err("GEER_AGENT_DATABASE_URL 与数据库类型的协议不匹配。".to_owned());
         }
         if kind == TraceDatabase::Mongodb {
             let authority_and_path = url
@@ -115,13 +106,49 @@ impl TraceDatabaseConfig {
                 .map(|(_, path)| path.split('?').next().unwrap_or_default())
                 .unwrap_or_default();
             if database_name.is_empty() {
-                return Err("MongoDB Trace URI 必须包含数据库名。".to_owned());
+                return Err("MongoDB URI 必须包含数据库名。".to_owned());
             }
         }
-        Ok(Some(Self {
+        Ok(Self {
             kind,
             url: url.to_owned(),
-        }))
+        })
+    }
+}
+
+#[derive(Default)]
+struct DatabaseInputs {
+    common_kind: Option<String>,
+    common_url: Option<String>,
+    trace_enabled: Option<String>,
+    session_enabled: Option<String>,
+}
+
+impl DatabaseInputs {
+    fn from_env() -> Self {
+        Self {
+            common_kind: std::env::var("GEER_AGENT_DATABASE").ok(),
+            common_url: std::env::var("GEER_AGENT_DATABASE_URL").ok(),
+            trace_enabled: std::env::var("GEER_AGENT_TRACE").ok(),
+            session_enabled: std::env::var("GEER_AGENT_SESSION_PERSISTENCE").ok(),
+        }
+    }
+
+    fn resolve(self) -> Result<(Option<TraceDatabaseConfig>, Option<TraceDatabaseConfig>), String> {
+        let database = TraceDatabaseConfig::from_values(self.common_kind, self.common_url)?;
+        Ok((
+            parse_on_off(self.trace_enabled, "GEER_AGENT_TRACE")?.then(|| database.clone()),
+            parse_on_off(self.session_enabled, "GEER_AGENT_SESSION_PERSISTENCE")?
+                .then_some(database),
+        ))
+    }
+}
+
+fn parse_on_off(value: Option<String>, name: &str) -> Result<bool, String> {
+    match value.as_deref().map(str::trim) {
+        None | Some("") | Some("on") => Ok(true),
+        Some("off") => Ok(false),
+        _ => Err(format!("{name} 只能是 on 或 off。")),
     }
 }
 
@@ -312,17 +339,9 @@ impl Config {
             std::env::var("GEER_AGENT_MAX_DURATION_SECONDS").ok(),
         ])
         .map_err(|message| io::Error::new(io::ErrorKind::InvalidInput, message))?;
-        config.trace_database = TraceDatabaseConfig::from_values(
-            std::env::var("GEER_AGENT_TRACE_DATABASE").ok(),
-            std::env::var("GEER_AGENT_TRACE_DATABASE_URL").ok(),
-        )
-        .map_err(|message| io::Error::new(io::ErrorKind::InvalidInput, message))?;
-        config.session_database = TraceDatabaseConfig::from_named_values(
-            std::env::var("GEER_AGENT_SESSION_DATABASE").ok(),
-            std::env::var("GEER_AGENT_SESSION_DATABASE_URL").ok(),
-            "GEER_AGENT_SESSION_DATABASE",
-        )
-        .map_err(|message| io::Error::new(io::ErrorKind::InvalidInput, message))?;
+        (config.trace_database, config.session_database) = DatabaseInputs::from_env()
+            .resolve()
+            .map_err(|message| io::Error::new(io::ErrorKind::InvalidInput, message))?;
         config.compaction = CompactionConfig::from_values(
             std::env::var("GEER_AGENT_CONTEXT_WINDOW_TOKENS").ok(),
             std::env::var("GEER_AGENT_AUTO_COMPACT").ok(),
@@ -405,9 +424,81 @@ fn required_value(value: Option<String>, name: &str) -> Result<String, String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        CompactionConfig, Config, DEFAULT_BASE_URL, OpenAiApi, ResourceLimits, TraceDatabase,
-        TraceDatabaseConfig,
+        CompactionConfig, Config, DEFAULT_BASE_URL, DEFAULT_DATABASE_URL, DatabaseInputs,
+        OpenAiApi, ResourceLimits, TraceDatabase, TraceDatabaseConfig,
     };
+
+    #[test]
+    fn database_defaults_and_shared_override() {
+        let (trace, session) = DatabaseInputs::default().resolve().unwrap();
+        assert_eq!(trace, session);
+        assert_eq!(trace.unwrap().url, DEFAULT_DATABASE_URL);
+
+        let (trace, session) = DatabaseInputs {
+            common_kind: Some("sqlite".into()),
+            common_url: Some("sqlite://custom.sqlite?mode=rwc".into()),
+            ..Default::default()
+        }
+        .resolve()
+        .unwrap();
+        assert_eq!(trace, session);
+        assert_eq!(trace.unwrap().url, "sqlite://custom.sqlite?mode=rwc");
+    }
+
+    #[test]
+    fn database_independent_switches() {
+        let (trace, session) = DatabaseInputs {
+            trace_enabled: Some("off".into()),
+            ..Default::default()
+        }
+        .resolve()
+        .unwrap();
+        assert!(trace.is_none() && session.is_some());
+        let (trace, session) = DatabaseInputs {
+            session_enabled: Some("off".into()),
+            ..Default::default()
+        }
+        .resolve()
+        .unwrap();
+        assert!(trace.is_some() && session.is_none());
+    }
+
+    #[test]
+    fn database_rejects_invalid_explicit_values() {
+        assert!(
+            DatabaseInputs {
+                common_kind: Some("postgres".into()),
+                ..Default::default()
+            }
+            .resolve()
+            .unwrap_err()
+            .contains("GEER_AGENT_DATABASE_URL")
+        );
+        assert!(
+            DatabaseInputs {
+                common_url: Some("postgres://localhost/db".into()),
+                ..Default::default()
+            }
+            .resolve()
+            .is_err()
+        );
+        assert!(
+            DatabaseInputs {
+                trace_enabled: Some("no".into()),
+                ..Default::default()
+            }
+            .resolve()
+            .is_err()
+        );
+        assert!(
+            DatabaseInputs {
+                common_kind: Some("unknown".into()),
+                ..Default::default()
+            }
+            .resolve()
+            .is_err()
+        );
+    }
 
     #[test]
     fn compaction_defaults_and_overrides() {
@@ -429,45 +520,17 @@ mod tests {
     }
 
     #[test]
-    fn session_database_uses_existing_backends_without_trace_requirement() {
-        assert!(
-            TraceDatabaseConfig::from_named_values(None, None, "GEER_AGENT_SESSION_DATABASE")
+    fn database_config_accepts_supported_backends_and_requires_matching_url() {
+        assert_eq!(
+            TraceDatabaseConfig::from_values(None, None).unwrap().url,
+            DEFAULT_DATABASE_URL
+        );
+        assert_eq!(
+            TraceDatabaseConfig::from_values(None, Some("sqlite::memory:".into()))
                 .unwrap()
-                .is_none()
+                .kind,
+            TraceDatabase::Sqlite
         );
-        let selected = TraceDatabaseConfig::from_named_values(
-            Some("sqlite".into()),
-            Some("sqlite::memory:".into()),
-            "GEER_AGENT_SESSION_DATABASE",
-        )
-        .unwrap()
-        .unwrap();
-        assert_eq!(selected.kind, TraceDatabase::Sqlite);
-        let error = TraceDatabaseConfig::from_named_values(
-            None,
-            Some("sqlite::memory:".into()),
-            "GEER_AGENT_SESSION_DATABASE",
-        )
-        .unwrap_err();
-        assert!(error.contains("GEER_AGENT_SESSION_DATABASE_URL"));
-        assert!(
-            TraceDatabaseConfig::from_named_values(
-                Some("sqlite".into()),
-                Some("mongodb://localhost/db".into()),
-                "GEER_AGENT_SESSION_DATABASE",
-            )
-            .is_err()
-        );
-    }
-
-    #[test]
-    fn trace_database_config_requires_selected_backend_and_matching_url() {
-        assert!(
-            TraceDatabaseConfig::from_values(None, None)
-                .unwrap()
-                .is_none()
-        );
-        assert!(TraceDatabaseConfig::from_values(None, Some("sqlite::memory:".into())).is_err());
         for (database, url, expected) in [
             ("sqlite", "sqlite::memory:", TraceDatabase::Sqlite),
             (
@@ -482,9 +545,8 @@ mod tests {
                 TraceDatabase::Mongodb,
             ),
         ] {
-            let config = TraceDatabaseConfig::from_values(Some(database.into()), Some(url.into()))
-                .unwrap()
-                .unwrap();
+            let config =
+                TraceDatabaseConfig::from_values(Some(database.into()), Some(url.into())).unwrap();
             assert_eq!(config.kind, expected);
             assert!(!format!("{config:?}").contains(url));
         }

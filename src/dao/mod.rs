@@ -3,6 +3,8 @@
 mod mongo;
 mod sql;
 
+pub(crate) const SESSION_REVISION_CONFLICT: &str = "会话 revision 冲突";
+
 use std::collections::{HashMap, HashSet};
 
 use crate::{
@@ -13,12 +15,19 @@ use crate::{
     },
 };
 
+#[derive(Clone)]
 pub(crate) enum SessionStore {
     Sql(sql::SqlStore),
     Mongo(mongo::MongoStore),
 }
 
 impl SessionStore {
+    pub(crate) fn trace_store(&self) -> TraceStore {
+        match self {
+            Self::Sql(store) => TraceStore::Sql(store.clone()),
+            Self::Mongo(store) => TraceStore::Mongo(store.clone()),
+        }
+    }
     pub(crate) async fn connect(config: &TraceDatabaseConfig) -> Result<Self, TraceError> {
         match config.kind {
             TraceDatabase::Sqlite | TraceDatabase::Postgres | TraceDatabase::Mysql => {
@@ -434,6 +443,43 @@ mod tests {
         })
         .await;
         let _ = std::fs::remove_file(path);
+    }
+
+    #[tokio::test]
+    async fn sqlite_shared_connection_creates_parent_and_holds_both_records() {
+        let root = std::env::temp_dir().join(format!("geer-shared-{}", Uuid::new_v4()));
+        let path = root.join("nested/geer.sqlite");
+        let config = TraceDatabaseConfig {
+            kind: TraceDatabase::Sqlite,
+            url: format!("sqlite://{}?mode=rwc", path.display()),
+        };
+        let session_store = SessionStore::connect(&config).await.unwrap();
+        let trace_store = session_store.trace_store();
+        assert!(path.is_file());
+        let id = Uuid::new_v4().to_string();
+        let session = SessionRecord {
+            id: id.clone(),
+            workspace: "/tmp/shared".into(),
+            api: "responses".into(),
+            model: "test".into(),
+            endpoint: "https://example.test/v1".into(),
+            snapshot: json!({"version":1}),
+            head_event_id: None,
+            revision: 0,
+            updated_at_ms: 100,
+            uncertain_tools: false,
+        };
+        session_store.save(&session, &[], None).await.unwrap();
+        let trace = record(&Uuid::new_v4().to_string(), &id, 101);
+        trace_store.write_one(&trace).await.unwrap();
+        assert_eq!(session_store.load(&id).await.unwrap(), Some(session));
+        assert_eq!(
+            trace_store.get_one(&trace.request_id).await.unwrap(),
+            Some(trace)
+        );
+        drop(trace_store);
+        drop(session_store);
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[tokio::test]

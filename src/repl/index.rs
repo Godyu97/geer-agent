@@ -1,34 +1,26 @@
 use std::{error::Error, io, io::BufRead, io::Write};
 
 use super::color::Color;
-use crate::prompt::Prompt;
 
 pub(crate) trait Session {
     fn session_id(&self) -> &str;
 
-    async fn handle_message<F>(
-        &mut self,
-        prompt: &mut Prompt,
-        on_delta: F,
-    ) -> Result<(), Box<dyn Error>>
+    async fn handle_message<F>(&mut self, input: &str, on_delta: F) -> Result<(), Box<dyn Error>>
     where
         F: FnMut(&str) -> io::Result<()>;
 
-    fn reset(&mut self);
+    async fn new_session(&mut self) -> String;
 
-    async fn flush(&mut self, prompt: &mut Prompt);
+    async fn flush(&mut self) -> String;
 
-    async fn compact(&mut self, prompt: &mut Prompt) -> Result<String, Box<dyn Error>>;
+    async fn compact(&mut self) -> Result<String, Box<dyn Error>>;
 
     async fn sessions(&self) -> Result<Vec<String>, Box<dyn Error>>;
 
-    async fn resume(&mut self, prompt: &mut Prompt, id: &str) -> Result<String, Box<dyn Error>>;
+    async fn open(&mut self, id: &str) -> Result<String, Box<dyn Error>>;
 }
 
-pub(crate) async fn run(
-    session: &mut impl Session,
-    prompt: &mut Prompt,
-) -> Result<(), Box<dyn Error>> {
+pub(crate) async fn run(session: &mut impl Session) -> Result<(), Box<dyn Error>> {
     let color = Color::detect();
     let stdin = io::stdin();
 
@@ -50,7 +42,10 @@ pub(crate) async fn run(
                 continue;
             }
             InputLine::Eof => {
-                session.flush(prompt).await;
+                let report = session.flush().await;
+                if !report.is_empty() {
+                    println!("{report}");
+                }
                 println!("bye");
                 break;
             }
@@ -60,18 +55,25 @@ pub(crate) async fn run(
             Input::Empty => {}
             Input::Help => print_help(),
             Input::Reset => {
-                session.flush(prompt).await;
-                prompt.reset();
-                session.reset();
-                println!("（已清空对话记忆）");
+                session.new_session().await;
+                println!("（已清空对话记忆，开始新会话）");
+                println!("Session ID: {}", session.session_id());
+            }
+            Input::New => {
+                session.new_session().await;
+                println!("（已开始新会话）");
                 println!("Session ID: {}", session.session_id());
             }
             Input::Exit => {
-                session.flush(prompt).await;
+                let report = session.flush().await;
+                if !report.is_empty() {
+                    println!("{report}");
+                }
                 println!("bye");
                 break;
             }
-            Input::Compact => match session.compact(prompt).await {
+            Input::Save => println!("{}", session.flush().await),
+            Input::Compact => match session.compact().await {
                 Ok(message) => println!("{message}"),
                 Err(error) => eprintln!("上下文压缩失败：{error}"),
             },
@@ -86,21 +88,17 @@ pub(crate) async fn run(
                 }
                 Err(error) => eprintln!("会话列表读取失败：{error}"),
             },
-            Input::Resume(id) => {
-                session.flush(prompt).await;
-                match session.resume(prompt, &id).await {
-                    Ok(message) => {
-                        println!("{message}");
-                        println!("Session ID: {}", session.session_id());
-                    }
-                    Err(error) => eprintln!("会话恢复失败：{error}"),
+            Input::Open(id) => match session.open(&id).await {
+                Ok(message) => {
+                    println!("{message}");
+                    println!("Session ID: {}", session.session_id());
                 }
-            }
+                Err(error) => eprintln!("会话恢复失败：{error}"),
+            },
             Input::Unknown(command) => {
                 println!("未知命令：{command}（输入 /help 查看可用命令）");
             }
             Input::Message(message) => {
-                prompt.begin_turn(&message);
                 {
                     let mut stdout = io::stdout().lock();
                     color.write_assistant_prompt(&mut stdout)?;
@@ -108,7 +106,7 @@ pub(crate) async fn run(
                 }
 
                 let result = session
-                    .handle_message(prompt, |delta| {
+                    .handle_message(&message, |delta| {
                         let mut stdout = io::stdout().lock();
                         if delta.starts_with("\n[调用工具") || delta.starts_with("\n[工具调用轮次")
                         {
@@ -134,7 +132,7 @@ pub(crate) async fn run(
 
 fn print_help() {
     println!(
-        "可用命令：\n  /help                 显示帮助\n  /compact              压缩旧对话\n  /sessions             列出当前目录的近期会话\n  /resume <session-id>  恢复会话\n  /reset                开始新会话\n  /exit                 退出程序"
+        "可用命令：\n  /help                 显示帮助\n  /compact              压缩旧对话\n  /sessions             列出当前目录的近期会话\n  /open <session-id>    打开会话\n  /resume <session-id>  打开会话（兼容命令）\n  /new                  开始新会话\n  /reset                开始新会话\n  /save                 保存所有待写会话\n  /exit                 退出程序"
     );
 }
 
@@ -160,9 +158,11 @@ enum Input {
     Empty,
     Help,
     Reset,
+    New,
+    Save,
     Compact,
     Sessions,
-    Resume(String),
+    Open(String),
     Exit,
     Unknown(String),
     Message(String),
@@ -174,10 +174,15 @@ fn parse_input(line: &str) -> Input {
         "" => Input::Empty,
         "/help" => Input::Help,
         "/reset" => Input::Reset,
+        "/new" => Input::New,
+        "/save" => Input::Save,
         "/compact" => Input::Compact,
         "/sessions" => Input::Sessions,
         input if input.starts_with("/resume ") && !input[8..].trim().is_empty() => {
-            Input::Resume(input[8..].trim().to_owned())
+            Input::Open(input[8..].trim().to_owned())
+        }
+        input if input.starts_with("/open ") && !input[6..].trim().is_empty() => {
+            Input::Open(input[6..].trim().to_owned())
         }
         "/exit" => Input::Exit,
         input if input.starts_with('/') => Input::Unknown(input.to_owned()),
@@ -193,9 +198,12 @@ mod tests {
     fn parses_supported_commands() {
         assert!(matches!(parse_input("/help"), Input::Help));
         assert!(matches!(parse_input("/reset"), Input::Reset));
+        assert!(matches!(parse_input("/new"), Input::New));
+        assert!(matches!(parse_input("/save"), Input::Save));
         assert!(matches!(parse_input("/compact"), Input::Compact));
         assert!(matches!(parse_input("/sessions"), Input::Sessions));
-        assert!(matches!(parse_input("/resume abc"), Input::Resume(id) if id == "abc"));
+        assert!(matches!(parse_input("/resume abc"), Input::Open(id) if id == "abc"));
+        assert!(matches!(parse_input("/open abc"), Input::Open(id) if id == "abc"));
         assert!(matches!(parse_input("/exit"), Input::Exit));
     }
 

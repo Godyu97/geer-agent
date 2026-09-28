@@ -1,8 +1,9 @@
-use std::time::Duration;
+use std::{str::FromStr, time::Duration};
 
 use sea_orm::{
     ActiveModelTrait, ActiveValue, ColumnTrait, ConnectOptions, Database, DatabaseConnection,
     DbErr, EntityTrait, QueryFilter, QueryOrder, QuerySelect, sea_query::Condition,
+    sqlx::sqlite::SqliteConnectOptions,
 };
 use sea_orm_migration::prelude::*;
 
@@ -258,12 +259,25 @@ impl MigrationTrait for CreateTrace {
     }
 }
 
+#[derive(Clone)]
 pub(crate) struct SqlStore {
     db: DatabaseConnection,
 }
 
 impl SqlStore {
     pub(super) async fn connect(url: &str) -> Result<Self, TraceError> {
+        if url.starts_with("sqlite:") && !url.starts_with("sqlite::memory:") {
+            let options = SqliteConnectOptions::from_str(url)
+                .map_err(|_| TraceError("SQLite URL 无效".into()))?;
+            let filename = options.get_filename();
+            if let Some(parent) = filename.parent()
+                && !parent.as_os_str().is_empty()
+                && !url.contains("mode=memory")
+            {
+                std::fs::create_dir_all(parent)
+                    .map_err(|_| TraceError("SQLite 目录创建失败".into()))?;
+            }
+        }
         let mut options = ConnectOptions::new(url);
         options
             .connect_timeout(Duration::from_secs(5))
@@ -439,7 +453,7 @@ impl SqlStore {
                 .await
                 .map_err(|_| TraceError("SQL 会话检查点更新失败".into()))?;
             if updated.rows_affected != 1 {
-                return Err(TraceError("会话 revision 冲突".into()));
+                return Err(TraceError(super::SESSION_REVISION_CONFLICT.into()));
             }
         } else {
             if record.revision != 0 {

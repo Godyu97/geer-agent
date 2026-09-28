@@ -25,7 +25,7 @@ use crate::{
     },
 };
 use guard::{LoopGuard, StopReason, call_fingerprint, result_fingerprint};
-use session::SessionRuntime;
+use session::{SessionManager, SessionRuntime};
 
 static NEXT_RUN_ID: AtomicU64 = AtomicU64::new(0);
 
@@ -328,26 +328,11 @@ fn finalization_instruction(skipped_tool_batch: bool, reason: TerminationReason)
 
 pub(crate) async fn run() -> Result<(), Box<dyn Error>> {
     let config = Config::load()?;
-    let session_runtime = if let Some(database) = &config.session_database {
+    let shared_database =
+        config.session_database.is_some() && config.session_database == config.trace_database;
+    let session_store = if let Some(database) = &config.session_database {
         match SessionStore::connect(database).await {
-            Ok(store) => Some(SessionRuntime::new(
-                store,
-                std::env::current_dir()?
-                    .canonicalize()?
-                    .to_string_lossy()
-                    .into_owned(),
-                config.api.as_str().to_owned(),
-                config.model.clone(),
-                &config.base_url,
-                vec![
-                    config.api_key.clone(),
-                    database.url.clone(),
-                    config
-                        .trace_database
-                        .as_ref()
-                        .map_or(String::new(), |trace| trace.url.clone()),
-                ],
-            )),
+            Ok(store) => Some(store),
             Err(_) => {
                 eprintln!("会话数据库连接或初始化失败，本次会话仅保存在内存中。");
                 None
@@ -356,7 +341,9 @@ pub(crate) async fn run() -> Result<(), Box<dyn Error>> {
     } else {
         None
     };
-    let trace_store = if let Some(database) = &config.trace_database {
+    let trace_store = if shared_database {
+        session_store.as_ref().map(SessionStore::trace_store)
+    } else if let Some(database) = &config.trace_database {
         match TraceStore::connect(database).await {
             Ok(store) => Some(store),
             Err(_) => {
@@ -367,8 +354,31 @@ pub(crate) async fn run() -> Result<(), Box<dyn Error>> {
     } else {
         None
     };
+    let workspace = std::env::current_dir()?
+        .canonicalize()?
+        .to_string_lossy()
+        .into_owned();
+    let session_runtime = session_store.map(|store| {
+        SessionRuntime::new(
+            store,
+            workspace.clone(),
+            config.api.as_str().to_owned(),
+            config.model.clone(),
+            &config.base_url,
+            vec![
+                config.api_key.clone(),
+                config
+                    .session_database
+                    .as_ref()
+                    .map_or(String::new(), |database| database.url.clone()),
+                config
+                    .trace_database
+                    .as_ref()
+                    .map_or(String::new(), |database| database.url.clone()),
+            ],
+        )
+    });
     let system_prompt = prompt::load(&config.bash_bin).await?;
-    let mut prompt = Prompt::new(config.api, system_prompt);
     let mut agent = Agent {
         chat: Provider::new(&config),
         tools: Tools::new(config.tools_enabled, config.bash_bin.clone())?,
@@ -377,11 +387,9 @@ pub(crate) async fn run() -> Result<(), Box<dyn Error>> {
             ..DEFAULT_AGENT_BUDGET
         },
         compaction: config.compaction,
-        context_token_bias: 0,
         model: config.model.clone(),
-        session_id: Uuid::new_v4().to_string(),
+        sessions: SessionManager::new(config.api, system_prompt, session_runtime),
         trace_store,
-        session_runtime,
         api: config.api,
         api_key: config.api_key.clone(),
         base_url: config.base_url.clone(),
@@ -389,8 +397,12 @@ pub(crate) async fn run() -> Result<(), Box<dyn Error>> {
             .trace_database
             .as_ref()
             .map(|database| database.url.clone()),
+        session_database_url: config
+            .session_database
+            .as_ref()
+            .map(|database| database.url.clone()),
     };
-    repl::run(&mut agent, &mut prompt).await
+    repl::run(&mut agent).await
 }
 
 struct Agent {
@@ -398,15 +410,14 @@ struct Agent {
     tools: Tools,
     budget: AgentBudget,
     compaction: CompactionConfig,
-    context_token_bias: u64,
     model: String,
-    session_id: String,
+    sessions: SessionManager,
     trace_store: Option<TraceStore>,
-    session_runtime: Option<SessionRuntime>,
     api: OpenAiApi,
     api_key: String,
     base_url: String,
     trace_database_url: Option<String>,
+    session_database_url: Option<String>,
 }
 
 struct TraceContext<'a> {
@@ -416,94 +427,109 @@ struct TraceContext<'a> {
     api_key: &'a str,
     base_url: &'a str,
     database_url: Option<&'a str>,
+    session_database_url: Option<&'a str>,
     store: Option<&'a TraceStore>,
 }
 
 impl Session for Agent {
     fn session_id(&self) -> &str {
-        &self.session_id
+        &self.sessions.active.id
     }
 
     async fn handle_message<F>(
         &mut self,
-        prompt: &mut Prompt,
+        input: &str,
         mut on_delta: F,
     ) -> Result<(), Box<dyn Error>>
     where
         F: FnMut(&str) -> io::Result<()>,
     {
-        if let Some(session) = self.session_runtime.as_mut() {
-            session.save(&self.session_id, prompt, false).await;
+        let state = &mut self.sessions.active;
+        state.prompt.begin_turn(input);
+        state.changed();
+        if let Some(session) = state.runtime.as_mut() {
+            session.save(&state.id, &mut state.prompt, false).await;
         }
         let trace = TraceContext {
-            session_id: &self.session_id,
+            session_id: &state.id,
             api: self.api,
             model: &self.model,
             api_key: &self.api_key,
             base_url: &self.base_url,
             database_url: self.trace_database_url.as_deref(),
+            session_database_url: self.session_database_url.as_deref(),
             store: self.trace_store.as_ref(),
         };
         let result = run_tool_loop_with_session(
             &mut self.chat,
             &mut self.tools,
-            prompt,
+            &mut state.prompt,
             &mut on_delta,
             self.budget,
             &self.model,
             Some(&trace),
             self.compaction,
-            &mut self.context_token_bias,
-            self.session_runtime.as_mut(),
-            &self.session_id,
+            &mut state.context_token_bias,
+            state.runtime.as_mut(),
+            &state.id,
         )
         .await;
-        if let Some(session) = self.session_runtime.as_mut() {
-            session.save(&self.session_id, prompt, false).await;
-        }
+        state.save().await;
         result.map(|_| ())
     }
 
-    fn reset(&mut self) {
+    async fn new_session(&mut self) -> String {
+        let id = self.sessions.new_session().await;
         self.tools.reset();
-        self.session_id = Uuid::new_v4().to_string();
-        self.context_token_bias = 0;
-        if let Some(session) = self.session_runtime.as_mut() {
-            session.reset();
-        }
+        id
     }
 
-    async fn flush(&mut self, prompt: &mut Prompt) {
-        if let Some(session) = self.session_runtime.as_mut() {
-            let uncertain = session.uncertain_tools();
-            session.save(&self.session_id, prompt, uncertain).await;
+    async fn flush(&mut self) -> String {
+        let results = self.sessions.save_all().await;
+        let failures = self.sessions.unsaved_ids();
+        let mut report = if results.is_empty() {
+            "没有待保存的会话。".to_owned()
+        } else {
+            results
+                .iter()
+                .map(|(id, status)| format!("{id} [{}]", status.label()))
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+        if !failures.is_empty() {
+            report.push_str(&format!("\n未保存的 Session ID: {}", failures.join(", ")));
         }
+        report
     }
 
-    async fn compact(&mut self, prompt: &mut Prompt) -> Result<String, Box<dyn Error>> {
+    async fn compact(&mut self) -> Result<String, Box<dyn Error>> {
         let max_source = self
             .compaction
             .context_window_tokens
             .saturating_sub(self.compaction.summary_tokens())
             .saturating_sub((self.compaction.context_window_tokens / 40).min(4096));
-        let Some(plan) =
-            prompt.prepare_compaction_bounded(self.compaction.recent_tokens(), true, max_source)
-        else {
+        let state = &mut self.sessions.active;
+        let Some(plan) = state.prompt.prepare_compaction_bounded(
+            self.compaction.recent_tokens(),
+            true,
+            max_source,
+        ) else {
             return Ok("没有可压缩的完整历史片段。".to_owned());
         };
         let trace = TraceContext {
-            session_id: &self.session_id,
+            session_id: &state.id,
             api: self.api,
             model: &self.model,
             api_key: &self.api_key,
             base_url: &self.base_url,
             database_url: self.trace_database_url.as_deref(),
+            session_database_url: self.session_database_url.as_deref(),
             store: self.trace_store.as_ref(),
         };
         let mut runtime = AgentRuntime::new(self.budget, &self.model);
         let result = compact_once(
             &mut self.chat,
-            prompt,
+            &mut state.prompt,
             plan,
             self.compaction,
             &mut runtime,
@@ -512,10 +538,9 @@ impl Session for Agent {
         .await;
         let message = match result {
             Ok(Some((before, after, count))) => {
-                self.context_token_bias = 0;
-                if let Some(session) = self.session_runtime.as_mut() {
-                    session.save(&self.session_id, prompt, false).await;
-                }
+                state.context_token_bias = 0;
+                state.changed();
+                state.save().await;
                 format!("已压缩 {count} 条旧消息，估算 {before} → {after} tokens。")
             }
             Ok(None) => "没有可压缩的历史。".to_owned(),
@@ -529,52 +554,26 @@ impl Session for Agent {
     }
 
     async fn sessions(&self) -> Result<Vec<String>, Box<dyn Error>> {
-        let Some(session) = self.session_runtime.as_ref() else {
-            return Ok(Vec::new());
-        };
-        let records = session.list().await.map_err(io::Error::other)?;
-        Ok(records
-            .into_iter()
-            .map(|record| {
-                let updated =
-                    chrono::DateTime::<chrono::Utc>::from_timestamp_millis(record.updated_at_ms)
-                        .map_or_else(
-                            || record.updated_at_ms.to_string(),
-                            |time| time.to_rfc3339(),
-                        );
-                format!(
-                    "{}  {}  {}{}",
-                    record.id,
-                    updated,
-                    record.model,
-                    if record.uncertain_tools {
-                        "  [工具状态未确认]"
-                    } else {
-                        ""
-                    }
-                )
-            })
-            .collect())
+        self.sessions
+            .list()
+            .await
+            .map_err(|error| io::Error::other(error).into())
     }
 
-    async fn resume(&mut self, prompt: &mut Prompt, id: &str) -> Result<String, Box<dyn Error>> {
-        let Some(session) = self.session_runtime.as_mut() else {
-            return Err(io::Error::other("未配置会话数据库，无法恢复。").into());
-        };
-        let (record, snapshot) = session.load(id).await.map_err(io::Error::other)?;
-        // restore 在验证完成前不改 Prompt；失败时原会话保持原样。
-        prompt.restore(snapshot).map_err(io::Error::other)?;
-        let interrupted = record.uncertain_tools;
-        prompt.commit_turn();
-        session.adopt(&record);
-        self.session_id = record.id;
-        self.context_token_bias = 0;
-        self.tools.reset();
-        Ok(if interrupted {
-            "已恢复会话；上次工具执行可能已产生副作用，状态未确认。请核对后再继续。".to_owned()
-        } else {
-            "已恢复会话。".to_owned()
-        })
+    async fn open(&mut self, id: &str) -> Result<String, Box<dyn Error>> {
+        let switched = self.sessions.open(id).await.map_err(io::Error::other)?;
+        match switched {
+            None => Ok("当前已是该会话。".to_owned()),
+            Some(interrupted) => {
+                self.tools.reset();
+                Ok(if interrupted {
+                    "已恢复会话；上次工具执行可能已产生副作用，状态未确认。请核对后再继续。"
+                        .to_owned()
+                } else {
+                    "已恢复会话。".to_owned()
+                })
+            }
+        }
     }
 }
 
@@ -1121,7 +1120,12 @@ async fn persist_trace(
     let Some(store) = trace.store else { return };
     let mut response = capture.response();
     let mut request = capture.request.clone();
-    let secrets = [trace.api_key, trace.database_url.unwrap_or_default()];
+    let secrets = [
+        trace.api_key,
+        trace.base_url,
+        trace.database_url.unwrap_or_default(),
+        trace.session_database_url.unwrap_or_default(),
+    ];
     redact_json(&mut request, &secrets);
     if let Some(response) = &mut response {
         redact_json(response, &secrets);
@@ -1169,6 +1173,7 @@ fn redact_error(message: &str, trace: &TraceContext<'_>) -> String {
             trace.api_key,
             trace.base_url,
             trace.database_url.unwrap_or_default(),
+            trace.session_database_url.unwrap_or_default(),
         ],
     )
 }
@@ -1196,7 +1201,7 @@ fn is_context_overflow(error: &(dyn Error + 'static)) -> bool {
 mod tests {
     use std::{collections::VecDeque, error::Error, fs, io, time::SystemTime};
 
-    use super::session::SessionRuntime;
+    use super::session::{SessionManager, SessionRuntime};
     use super::{
         Agent, AgentBudget, AgentMetrics, AgentRuntime, DEFAULT_AGENT_BUDGET,
         FINALIZATION_FALLBACK, SOFT_BUDGET_HINT, TerminationReason, TraceContext, run_record,
@@ -1505,19 +1510,30 @@ mod tests {
             tools,
             budget: DEFAULT_AGENT_BUDGET,
             compaction: config.compaction,
-            context_token_bias: 0,
             model: config.model.clone(),
-            session_id: uuid::Uuid::new_v4().to_string(),
+            sessions: SessionManager::new(config.api, "current system".into(), Some(runtime)),
             trace_store: None,
-            session_runtime: Some(runtime),
             api: config.api,
             api_key: config.api_key.clone(),
             base_url: config.base_url.clone(),
             trace_database_url: None,
+            session_database_url: None,
         };
         assert!(agent.tools.granted_for_test("read"));
-        agent.resume(&mut prompt, &saved_id).await.unwrap();
+        let initial_id = agent.session_id().to_owned();
+        assert!(agent.open("missing").await.is_err());
+        assert_eq!(agent.session_id(), initial_id);
+        assert!(agent.tools.granted_for_test("read"));
+        agent.open(&saved_id).await.unwrap();
         assert_eq!(agent.session_id(), saved_id);
+        assert!(!agent.tools.granted_for_test("read"));
+        agent.tools.grant_for_test("read");
+        agent.open(&saved_id).await.unwrap();
+        assert!(agent.tools.granted_for_test("read"));
+        agent.new_session().await;
+        assert!(!agent.tools.granted_for_test("read"));
+        agent.tools.grant_for_test("read");
+        agent.open(&saved_id).await.unwrap();
         assert!(!agent.tools.granted_for_test("read"));
         let _ = fs::remove_file(path);
     }
@@ -1608,6 +1624,7 @@ mod tests {
             api_key: "test-key",
             base_url: "http://localhost",
             database_url: None,
+            session_database_url: None,
             store: Some(&store),
         };
         let mut budget = DEFAULT_AGENT_BUDGET;

@@ -1,10 +1,11 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use serde_json::Value;
 use uuid::Uuid;
 
 use crate::{
-    dao::SessionStore,
+    config::OpenAiApi,
+    dao::{SESSION_REVISION_CONFLICT, SessionStore},
     prompt::{Prompt, PromptSnapshot},
     session::{SessionEvent, SessionRecord},
     trace::{now_unix_ms, redact_json},
@@ -22,8 +23,16 @@ pub(super) struct SessionRuntime {
     queued: Vec<SessionEvent>,
     staged_count: usize,
     uncertain_tools: bool,
+    status: SaveStatus,
     #[cfg(test)]
     fail_next_save: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum SaveStatus {
+    Saved,
+    Pending,
+    Conflict,
 }
 
 impl SessionRuntime {
@@ -48,12 +57,37 @@ impl SessionRuntime {
             queued: Vec::new(),
             staged_count: 0,
             uncertain_tools: false,
+            status: SaveStatus::Pending,
             #[cfg(test)]
             fail_next_save: false,
         }
     }
 
-    pub(super) async fn save(&mut self, id: &str, prompt: &mut Prompt, uncertain_tools: bool) {
+    pub(super) fn fresh(&self) -> Self {
+        Self {
+            store: self.store.clone(),
+            workspace: self.workspace.clone(),
+            api: self.api.clone(),
+            model: self.model.clone(),
+            endpoint: self.endpoint.clone(),
+            secrets: self.secrets.clone(),
+            revision: None,
+            head_event_id: None,
+            queued: Vec::new(),
+            staged_count: 0,
+            uncertain_tools: false,
+            status: SaveStatus::Pending,
+            #[cfg(test)]
+            fail_next_save: false,
+        }
+    }
+
+    pub(super) async fn save(
+        &mut self,
+        id: &str,
+        prompt: &mut Prompt,
+        uncertain_tools: bool,
+    ) -> SaveStatus {
         self.uncertain_tools = uncertain_tools;
         let secrets: Vec<&str> = self.secrets.iter().map(String::as_str).collect();
         for raw in prompt.pending_events().iter().skip(self.staged_count) {
@@ -78,7 +112,8 @@ impl SessionRuntime {
             Ok(snapshot) => snapshot,
             Err(_) => {
                 eprintln!("会话快照编码失败；本次对话继续在内存中运行。");
-                return;
+                self.status = SaveStatus::Pending;
+                return self.status;
             }
         };
         redact_session_value(&mut snapshot, &secrets);
@@ -121,9 +156,22 @@ impl SessionRuntime {
             self.queued.clear();
             self.staged_count = 0;
             prompt.clear_pending_events();
+            self.status = SaveStatus::Saved;
         } else {
-            eprintln!("会话保存失败（Session ID: {id}）；继续运行，后续检查点将重试补写。");
+            self.status = if result
+                .as_ref()
+                .is_err_and(|error| error.0 == SESSION_REVISION_CONFLICT)
+            {
+                SaveStatus::Conflict
+            } else {
+                SaveStatus::Pending
+            };
+            eprintln!(
+                "会话保存失败（Session ID: {id}，状态：{}）；继续运行，后续检查点将重试补写。",
+                self.status.label()
+            );
         }
+        self.status
     }
 
     pub(super) async fn list(&self) -> Result<Vec<SessionRecord>, String> {
@@ -164,18 +212,243 @@ impl SessionRuntime {
         self.queued.clear();
         self.staged_count = 0;
         self.uncertain_tools = record.uncertain_tools;
-    }
-
-    pub(super) fn reset(&mut self) {
-        self.revision = None;
-        self.head_event_id = None;
-        self.queued.clear();
-        self.staged_count = 0;
-        self.uncertain_tools = false;
+        self.status = SaveStatus::Saved;
     }
 
     pub(super) fn uncertain_tools(&self) -> bool {
         self.uncertain_tools
+    }
+
+    pub(super) fn status(&self) -> SaveStatus {
+        self.status
+    }
+}
+
+impl SaveStatus {
+    pub(super) fn label(self) -> &'static str {
+        match self {
+            Self::Saved => "已保存",
+            Self::Pending => "待补写",
+            Self::Conflict => "revision 冲突",
+        }
+    }
+}
+
+pub(super) struct SessionState {
+    pub(super) id: String,
+    pub(super) prompt: Prompt,
+    pub(super) context_token_bias: u64,
+    pub(super) runtime: Option<SessionRuntime>,
+    updated_at_ms: i64,
+    dirty: bool,
+}
+
+impl SessionState {
+    fn new(api: OpenAiApi, system: &str, runtime: Option<SessionRuntime>) -> Self {
+        Self {
+            id: Uuid::new_v4().to_string(),
+            prompt: Prompt::new(api, system.to_owned()),
+            context_token_bias: 0,
+            runtime,
+            updated_at_ms: now_unix_ms(),
+            dirty: true,
+        }
+    }
+
+    pub(super) fn changed(&mut self) {
+        self.dirty = true;
+        self.updated_at_ms = now_unix_ms();
+    }
+
+    pub(super) async fn save(&mut self) -> Option<SaveStatus> {
+        let runtime = self.runtime.as_mut()?;
+        let uncertain = runtime.uncertain_tools();
+        let result = runtime.save(&self.id, &mut self.prompt, uncertain).await;
+        self.dirty = result != SaveStatus::Saved;
+        Some(result)
+    }
+
+    fn needs_save(&self) -> bool {
+        self.runtime.is_some() && self.dirty
+    }
+
+    fn status_label(&self) -> &'static str {
+        match &self.runtime {
+            None => "仅内存",
+            Some(runtime) if self.dirty => runtime.status().label(),
+            Some(_) => "已保存",
+        }
+    }
+}
+
+pub(super) struct SessionManager {
+    pub(super) active: SessionState,
+    parked: HashMap<String, SessionState>,
+    runtime_template: Option<SessionRuntime>,
+    api: OpenAiApi,
+    system: String,
+}
+
+impl SessionManager {
+    pub(super) fn new(api: OpenAiApi, system: String, runtime: Option<SessionRuntime>) -> Self {
+        let active = SessionState::new(api, &system, runtime.as_ref().map(SessionRuntime::fresh));
+        Self {
+            active,
+            parked: HashMap::new(),
+            runtime_template: runtime,
+            api,
+            system,
+        }
+    }
+
+    fn fresh(&self) -> SessionState {
+        SessionState::new(
+            self.api,
+            &self.system,
+            self.runtime_template.as_ref().map(SessionRuntime::fresh),
+        )
+    }
+
+    pub(super) async fn new_session(&mut self) -> String {
+        let next = self.fresh();
+        self.active.save().await;
+        let previous = std::mem::replace(&mut self.active, next);
+        self.parked.insert(previous.id.clone(), previous);
+        self.active.id.clone()
+    }
+
+    pub(super) async fn open(&mut self, id: &str) -> Result<Option<bool>, String> {
+        if self.active.id == id {
+            return Ok(None);
+        }
+        let target = if self.parked.contains_key(id) {
+            None
+        } else {
+            let runtime = self
+                .runtime_template
+                .as_ref()
+                .ok_or_else(|| "未配置会话数据库，无法恢复。".to_owned())?;
+            let (record, snapshot) = runtime.load(id).await?;
+            let mut prompt = Prompt::new(self.api, self.system.clone());
+            prompt.restore(snapshot)?;
+            prompt.commit_turn();
+            let mut runtime = runtime.fresh();
+            runtime.adopt(&record);
+            Some(SessionState {
+                id: record.id,
+                prompt,
+                context_token_bias: 0,
+                runtime: Some(runtime),
+                updated_at_ms: record.updated_at_ms,
+                dirty: false,
+            })
+        };
+        self.active.save().await;
+        let next = match target {
+            Some(state) => state,
+            None => self.parked.remove(id).expect("已检查缓存会话存在"),
+        };
+        let interrupted = next
+            .runtime
+            .as_ref()
+            .is_some_and(SessionRuntime::uncertain_tools);
+        let previous = std::mem::replace(&mut self.active, next);
+        self.parked.insert(previous.id.clone(), previous);
+        Ok(Some(interrupted))
+    }
+
+    pub(super) async fn save_all(&mut self) -> Vec<(String, SaveStatus)> {
+        let mut results = Vec::new();
+        if self.active.needs_save() {
+            let id = self.active.id.clone();
+            if let Some(status) = self.active.save().await {
+                results.push((id, status));
+            }
+        }
+        for state in self.parked.values_mut() {
+            if state.needs_save() {
+                let id = state.id.clone();
+                if let Some(status) = state.save().await {
+                    results.push((id, status));
+                }
+            }
+        }
+        results.sort_by(|left, right| left.0.cmp(&right.0));
+        results
+    }
+
+    pub(super) fn unsaved_ids(&self) -> Vec<String> {
+        let mut ids: Vec<_> = std::iter::once(&self.active)
+            .chain(self.parked.values())
+            .filter(|state| state.needs_save())
+            .map(|state| state.id.clone())
+            .collect();
+        ids.sort();
+        ids
+    }
+
+    pub(super) async fn list(&self) -> Result<Vec<String>, String> {
+        let mut entries: HashMap<String, (i64, String)> = HashMap::new();
+        if let Some(runtime) = &self.runtime_template {
+            match runtime.list().await {
+                Ok(records) => {
+                    for record in records {
+                        entries.insert(
+                            record.id.clone(),
+                            (
+                                record.updated_at_ms,
+                                format!(
+                                    "已保存{}",
+                                    if record.uncertain_tools {
+                                        "，工具状态未确认"
+                                    } else {
+                                        ""
+                                    }
+                                ),
+                            ),
+                        );
+                    }
+                }
+                Err(error) => eprintln!("会话存档列表读取失败：{error}；仅显示本进程会话。"),
+            }
+        }
+        for state in std::iter::once(&self.active).chain(self.parked.values()) {
+            let extra = if state
+                .runtime
+                .as_ref()
+                .is_some_and(SessionRuntime::uncertain_tools)
+            {
+                "，工具状态未确认"
+            } else {
+                ""
+            };
+            entries.insert(
+                state.id.clone(),
+                (
+                    state.updated_at_ms,
+                    format!("{}{extra}", state.status_label()),
+                ),
+            );
+        }
+        let mut sorted: Vec<_> = entries.into_iter().collect();
+        sorted.sort_by(|left, right| right.1.0.cmp(&left.1.0).then_with(|| left.0.cmp(&right.0)));
+        Ok(sorted
+            .into_iter()
+            .map(|(id, (updated, status))| {
+                let time = chrono::DateTime::<chrono::Utc>::from_timestamp_millis(updated)
+                    .map_or_else(|| updated.to_string(), |time| time.to_rfc3339());
+                format!(
+                    "{}{}  {}  {}  [{}]",
+                    if id == self.active.id { "* " } else { "  " },
+                    id,
+                    time,
+                    self.runtime_template
+                        .as_ref()
+                        .map_or("", |runtime| runtime.model.as_str()),
+                    status
+                )
+            })
+            .collect())
     }
 }
 
@@ -299,6 +572,208 @@ mod tests {
             output: vec![],
             usage: None,
         }
+    }
+
+    #[tokio::test]
+    async fn memory_switch_preserves_each_prompt_summary_bias_and_pending_events() {
+        for api in [OpenAiApi::ChatCompletions, OpenAiApi::Responses] {
+            let mut manager = SessionManager::new(api, "current system".into(), None);
+            let a = manager.active.id.clone();
+            manager.active.prompt.begin_turn("A-first");
+            manager.active.prompt.finish_turn(reply("A-answer"));
+            let plan = manager.active.prompt.prepare_compaction(0, true).unwrap();
+            manager
+                .active
+                .prompt
+                .apply_compaction(plan, "A-summary".into())
+                .unwrap();
+            manager.active.context_token_bias = 41;
+            let a_snapshot = serde_json::to_value(manager.active.prompt.snapshot()).unwrap();
+            let a_events = manager.active.prompt.pending_events().len();
+
+            let b = manager.new_session().await;
+            assert_ne!(a, b);
+            assert_eq!(manager.active.context_token_bias, 0);
+            manager.active.prompt.begin_turn("B-first");
+            manager.active.prompt.finish_turn(reply("B-answer"));
+            manager.active.context_token_bias = 7;
+            assert!(
+                !serde_json::to_string(&manager.active.prompt.snapshot())
+                    .unwrap()
+                    .contains("A-summary")
+            );
+            assert_eq!(manager.open(&a).await.unwrap(), Some(false));
+            assert_eq!(manager.active.context_token_bias, 41);
+            assert_eq!(
+                serde_json::to_value(manager.active.prompt.snapshot()).unwrap(),
+                a_snapshot
+            );
+            assert_eq!(manager.active.prompt.pending_events().len(), a_events);
+            assert_eq!(manager.open(&b).await.unwrap(), Some(false));
+            assert_eq!(manager.active.context_token_bias, 7);
+            assert!(
+                serde_json::to_string(&manager.active.prompt.snapshot())
+                    .unwrap()
+                    .contains("B-first")
+            );
+            assert_eq!(manager.open(&b).await.unwrap(), None);
+            assert_eq!(manager.active.context_token_bias, 7);
+            let before = manager.active.id.clone();
+            assert!(manager.open("missing").await.is_err());
+            assert_eq!(manager.active.id, before);
+            let listed = manager.list().await.unwrap();
+            assert_eq!(listed.len(), 2);
+            assert!(
+                listed
+                    .iter()
+                    .any(|line| line.contains("[仅内存]") && line.contains(&a))
+            );
+            assert!(
+                listed
+                    .iter()
+                    .any(|line| line.starts_with(&format!("* {b}")))
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn failed_parked_save_is_retried_and_revision_conflict_keeps_local_events() {
+        let path =
+            std::env::temp_dir().join(format!("geer-session-manager-{}.sqlite", Uuid::new_v4()));
+        let config = TraceDatabaseConfig {
+            kind: TraceDatabase::Sqlite,
+            url: format!("sqlite://{}?mode=rwc", path.display()),
+        };
+        let store = SessionStore::connect(&config).await.unwrap();
+        let runtime = SessionRuntime::new(
+            store.clone(),
+            "/tmp/test-workspace".into(),
+            "chat-completions".into(),
+            "test-model".into(),
+            "https://example.test/v1",
+            vec![],
+        );
+        let mut manager =
+            SessionManager::new(OpenAiApi::ChatCompletions, "system".into(), Some(runtime));
+        let a = manager.active.id.clone();
+        manager.active.prompt.begin_turn("A-private");
+        manager.active.prompt.finish_turn(reply("A-answer"));
+        manager.active.changed();
+        manager.active.runtime.as_mut().unwrap().fail_next_save = true;
+        let b = manager.new_session().await;
+        assert!(store.load(&a).await.unwrap().is_none());
+        assert_eq!(manager.parked[&a].prompt.pending_events().len(), 2);
+        assert!(
+            manager
+                .list()
+                .await
+                .unwrap()
+                .iter()
+                .any(|line| line.contains(&a) && line.contains("待补写"))
+        );
+        let results = manager.save_all().await;
+        assert!(results.contains(&(a.clone(), SaveStatus::Saved)));
+        assert!(results.contains(&(b, SaveStatus::Saved)));
+        assert!(manager.unsaved_ids().is_empty());
+        assert_eq!(
+            store
+                .history(&store.load(&a).await.unwrap().unwrap())
+                .await
+                .unwrap()
+                .len(),
+            2
+        );
+
+        assert_eq!(manager.open(&a).await.unwrap(), Some(false));
+        let mut external = store.load(&a).await.unwrap().unwrap();
+        external.revision += 1;
+        external.updated_at_ms += 1;
+        store.save(&external, &[], Some(0)).await.unwrap();
+        manager.active.prompt.begin_turn("local-only");
+        manager.active.prompt.finish_turn(reply("local-answer"));
+        manager.active.changed();
+        assert_eq!(manager.active.save().await, Some(SaveStatus::Conflict));
+        assert_eq!(store.load(&a).await.unwrap().unwrap(), external);
+        assert_eq!(manager.active.prompt.pending_events().len(), 2);
+        let results = manager.save_all().await;
+        assert!(results.contains(&(a.clone(), SaveStatus::Conflict)));
+        assert_eq!(manager.unsaved_ids(), vec![a.clone()]);
+        assert!(
+            manager
+                .list()
+                .await
+                .unwrap()
+                .iter()
+                .any(|line| line.contains(&a) && line.contains("revision 冲突"))
+        );
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[tokio::test]
+    async fn invalid_or_foreign_snapshot_does_not_change_active_state() {
+        let path =
+            std::env::temp_dir().join(format!("geer-session-invalid-{}.sqlite", Uuid::new_v4()));
+        let config = TraceDatabaseConfig {
+            kind: TraceDatabase::Sqlite,
+            url: format!("sqlite://{}?mode=rwc", path.display()),
+        };
+        let store = SessionStore::connect(&config).await.unwrap();
+        let runtime = SessionRuntime::new(
+            store.clone(),
+            "/tmp/workspace-a".into(),
+            "responses".into(),
+            "test-model".into(),
+            "https://example.test/v1",
+            vec![],
+        );
+        let mut source =
+            SessionManager::new(OpenAiApi::Responses, "system".into(), Some(runtime.fresh()));
+        let saved_id = source.active.id.clone();
+        source.active.prompt.begin_turn("saved input");
+        source.active.prompt.finish_turn(reply("saved answer"));
+        source.active.changed();
+        assert_eq!(source.active.save().await, Some(SaveStatus::Saved));
+
+        let foreign = SessionRuntime::new(
+            store.clone(),
+            "/tmp/workspace-b".into(),
+            "responses".into(),
+            "test-model".into(),
+            "https://example.test/v1",
+            vec![],
+        );
+        let mut manager =
+            SessionManager::new(OpenAiApi::Responses, "current system".into(), Some(foreign));
+        let current_id = manager.active.id.clone();
+        manager.active.prompt.begin_turn("local input");
+        let original = serde_json::to_value(manager.active.prompt.snapshot()).unwrap();
+        assert!(
+            manager
+                .open(&saved_id)
+                .await
+                .unwrap_err()
+                .contains("不兼容")
+        );
+        assert_eq!(manager.active.id, current_id);
+        assert_eq!(
+            serde_json::to_value(manager.active.prompt.snapshot()).unwrap(),
+            original
+        );
+        assert!(store.load(&current_id).await.unwrap().is_none());
+
+        let mut corrupted = store.load(&saved_id).await.unwrap().unwrap();
+        corrupted.revision += 1;
+        corrupted.snapshot = Value::Null;
+        store.save(&corrupted, &[], Some(0)).await.unwrap();
+        manager.runtime_template = Some(runtime);
+        assert!(manager.open(&saved_id).await.unwrap_err().contains("快照"));
+        assert_eq!(manager.active.id, current_id);
+        assert_eq!(
+            serde_json::to_value(manager.active.prompt.snapshot()).unwrap(),
+            original
+        );
+        assert!(store.load(&current_id).await.unwrap().is_none());
+        let _ = std::fs::remove_file(path);
     }
 
     #[tokio::test]

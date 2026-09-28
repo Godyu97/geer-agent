@@ -40,6 +40,7 @@ struct SessionEventDocument {
     event: SessionEvent,
 }
 
+#[derive(Clone)]
 pub(crate) struct MongoStore {
     collection: Collection<TraceDocument>,
     sessions: Collection<SessionDocument>,
@@ -131,7 +132,7 @@ impl MongoStore {
                 .await
                 .map_err(|_| TraceError("MongoDB 会话检查点更新失败".into()))?;
             if outcome.matched_count != 1 {
-                return Err(TraceError("会话 revision 冲突".into()));
+                return Err(TraceError(super::SESSION_REVISION_CONFLICT.into()));
             }
         } else {
             if record.revision != 0 {

@@ -240,12 +240,59 @@ pub(crate) fn redact_text(text: &str, secrets: &[&str]) -> String {
 
 pub(crate) fn redact_json(value: &mut Value, secrets: &[&str]) {
     match value {
-        Value::String(text) => *text = redact_text(text, secrets),
+        Value::String(text) => {
+            let redacted = redact_text(text, secrets);
+            *text = redacted
+                .split_inclusive('\n')
+                .map(|line| {
+                    let lower = line.trim_start().to_ascii_lowercase();
+                    if [
+                        "authorization:",
+                        "proxy-authorization:",
+                        "x-api-key:",
+                        "cookie:",
+                        "set-cookie:",
+                        "\"authorization\":",
+                        "\"api_key\":",
+                    ]
+                    .iter()
+                    .any(|prefix| lower.starts_with(prefix))
+                    {
+                        if line.ends_with('\n') {
+                            "[REDACTED]\n".to_owned()
+                        } else {
+                            "[REDACTED]".to_owned()
+                        }
+                    } else {
+                        line.to_owned()
+                    }
+                })
+                .collect();
+        }
         Value::Array(items) => items.iter_mut().for_each(|item| redact_json(item, secrets)),
         Value::Object(fields) => {
             let old = std::mem::take(fields);
             for (key, mut value) in old {
-                redact_json(&mut value, secrets);
+                if [
+                    "authorization",
+                    "proxy-authorization",
+                    "api_key",
+                    "api-key",
+                    "apikey",
+                    "x-api-key",
+                    "access_token",
+                    "cookie",
+                    "set-cookie",
+                    "password",
+                    "secret",
+                ]
+                .iter()
+                .any(|field| key.eq_ignore_ascii_case(field))
+                {
+                    value = Value::String("[REDACTED]".to_owned());
+                } else {
+                    redact_json(&mut value, secrets);
+                }
                 fields.insert(redact_text(&key, secrets), value);
             }
         }
@@ -256,6 +303,21 @@ pub(crate) fn redact_json(value: &mut Value, secrets: &[&str]) {
 #[cfg(test)]
 mod tests {
     use super::{TraceCapture, redact_json};
+
+    #[test]
+    fn redact_json_removes_nested_auth_headers_and_database_credentials() {
+        let mut value = serde_json::json!({
+            "headers": {"Authorization": "Bearer unknown-key"},
+            "content": "Authorization: Bearer inline-key\nsafe text",
+            "database": "postgres://user:private@localhost/db"
+        });
+        redact_json(&mut value, &["postgres://user:private@localhost/db"]);
+        let text = value.to_string();
+        assert!(!text.contains("unknown-key"));
+        assert!(!text.contains("inline-key"));
+        assert!(!text.contains("private"));
+        assert!(text.contains("safe text"));
+    }
 
     #[test]
     fn partial_capture_combines_stream_chunks() {
