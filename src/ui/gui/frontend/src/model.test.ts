@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import {
   applyEvent,
+  groupTranscript,
   initialState,
   safeExternalHref,
   shouldSubmit,
@@ -23,6 +24,70 @@ const snapshot: Snapshot = {
 };
 
 describe("GUI message ordering", () => {
+  it("isolates live tools from text and discards stale tool events", () => {
+    const pending = applyEvent(initialState, {
+      type: "queued",
+      pending: { id: 2, line: "检查" },
+    });
+    expect(
+      applyEvent(pending, {
+        type: "tool_progress",
+        request_id: 1,
+        name: "old",
+      }),
+    ).toBe(pending);
+    const tool = applyEvent(pending, {
+      type: "tool_progress",
+      request_id: 2,
+      name: "read",
+    });
+    expect(tool.live).toBe("");
+    expect(tool.liveTools).toEqual(["read"]);
+    const live = applyEvent(tool, {
+      type: "delta",
+      request_id: 2,
+      text: "可见回答",
+    });
+    const done = applyEvent(live, {
+      type: "snapshot",
+      request_id: 2,
+      notice: null,
+      error: null,
+      snapshot: {
+        ...snapshot,
+        transcript: [{ role: "assistant", text: "可见回答" }],
+      },
+    });
+    expect(done.liveTools).toEqual([]);
+    expect(done.live).toBe("");
+    expect(done.snapshot?.transcript[0].text).toBe("可见回答");
+    expect(
+      applyEvent(done, { type: "tool_progress", request_id: 2, name: "late" }),
+    ).toBe(done);
+  });
+  it("separates prose before and after a tool without inserting progress text", () => {
+    const pending = {
+      ...initialState,
+      pending: { id: 1, line: "检查" },
+      live: "先检查。",
+    };
+    const first = applyEvent(pending, {
+      type: "tool_progress",
+      request_id: 1,
+      name: "read",
+    });
+    const second = applyEvent(first, {
+      type: "tool_progress",
+      request_id: 1,
+      name: "rg",
+    });
+    const done = applyEvent(second, {
+      type: "delta",
+      request_id: 1,
+      text: "检查完成。",
+    });
+    expect(done.live).toBe("先检查。\n\n检查完成。");
+  });
   it("keeps only deltas and snapshots for the current operation", () => {
     const pending = { ...initialState, pending: { id: 2, line: "hello" } };
     const stale = applyEvent(pending, {
@@ -73,6 +138,23 @@ describe("GUI message ordering", () => {
     expect(failed.closing).toBe(false);
     expect(failed.closeFailed?.unsaved_ids).toEqual(["s"]);
   });
+});
+
+it("keeps interleaved tools and system notices within their user turn", () => {
+  const entries = [
+    { role: "system" as const, text: "恢复记录" },
+    { role: "user" as const, text: "第一轮" },
+    { role: "tool" as const, text: "read" },
+    { role: "assistant" as const, text: "继续检查" },
+    { role: "tool" as const, text: "rg" },
+    { role: "system" as const, text: "压缩完成" },
+    { role: "assistant" as const, text: "完成" },
+    { role: "user" as const, text: "第二轮" },
+  ];
+  const turns = groupTranscript(entries);
+  expect(turns.map((turn) => turn.start)).toEqual([0, 1, 7]);
+  expect(turns[1].entries).toEqual(entries.slice(1, 7));
+  expect(groupTranscript([])).toEqual([]);
 });
 
 describe("composer keys", () => {

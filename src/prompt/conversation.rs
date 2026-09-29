@@ -57,6 +57,35 @@ pub(crate) struct TranscriptEntry {
     pub(crate) text: String,
 }
 
+#[cfg(any(feature = "gui", test))]
+fn transcript_text(payload: &Value) -> Option<String> {
+    if let Some(text) = payload.get("text").and_then(Value::as_str)
+        && !text.is_empty()
+    {
+        return Some(text.to_owned());
+    }
+    // Responses 的正文存在 output 中；从原始事件读取也能恢复已保存的旧会话。
+    let messages = payload
+        .get("output")?
+        .as_array()?
+        .iter()
+        .filter(|item| item["type"] == "message" && item["role"] == "assistant")
+        .filter_map(|item| item.get("content").and_then(Value::as_array))
+        .map(|content| {
+            content
+                .iter()
+                .filter_map(|part| match part.get("type").and_then(Value::as_str) {
+                    Some("output_text") => part.get("text").and_then(Value::as_str),
+                    Some("refusal") => part.get("refusal").and_then(Value::as_str),
+                    _ => None,
+                })
+                .collect::<String>()
+        })
+        .filter(|text| !text.is_empty())
+        .collect::<Vec<_>>();
+    (!messages.is_empty()).then(|| messages.join("\n\n"))
+}
+
 #[derive(Clone, Serialize, Deserialize)]
 pub(crate) struct PromptSnapshot {
     version: u32,
@@ -399,25 +428,25 @@ impl Prompt {
     pub(crate) fn transcript(&self) -> Vec<TranscriptEntry> {
         let mut entries = Vec::new();
         for event in &self.display_events {
-            let text = event.payload.get("text").and_then(Value::as_str);
+            let text = transcript_text(&event.payload);
             match event.kind.as_str() {
                 "user" | "assistant" => {
-                    if let Some(text) = text.filter(|text| !text.is_empty()) {
+                    if let Some(text) = text {
                         entries.push(TranscriptEntry {
                             role: if event.kind == "user" {
                                 "user"
                             } else {
                                 "assistant"
                             },
-                            text: text.to_owned(),
+                            text,
                         });
                     }
                 }
                 "tool_step" => {
-                    if let Some(text) = text.filter(|text| !text.is_empty()) {
+                    if let Some(text) = text {
                         entries.push(TranscriptEntry {
                             role: "assistant",
-                            text: text.to_owned(),
+                            text,
                         });
                     }
                     if let Some(results) = event.payload.get("results").and_then(Value::as_array) {
@@ -710,7 +739,7 @@ mod tests {
     use async_openai::types::responses::{FunctionToolCall, OutputItem};
     use serde_json::{Value, json};
 
-    use super::Prompt;
+    use super::{Prompt, RawEvent};
     use crate::{
         config::OpenAiApi,
         provider::{Messages, ModelStep, ToolCall},
@@ -782,6 +811,100 @@ mod tests {
             restored.restore_display_events(events);
             assert_eq!(restored.transcript(), prompt.transcript());
         }
+    }
+
+    #[test]
+    fn transcript_reads_responses_output_in_live_and_restored_history() {
+        let output = |text: &str| {
+            serde_json::from_value(json!({
+                "type": "message", "id": "msg_1", "role": "assistant",
+                "status": "completed",
+                "content": [{"type": "output_text", "text": text, "annotations": []}]
+            }))
+            .unwrap()
+        };
+        let mut prompt = Prompt::new(OpenAiApi::Responses, "system".into());
+        prompt.begin_turn("检查文件");
+        let call = ToolCall {
+            id: "call_1".into(),
+            name: "read".into(),
+            args: "{}".into(),
+        };
+        prompt.apply_tool_results(
+            ModelStep {
+                text: String::new(),
+                output: vec![
+                    output("先读取文件。"),
+                    serde_json::from_value(json!({
+                        "type": "function_call", "call_id": call.id,
+                        "name": call.name, "arguments": call.args
+                    }))
+                    .unwrap(),
+                ],
+                calls: vec![call.clone()],
+                usage: None,
+            },
+            &[(call, "文件内容".into())],
+        );
+        prompt.finish_turn(ModelStep {
+            text: String::new(),
+            output: vec![output("检查完成。"), output("**正文仍然可见**")],
+            calls: vec![],
+            usage: None,
+        });
+        let entries = prompt.transcript();
+        assert_eq!(
+            entries
+                .iter()
+                .map(|entry| entry.text.as_str())
+                .collect::<Vec<_>>(),
+            [
+                "检查文件",
+                "先读取文件。",
+                "read\n文件内容",
+                "检查完成。\n\n**正文仍然可见**"
+            ]
+        );
+        let events =
+            serde_json::from_str(&serde_json::to_string(&prompt.display_events).unwrap()).unwrap();
+        let mut restored = Prompt::new(OpenAiApi::Responses, "system".into());
+        restored.restore(prompt.snapshot()).unwrap();
+        restored.restore_display_events(events);
+        assert_eq!(restored.transcript(), entries);
+    }
+
+    #[test]
+    fn transcript_prefers_text_and_excludes_internal_responses_output() {
+        let mut prompt = Prompt::new(OpenAiApi::Responses, "system".into());
+        let output = json!([
+            {"type": "reasoning", "text": "internal reasoning"},
+            {"type": "function_call", "arguments": "private arguments"},
+            {"type": "message", "role": "user", "content": [
+                {"type": "output_text", "text": "not an assistant"}
+            ]},
+            {"type": "message", "role": "assistant", "content": [
+                {"type": "output_text", "text": "公开正文"},
+                {"type": "refusal", "refusal": "，无法完成该操作。"}
+            ]}
+        ]);
+        prompt.restore_display_events(vec![
+            RawEvent {
+                kind: "assistant".into(),
+                payload: json!({"text": "唯一正文", "output": output.clone()}),
+            },
+            RawEvent {
+                kind: "assistant".into(),
+                payload: json!({"text": "", "output": output}),
+            },
+            RawEvent {
+                kind: "assistant".into(),
+                payload: json!({"output": [{"type": "reasoning"}, null]}),
+            },
+        ]);
+        let entries = prompt.transcript();
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].text, "唯一正文");
+        assert_eq!(entries[1].text, "公开正文，无法完成该操作。");
     }
 
     #[test]

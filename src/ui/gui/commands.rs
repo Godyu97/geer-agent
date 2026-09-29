@@ -4,6 +4,16 @@ use std::io;
 
 use crate::interaction::{self, Input, Session, Usage};
 
+pub(crate) fn tool_progress(delta: &str) -> Option<&str> {
+    // 核心一次回调发送完整进度标记；不从模型正文内部查找或删去相似文字。
+    let name = delta.strip_prefix("\n[调用工具 ")?.strip_suffix("]\n")?;
+    (!name.is_empty()
+        && name
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_'))
+    .then_some(name)
+}
+
 pub(crate) async fn handle_line<S, F, U>(
     session: &mut S,
     line: &str,
@@ -63,6 +73,24 @@ mod tests {
     use super::*;
     use crate::interaction::SessionStatus;
     use std::{cell::RefCell, error::Error, rc::Rc};
+
+    #[test]
+    fn identifies_only_complete_tool_progress_callbacks() {
+        assert_eq!(tool_progress("\n[调用工具 read]\n"), Some("read"));
+        assert_eq!(
+            tool_progress("\n[调用工具 get_current_time]\n"),
+            Some("get_current_time")
+        );
+        for text in [
+            "正文",
+            "[调用工具 read]",
+            "说明\n[调用工具 read]\n",
+            "\n[调用工具 ]\n",
+            "\n[调用工具 read]\n正文\n[调用工具 ls]\n",
+        ] {
+            assert_eq!(tool_progress(text), None);
+        }
+    }
 
     #[derive(Default)]
     struct MockSession {

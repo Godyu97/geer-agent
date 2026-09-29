@@ -12,7 +12,9 @@ use crate::{
     interaction::{self, DiagnosticBuffer, Input, Session, SessionStatus, Usage},
     prompt::TranscriptEntry,
     ui::{
-        gui_authorization::AuthorizationGate, gui_close::close_failure, gui_commands::handle_line,
+        gui_authorization::AuthorizationGate,
+        gui_close::close_failure,
+        gui_commands::{handle_line, tool_progress},
     },
 };
 
@@ -31,6 +33,10 @@ pub(super) enum GuiEvent {
     Delta {
         request_id: u64,
         text: String,
+    },
+    ToolProgress {
+        request_id: u64,
+        name: String,
     },
     Usage {
         request_id: u64,
@@ -180,7 +186,7 @@ pub(super) fn gui_submit(
         return Err("窗口正在关闭。".to_owned());
     }
     if !state.ready.load(Ordering::Acquire) {
-        return Err("Agent 正在初始化或启动失败。".to_owned());
+        return Err("Geer 正在初始化或启动失败。".to_owned());
     }
     if line.trim().is_empty() || line.len() > 65_536 {
         return Err("输入不能为空且不能超过 65536 字节。".to_owned());
@@ -262,9 +268,15 @@ fn worker(
                     &mut agent,
                     &line,
                     |delta| {
-                        bus.send(GuiEvent::Delta {
-                            request_id,
-                            text: delta.to_owned(),
+                        bus.send(match tool_progress(delta) {
+                            Some(name) => GuiEvent::ToolProgress {
+                                request_id,
+                                name: name.to_owned(),
+                            },
+                            None => GuiEvent::Delta {
+                                request_id,
+                                text: delta.to_owned(),
+                            },
                         });
                         Ok(())
                     },

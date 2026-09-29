@@ -1,6 +1,7 @@
 import {
   useEffect,
   useLayoutEffect,
+  useMemo,
   useReducer,
   useRef,
   useState,
@@ -13,6 +14,7 @@ import { getCurrentWindow } from "@tauri-apps/api/window";
 import { writeText } from "@tauri-apps/plugin-clipboard-manager";
 import {
   applyEvent,
+  groupTranscript,
   initialState,
   safeExternalHref,
   shouldSubmit,
@@ -37,8 +39,8 @@ function Message({
   onCopyError: (message: string) => void;
 }) {
   const label = {
-    user: "你",
-    assistant: "Agent",
+    user: "李火旺🔥",
+    assistant: "Geer",
     tool: "工具",
     system: "系统",
   }[entry.role];
@@ -89,6 +91,62 @@ function shortId(id: string): string {
   return id.slice(0, 8);
 }
 
+function ToolGroup({
+  entries,
+  pending = false,
+}: {
+  entries: Entry[];
+  pending?: boolean;
+}) {
+  const [open, setOpen] = useState(false);
+  return (
+    <details
+      className="tool-group"
+      onToggle={(event) => setOpen(event.currentTarget.open)}
+    >
+      <summary>
+        <span>工具调用 · {entries.length} 次</span>
+        <span className="tool-group-state">
+          {pending ? "进行中" : "查看详情"}
+        </span>
+      </summary>
+      {open && (
+        <div className="tool-group-content">
+          {entries.map((entry, index) => (
+            <pre className="tool-detail plain" key={index}>
+              {entry.text}
+            </pre>
+          ))}
+        </div>
+      )}
+    </details>
+  );
+}
+
+function ConversationTurn({
+  entries,
+  onCopyError,
+}: {
+  entries: Entry[];
+  onCopyError: (message: string) => void;
+}) {
+  const tools = entries.filter((entry) => entry.role === "tool");
+  const firstTool = entries.findIndex((entry) => entry.role === "tool");
+  return (
+    <section className="conversation-turn" aria-label="对话轮次">
+      {entries.map((entry, index) =>
+        entry.role === "tool" ? (
+          index === firstTool ? (
+            <ToolGroup key="tools" entries={tools} />
+          ) : null
+        ) : (
+          <Message key={index} entry={entry} onCopyError={onCopyError} />
+        ),
+      )}
+    </section>
+  );
+}
+
 export default function App() {
   const [state, dispatch] = useReducer(applyEvent, initialState);
   const [input, setInput] = useState("");
@@ -128,7 +186,7 @@ export default function App() {
   useEffect(() => {
     if (followBottom.current && stream.current)
       stream.current.scrollTop = stream.current.scrollHeight;
-  }, [state.snapshot?.transcript, state.live, sessionId]);
+  }, [state.snapshot?.transcript, state.live, state.liveTools, sessionId]);
 
   async function submit(line: string) {
     if (
@@ -141,7 +199,13 @@ export default function App() {
     )
       return;
     const pending: Pending = { id: nextRequest.current++, line: line.trim() };
-    current.current = { ...current.current, pending, live: "", liveUsage: 0 };
+    current.current = {
+      ...current.current,
+      pending,
+      live: "",
+      liveTools: [],
+      liveUsage: 0,
+    };
     dispatch({ type: "queued", pending });
     setLocalError(null);
     try {
@@ -179,7 +243,8 @@ export default function App() {
   }
 
   const transcript = state.snapshot?.transcript ?? [];
-  const visible = transcript.slice(-visibleCount);
+  const turns = useMemo(() => groupTranscript(transcript), [transcript]);
+  const visible = turns.slice(-visibleCount);
   const status = state.snapshot?.status;
   const disabled =
     !state.snapshot ||
@@ -273,7 +338,7 @@ export default function App() {
         </header>
         {state.startupError ? (
           <div className="startup-error">
-            <h2>无法启动 Agent</h2>
+            <h2>无法启动 Geer</h2>
             <p>{state.startupError}</p>
             <p>请检查程序选用的 .env 和模型配置，然后重新启动。</p>
           </div>
@@ -292,10 +357,10 @@ export default function App() {
                 <div className="empty">
                   <div className="empty-symbol">✦</div>
                   <h1>从这里开始</h1>
-                  <p>向 Agent 提问，或输入 /help 查看已有命令。</p>
+                  <p>向 Geer 提问，或输入 /help 查看已有命令。</p>
                 </div>
               )}
-              {transcript.length > visibleCount && (
+              {turns.length > visibleCount && (
                 <button
                   className="older"
                   onClick={() => {
@@ -305,13 +370,13 @@ export default function App() {
                     setVisibleCount((count) => count + 120);
                   }}
                 >
-                  显示更早记录 · 还有 {transcript.length - visibleCount} 条
+                  显示更早记录 · 还有 {turns.length - visibleCount} 轮
                 </button>
               )}
-              {visible.map((entry, index) => (
-                <Message
-                  key={`${status?.session_id}-${transcript.length - visible.length + index}`}
-                  entry={entry}
+              {visible.map((turn) => (
+                <ConversationTurn
+                  key={`${status?.session_id}-${turn.start}`}
+                  entries={turn.entries}
                   onCopyError={setLocalError}
                 />
               ))}
@@ -321,6 +386,16 @@ export default function App() {
                     entry={{ role: "user", text: state.pending!.line }}
                     onCopyError={setLocalError}
                   />
+                  {state.liveTools.length > 0 && (
+                    <ToolGroup
+                      key={`${sessionId}-pending-${state.pending!.id}`}
+                      entries={state.liveTools.map((name) => ({
+                        role: "tool",
+                        text: `调用 ${name}`,
+                      }))}
+                      pending
+                    />
+                  )}
                   {state.live && (
                     <Message
                       entry={{ role: "assistant", text: state.live }}
@@ -332,9 +407,7 @@ export default function App() {
               {state.pending && (
                 <div className="working">
                   <span className="pulse" />
-                  {state.closing
-                    ? "等待当前操作完成并保存…"
-                    : "Agent 正在工作…"}
+                  {state.closing ? "等待当前操作完成并保存…" : "Geer 正在工作…"}
                   {state.liveUsage > 0
                     ? ` · 已报告 ${state.liveUsage} tokens`
                     : state.live
@@ -361,9 +434,13 @@ export default function App() {
             </div>
             <div className="composer">
               <div className="composer-inner">
+                <label className="composer-identity" htmlFor="message-input">
+                  李火旺🔥
+                </label>
                 <textarea
+                  id="message-input"
                   aria-label="消息"
-                  placeholder="发送消息给 Agent…"
+                  placeholder="发送消息给 Geer…"
                   value={input}
                   disabled={disabled}
                   rows={3}

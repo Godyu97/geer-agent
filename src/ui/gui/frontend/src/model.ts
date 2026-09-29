@@ -2,6 +2,18 @@ export type Entry = {
   role: "user" | "assistant" | "tool" | "system";
   text: string;
 };
+export type Turn = { start: number; entries: Entry[] };
+
+export function groupTranscript(entries: Entry[]): Turn[] {
+  const turns: Turn[] = [];
+  entries.forEach((entry, index) => {
+    if (entry.role === "user" || turns.length === 0)
+      turns.push({ start: index, entries: [] });
+    turns[turns.length - 1].entries.push(entry);
+  });
+  return turns;
+}
+
 export type Usage = { input: number; output: number };
 export type Status = {
   model: string;
@@ -36,6 +48,7 @@ export type Event =
     }
   | { type: "started"; request_id: number }
   | { type: "delta"; request_id: number; text: string }
+  | { type: "tool_progress"; request_id: number; name: string }
   | { type: "usage"; request_id: number; usage: Usage | null }
   | { type: "authorization"; id: number; prompt: string }
   | { type: "diagnostic"; message: string }
@@ -60,6 +73,7 @@ export type ViewState = {
   snapshot: Snapshot | null;
   pending: Pending | null;
   live: string;
+  liveTools: string[];
   liveUsage: number;
   authorization: { id: number; prompt: string } | null;
   notice: string | null;
@@ -78,6 +92,7 @@ export const initialState: ViewState = {
   snapshot: null,
   pending: null,
   live: "",
+  liveTools: [],
   liveUsage: 0,
   authorization: null,
   notice: null,
@@ -95,13 +110,20 @@ export function applyEvent(state: ViewState, event: Action): ViewState {
         ...state,
         pending: event.pending,
         live: "",
+        liveTools: [],
         liveUsage: 0,
         notice: null,
         error: null,
       };
     case "submit_failed":
       return state.pending?.id === event.request_id
-        ? { ...state, pending: null, live: "", error: event.message }
+        ? {
+            ...state,
+            pending: null,
+            live: "",
+            liveTools: [],
+            error: event.message,
+          }
         : state;
     case "authorization_cleared":
       return { ...state, authorization: null };
@@ -115,6 +137,7 @@ export function applyEvent(state: ViewState, event: Action): ViewState {
         snapshot: event.snapshot,
         pending: event.request_id === null ? state.pending : null,
         live: event.request_id === null ? state.live : "",
+        liveTools: event.request_id === null ? state.liveTools : [],
         liveUsage: event.request_id === null ? state.liveUsage : 0,
         notice: event.notice,
         error: event.error,
@@ -130,6 +153,17 @@ export function applyEvent(state: ViewState, event: Action): ViewState {
         ? {
             ...state,
             liveUsage: state.liveUsage + event.usage.input + event.usage.output,
+          }
+        : state;
+    case "tool_progress":
+      return state.pending?.id === event.request_id
+        ? {
+            ...state,
+            live:
+              state.live && !state.live.endsWith("\n\n")
+                ? state.live + "\n\n"
+                : state.live,
+            liveTools: [...state.liveTools, event.name],
           }
         : state;
     case "authorization":
