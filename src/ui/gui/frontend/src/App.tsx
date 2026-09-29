@@ -257,7 +257,7 @@ export default function App() {
     } catch (error) {
       setLocalError(String(error));
     }
-    dispatch({ type: "authorization_cleared" });
+    dispatch({ type: "authorization_cleared", id: request.id });
   }
 
   async function browseWorkspace() {
