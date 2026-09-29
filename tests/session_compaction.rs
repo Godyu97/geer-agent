@@ -1,5 +1,5 @@
 use std::{
-    io::{Read, Write},
+    io::{self, Read, Write},
     net::{TcpListener, TcpStream},
     process::{Command, Output, Stdio},
     thread,
@@ -91,8 +91,17 @@ fn run_with_model(api: &str, base_url: &str, db_url: &str, model: &str, input: &
 }
 
 fn run_default(api: &str, base_url: &str, workspace: &std::path::Path, input: &str) -> Output {
-    let mut child = Command::new(env!("CARGO_BIN_EXE_geer-agent"))
+    let source = std::path::Path::new(env!("CARGO_BIN_EXE_geer-agent"));
+    let executable = workspace.join("bin").join(source.file_name().unwrap());
+    if !executable.exists() {
+        std::fs::create_dir_all(executable.parent().unwrap()).unwrap();
+        std::fs::copy(source, &executable).unwrap();
+    }
+    let mut command = Command::new(executable);
+    command
         .current_dir(workspace)
+        .env("HOME", workspace)
+        .env("USERPROFILE", workspace)
         .env("OPENAI_API_KEY", "mock-key")
         .env("OPENAI_MODEL", "test-model")
         .env("OPENAI_BASE_URL", base_url)
@@ -105,9 +114,18 @@ fn run_default(api: &str, base_url: &str, workspace: &std::path::Path, input: &s
         .env_remove("GEER_AGENT_SESSION_PERSISTENCE")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .unwrap();
+        .stderr(Stdio::piped());
+    let mut retries = 0;
+    let mut child = loop {
+        match command.spawn() {
+            Ok(child) => break child,
+            Err(error) if error.kind() == io::ErrorKind::ExecutableFileBusy && retries < 20 => {
+                retries += 1;
+                thread::sleep(Duration::from_millis(10));
+            }
+            Err(error) => panic!("启动临时可执行文件失败：{error}"),
+        }
+    };
     child
         .stdin
         .take()
@@ -176,7 +194,7 @@ async fn default_database_is_shared_across_sessions_and_restarts(api: &str) {
     assert_eq!(ids.len(), 2, "{first_stdout}");
     let (a, b) = (&ids[0], &ids[1]);
     assert_ne!(a, b);
-    let db_path = workspace.join(".db/geer.sqlite");
+    let db_path = workspace.join(".geer-agent/.db/geer.sqlite");
     assert!(
         db_path.is_file(),
         "默认 SQLite 未创建：{}",
@@ -296,7 +314,7 @@ async fn eof_saves_all_default_sessions_without_model_requests() {
         .filter_map(|line| line.strip_prefix("Session ID: "))
         .collect();
     assert_eq!(ids.len(), 2);
-    let db_path = workspace.join(".db/geer.sqlite");
+    let db_path = workspace.join(".geer-agent/.db/geer.sqlite");
     let db = Database::connect(format!("sqlite://{}?mode=rw", db_path.display()))
         .await
         .unwrap();

@@ -1,5 +1,6 @@
 use std::collections::{HashMap, HashSet};
 
+use serde::Serialize;
 use serde_json::Value;
 use uuid::Uuid;
 
@@ -7,7 +8,7 @@ use crate::{
     config::OpenAiApi,
     dao::{SESSION_REVISION_CONFLICT, SessionStore},
     interaction::emit_diagnostic,
-    prompt::{Prompt, PromptSnapshot},
+    prompt::{Prompt, PromptSnapshot, RawEvent},
     session::{SessionEvent, SessionRecord},
     trace::{now_unix_ms, redact_json},
 };
@@ -182,7 +183,10 @@ impl SessionRuntime {
             .map_err(|error| error.to_string())
     }
 
-    pub(super) async fn load(&self, id: &str) -> Result<(SessionRecord, PromptSnapshot), String> {
+    pub(super) async fn load(
+        &self,
+        id: &str,
+    ) -> Result<(SessionRecord, PromptSnapshot, Vec<RawEvent>), String> {
         let record = self
             .store
             .load(id)
@@ -204,7 +208,17 @@ impl SessionRuntime {
         validate_events(&events)?;
         let snapshot = serde_json::from_value(record.snapshot.clone())
             .map_err(|_| "会话快照格式无效。".to_owned())?;
-        Ok((record, snapshot))
+        #[cfg(any(feature = "gui", test))]
+        let display_events = events
+            .into_iter()
+            .map(|event| RawEvent {
+                kind: event.kind,
+                payload: event.payload,
+            })
+            .collect();
+        #[cfg(not(any(feature = "gui", test)))]
+        let display_events = Vec::new();
+        Ok((record, snapshot, display_events))
     }
 
     pub(super) fn adopt(&mut self, record: &SessionRecord) {
@@ -290,6 +304,16 @@ pub(super) struct SessionManager {
     system: String,
 }
 
+#[derive(Clone, Debug, Serialize)]
+pub(crate) struct SessionEntry {
+    pub(crate) id: String,
+    pub(crate) updated_at_ms: i64,
+    pub(crate) model: String,
+    pub(crate) status: String,
+    pub(crate) active: bool,
+    pub(crate) uncertain_tools: bool,
+}
+
 impl SessionManager {
     pub(super) fn new(api: OpenAiApi, system: String, runtime: Option<SessionRuntime>) -> Self {
         let active = SessionState::new(api, &system, runtime.as_ref().map(SessionRuntime::fresh));
@@ -329,9 +353,13 @@ impl SessionManager {
                 .runtime_template
                 .as_ref()
                 .ok_or_else(|| "未配置会话数据库，无法恢复。".to_owned())?;
-            let (record, snapshot) = runtime.load(id).await?;
+            let (record, snapshot, display_events) = runtime.load(id).await?;
             let mut prompt = Prompt::new(self.api, self.system.clone());
             prompt.restore(snapshot)?;
+            #[cfg(any(feature = "gui", test))]
+            prompt.restore_display_events(display_events);
+            #[cfg(not(any(feature = "gui", test)))]
+            let _ = display_events;
             prompt.commit_turn();
             let mut runtime = runtime.fresh();
             runtime.adopt(&record);
@@ -388,25 +416,59 @@ impl SessionManager {
         ids
     }
 
+    #[cfg(any(feature = "gui", test))]
+    pub(super) fn volatile_ids(&self) -> Vec<String> {
+        let mut ids: Vec<_> = std::iter::once(&self.active)
+            .chain(self.parked.values())
+            .filter(|state| state.runtime.is_none() && !state.prompt.pending_events().is_empty())
+            .map(|state| state.id.clone())
+            .collect();
+        ids.sort();
+        ids
+    }
+
     pub(super) async fn list(&self) -> Result<Vec<String>, String> {
-        let mut entries: HashMap<String, (i64, String)> = HashMap::new();
+        Ok(self
+            .list_entries()
+            .await?
+            .into_iter()
+            .map(|entry| {
+                let time =
+                    chrono::DateTime::<chrono::Utc>::from_timestamp_millis(entry.updated_at_ms)
+                        .map_or_else(|| entry.updated_at_ms.to_string(), |time| time.to_rfc3339());
+                format!(
+                    "{}{}  {}  {}  [{}{}]",
+                    if entry.active { "* " } else { "  " },
+                    entry.id,
+                    time,
+                    entry.model,
+                    entry.status,
+                    if entry.uncertain_tools {
+                        "，工具状态未确认"
+                    } else {
+                        ""
+                    }
+                )
+            })
+            .collect())
+    }
+
+    pub(super) async fn list_entries(&self) -> Result<Vec<SessionEntry>, String> {
+        let mut entries: HashMap<String, SessionEntry> = HashMap::new();
         if let Some(runtime) = &self.runtime_template {
             match runtime.list().await {
                 Ok(records) => {
                     for record in records {
                         entries.insert(
                             record.id.clone(),
-                            (
-                                record.updated_at_ms,
-                                format!(
-                                    "已保存{}",
-                                    if record.uncertain_tools {
-                                        "，工具状态未确认"
-                                    } else {
-                                        ""
-                                    }
-                                ),
-                            ),
+                            SessionEntry {
+                                id: record.id,
+                                updated_at_ms: record.updated_at_ms,
+                                model: record.model,
+                                status: "已保存".to_owned(),
+                                active: false,
+                                uncertain_tools: record.uncertain_tools,
+                            },
                         );
                     }
                 }
@@ -416,42 +478,32 @@ impl SessionManager {
             }
         }
         for state in std::iter::once(&self.active).chain(self.parked.values()) {
-            let extra = if state
-                .runtime
-                .as_ref()
-                .is_some_and(SessionRuntime::uncertain_tools)
-            {
-                "，工具状态未确认"
-            } else {
-                ""
-            };
             entries.insert(
                 state.id.clone(),
-                (
-                    state.updated_at_ms,
-                    format!("{}{extra}", state.status_label()),
-                ),
+                SessionEntry {
+                    id: state.id.clone(),
+                    updated_at_ms: state.updated_at_ms,
+                    model: self
+                        .runtime_template
+                        .as_ref()
+                        .map_or(String::new(), |runtime| runtime.model.clone()),
+                    status: state.status_label().to_owned(),
+                    active: state.id == self.active.id,
+                    uncertain_tools: state
+                        .runtime
+                        .as_ref()
+                        .is_some_and(SessionRuntime::uncertain_tools),
+                },
             );
         }
-        let mut sorted: Vec<_> = entries.into_iter().collect();
-        sorted.sort_by(|left, right| right.1.0.cmp(&left.1.0).then_with(|| left.0.cmp(&right.0)));
-        Ok(sorted
-            .into_iter()
-            .map(|(id, (updated, status))| {
-                let time = chrono::DateTime::<chrono::Utc>::from_timestamp_millis(updated)
-                    .map_or_else(|| updated.to_string(), |time| time.to_rfc3339());
-                format!(
-                    "{}{}  {}  {}  [{}]",
-                    if id == self.active.id { "* " } else { "  " },
-                    id,
-                    time,
-                    self.runtime_template
-                        .as_ref()
-                        .map_or("", |runtime| runtime.model.as_str()),
-                    status
-                )
-            })
-            .collect())
+        let mut sorted: Vec<_> = entries.into_values().collect();
+        sorted.sort_by(|left, right| {
+            right
+                .updated_at_ms
+                .cmp(&left.updated_at_ms)
+                .then_with(|| left.id.cmp(&right.id))
+        });
+        Ok(sorted)
     }
 }
 
@@ -600,6 +652,9 @@ mod tests {
             manager.active.prompt.begin_turn("B-first");
             manager.active.prompt.finish_turn(reply("B-answer"));
             manager.active.context_token_bias = 7;
+            let mut expected_volatile = vec![a.clone(), b.clone()];
+            expected_volatile.sort();
+            assert_eq!(manager.volatile_ids(), expected_volatile);
             assert!(
                 !serde_json::to_string(&manager.active.prompt.snapshot())
                     .unwrap()
@@ -621,10 +676,19 @@ mod tests {
             );
             assert_eq!(manager.open(&b).await.unwrap(), None);
             assert_eq!(manager.active.context_token_bias, 7);
+            assert_eq!(manager.active.prompt.transcript()[0].text, "B-first");
             let before = manager.active.id.clone();
             assert!(manager.open("missing").await.is_err());
             assert_eq!(manager.active.id, before);
             let listed = manager.list().await.unwrap();
+            let structured = manager.list_entries().await.unwrap();
+            assert_eq!(structured.len(), 2);
+            assert!(structured.iter().any(|entry| entry.id == b && entry.active));
+            assert!(
+                structured
+                    .iter()
+                    .any(|entry| entry.id == a && !entry.active)
+            );
             assert_eq!(listed.len(), 2);
             assert!(
                 listed
@@ -737,6 +801,23 @@ mod tests {
         source.active.changed();
         assert_eq!(source.active.save().await, Some(SaveStatus::Saved));
 
+        let mut compatible = SessionManager::new(
+            OpenAiApi::Responses,
+            "restored system".into(),
+            Some(runtime.fresh()),
+        );
+        assert!(compatible.open(&saved_id).await.is_ok());
+        assert_eq!(
+            compatible
+                .active
+                .prompt
+                .transcript()
+                .iter()
+                .map(|entry| entry.text.as_str())
+                .collect::<Vec<_>>(),
+            ["saved input", "saved answer"]
+        );
+
         let foreign = SessionRuntime::new(
             store.clone(),
             "/tmp/workspace-b".into(),
@@ -815,9 +896,13 @@ mod tests {
         assert!(!record.snapshot.to_string().contains("extra-secret"));
         assert!(!record.snapshot.to_string().contains("known-key"));
         assert_eq!(record.endpoint, "https://example.test/v1");
-        let (_, snapshot) = runtime.load(&id).await.unwrap();
+        let (_, snapshot, display_events) = runtime.load(&id).await.unwrap();
         let mut recovered = Prompt::new(OpenAiApi::ChatCompletions, "new system".into());
         recovered.restore(snapshot).unwrap();
+        recovered.restore_display_events(display_events);
+        assert_eq!(recovered.transcript().len(), 4);
+        assert_eq!(recovered.transcript()[3].text, "second answer");
+        assert!(!format!("{:?}", recovered.transcript()).contains("my-secret"));
         let crate::provider::Messages::Chat(messages) = recovered.messages() else {
             panic!("Chat 会话")
         };
@@ -833,7 +918,7 @@ mod tests {
             "https://example.test/v1",
             vec!["known-key".into(), config.url.clone()],
         );
-        let (record, _) = restarted.load(&id).await.unwrap();
+        let (record, _, _) = restarted.load(&id).await.unwrap();
         restarted.adopt(&record);
         recovered.begin_turn("third");
         restarted.save(&id, &mut recovered, true).await;

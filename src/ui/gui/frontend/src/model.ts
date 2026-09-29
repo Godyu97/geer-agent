@@ -1,0 +1,175 @@
+export type Entry = {
+  role: "user" | "assistant" | "tool" | "system";
+  text: string;
+};
+export type Usage = { input: number; output: number };
+export type Status = {
+  model: string;
+  session_id: string;
+  context_tokens: number;
+  context_window_tokens: number;
+  turn_tokens: number;
+  total_tokens: number;
+  usage_complete: boolean;
+};
+export type SessionEntry = {
+  id: string;
+  updated_at_ms: number;
+  model: string;
+  status: string;
+  active: boolean;
+  uncertain_tools: boolean;
+};
+export type Snapshot = {
+  status: Status;
+  sessions: SessionEntry[];
+  transcript: Entry[];
+  unsaved_ids: string[];
+};
+export type Event =
+  | {
+      type: "snapshot";
+      request_id: number | null;
+      snapshot: Snapshot;
+      notice: string | null;
+      error: string | null;
+    }
+  | { type: "started"; request_id: number }
+  | { type: "delta"; request_id: number; text: string }
+  | { type: "usage"; request_id: number; usage: Usage | null }
+  | { type: "authorization"; id: number; prompt: string }
+  | { type: "diagnostic"; message: string }
+  | { type: "startup_error"; message: string }
+  | { type: "closing" }
+  | {
+      type: "close_failed";
+      report: string;
+      unsaved_ids: string[];
+      can_retry: boolean;
+    };
+
+export type Action =
+  | Event
+  | { type: "queued"; pending: Pending }
+  | { type: "submit_failed"; request_id: number; message: string }
+  | { type: "authorization_cleared" }
+  | { type: "close_dismissed" };
+
+export type Pending = { id: number; line: string };
+export type ViewState = {
+  snapshot: Snapshot | null;
+  pending: Pending | null;
+  live: string;
+  liveUsage: number;
+  authorization: { id: number; prompt: string } | null;
+  notice: string | null;
+  error: string | null;
+  diagnostics: string[];
+  startupError: string | null;
+  closing: boolean;
+  closeFailed: {
+    report: string;
+    unsaved_ids: string[];
+    can_retry: boolean;
+  } | null;
+};
+
+export const initialState: ViewState = {
+  snapshot: null,
+  pending: null,
+  live: "",
+  liveUsage: 0,
+  authorization: null,
+  notice: null,
+  error: null,
+  diagnostics: [],
+  startupError: null,
+  closing: false,
+  closeFailed: null,
+};
+
+export function applyEvent(state: ViewState, event: Action): ViewState {
+  switch (event.type) {
+    case "queued":
+      return {
+        ...state,
+        pending: event.pending,
+        live: "",
+        liveUsage: 0,
+        notice: null,
+        error: null,
+      };
+    case "submit_failed":
+      return state.pending?.id === event.request_id
+        ? { ...state, pending: null, live: "", error: event.message }
+        : state;
+    case "authorization_cleared":
+      return { ...state, authorization: null };
+    case "close_dismissed":
+      return { ...state, closeFailed: null };
+    case "snapshot":
+      if (event.request_id !== null && state.pending?.id !== event.request_id)
+        return state;
+      return {
+        ...state,
+        snapshot: event.snapshot,
+        pending: event.request_id === null ? state.pending : null,
+        live: event.request_id === null ? state.live : "",
+        liveUsage: event.request_id === null ? state.liveUsage : 0,
+        notice: event.notice,
+        error: event.error,
+      };
+    case "started":
+      return state;
+    case "delta":
+      return state.pending?.id === event.request_id
+        ? { ...state, live: state.live + event.text }
+        : state;
+    case "usage":
+      return state.pending?.id === event.request_id && event.usage
+        ? {
+            ...state,
+            liveUsage: state.liveUsage + event.usage.input + event.usage.output,
+          }
+        : state;
+    case "authorization":
+      return {
+        ...state,
+        authorization: { id: event.id, prompt: event.prompt },
+      };
+    case "diagnostic":
+      return {
+        ...state,
+        diagnostics: [...state.diagnostics, event.message].slice(-20),
+      };
+    case "startup_error":
+      return { ...state, startupError: event.message, pending: null };
+    case "closing":
+      return { ...state, closing: true, authorization: null };
+    case "close_failed":
+      return {
+        ...state,
+        closing: false,
+        closeFailed: {
+          report: event.report,
+          unsaved_ids: event.unsaved_ids,
+          can_retry: event.can_retry,
+        },
+      };
+  }
+}
+
+export function shouldSubmit(
+  event: Pick<KeyboardEvent, "key" | "shiftKey" | "isComposing" | "keyCode">,
+): boolean {
+  return (
+    event.key === "Enter" &&
+    !event.shiftKey &&
+    !event.isComposing &&
+    event.keyCode !== 229
+  );
+}
+
+export function safeExternalHref(href: string | undefined): string | undefined {
+  return href && /^https?:\/\//i.test(href) ? href : undefined;
+}

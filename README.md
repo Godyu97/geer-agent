@@ -4,13 +4,31 @@ GeekAgent 教程的 Rust 学习实现。
 
 ## 配置与运行
 
-复制 `.env.example` 为 `.env`，填写 `OPENAI_API_KEY` 和 `OPENAI_MODEL`，然后运行：
+普通 `cargo run` 可使用项目根目录的 `.env`：复制 `.env.example` 为 `.env`，填写 `OPENAI_API_KEY` 和 `OPENAI_MODEL`，然后运行：
 
 ```sh
 cargo run
 ```
 
-也可以只设置同名进程环境变量。`OPENAI_BASE_URL` 可选，默认使用 OpenAI 地址；`OPENAI_API` 可选，默认使用 Responses API，另可设为 `chat-completions`。
+复制可执行文件到其他目录运行时，优先读取可执行文件同级的 `.env`；若不存在，则读取 `~/.geer-agent/.env`。普通本地 Cargo 构建产物在同级没有 `.env` 时，也会检查项目根目录的 `.env`。启动工作目录中的其他 `.env` 不参与查找。所有候选位置都没有外部 `.env` 时，也可以只设置同名进程环境变量。`OPENAI_BASE_URL` 可选，默认使用 OpenAI 地址；`OPENAI_API` 可选，默认使用 Responses API，另可设为 `chat-completions`。
+
+`GEER_AGENT_UI=auto|gui|tui|repl` 可写在上述位置的 `.env`，进程环境变量优先。默认 `auto` 在交互终端使用 TUI，在输入或输出接管道时使用文本 REPL；显式 `tui` 要求交互终端。`gui` 必须在构建时启用 Cargo 的 `gui` feature，否则程序会提示构建方式。三种界面继续使用同一个 `geer-agent` 可执行文件。
+
+## 桌面 GUI（可选）
+
+GUI 使用 Tauri 2 + React/TypeScript。先构建静态前端，再启用 Rust feature：
+
+```sh
+cd src/ui/gui/frontend
+npm ci
+npm run build
+cd ../../../..
+cargo run --features gui
+```
+
+在程序实际选用的 `.env` 中设置 `GEER_AGENT_UI=gui` 后，上述 `cargo run` 会打开窗口。未设置时仍按 `auto` 选择终端界面；也可以执行 `GEER_AGENT_UI=gui cargo run --features gui` 临时启动。GUI 提供完整会话记录、侧栏会话切换、Markdown 回答、流式输出、用量与工具授权。现有 `/help`、`/new`、`/open`、`/save`、`/compact`、`/sessions`、`/exit` 等命令可直接在输入框使用。Enter 发送，Shift+Enter 换行；授权默认拒绝。关闭窗口时等待正在执行的请求并补写会话，保存失败时可重试、返回或明确退出。若持久化已关闭或数据库不可用，关闭含有对话的仅内存会话前会提示数据无法保存。
+
+Linux 需要 WebKitGTK 4.1 等 Tauri 开发依赖。Fedora 按 [Tauri 官方前置要求](https://tauri.app/start/prerequisites/) 安装 `webkit2gtk4.1-devel openssl-devel curl wget file libappindicator-gtk3-devel librsvg2-devel libxdo-devel` 及 C 开发工具；如编译提示找不到 `dbus-1.pc`，还需 `dbus-devel`。从 Wayland 会话中运行，可用 `GDK_BACKEND=wayland` 做原生 Wayland 验收。Windows 11 使用 MSVC Rust 工具链、Microsoft C++ Build Tools、WebView2 和 Node.js；本项目工具执行还需要 Git for Windows Bash。前端产物嵌入启用 GUI 的二进制，修改前端后需重新运行 `npm run build` 和 Cargo 构建。默认 `cargo build` 不需要 Node 或 GTK/WebKitGTK。
 
 ## 终端界面
 
@@ -44,14 +62,13 @@ REPL 向模型提供 `get_current_time`、`read`、`write`、`edit`、`bash`。�
 
 会话存储将脱敏后的用户输入、模型输出、工具结果和摘要事件追加保存，并发布可恢复的检查点；压缩不会删除原始事件。恢复要求相同工作目录、模型、API 类型和端点，重新生成系统环境提示并清空工具授权。工具执行中断后会提示副作用未确认，不自动重跑工具。已知 API key、数据库 URL 和认证头在保存前脱敏；会话记录仍可能含其他敏感业务内容，请保护数据库及备份。本版不自动清理会话。
 
-会话和 Trace 默认共用启动工作目录的 `./.db/geer.sqlite`，目录会自动创建且已加入 Git 忽略。可用公共配置改用其他数据库：
+会话和 Trace 默认共用所选配置目录的 `.db/geer.sqlite`，目录会自动创建：普通 `cargo run` 使用项目根目录时写入项目的 `.db/`；可执行文件旁有 `.env` 时写入其同级 `.db/`；使用 `~/.geer-agent/.env`，或仅使用进程变量、内嵌配置时写入 `~/.geer-agent/.db/`。项目根目录的 `.db/` 已加入 Git 忽略。可用公共配置改用其他数据库或指定旧文件：
 
 ```sh
-GEER_AGENT_DATABASE=sqlite
-GEER_AGENT_DATABASE_URL='sqlite://.db/geer.sqlite?mode=rwc'
+GEER_AGENT_DATABASE_URL='sqlite:///absolute/path/to/previous/.db/geer.sqlite?mode=rwc'
 ```
 
-`GEER_AGENT_DATABASE` 默认为 `sqlite`；选择其他后端时必须设置对应 URL。Trace 和会话共用这组数据库配置，可分别通过 `GEER_AGENT_TRACE` 和 `GEER_AGENT_SESSION_PERSISTENCE` 关闭。已有数据库可以通过公共配置指定原地址，无需迁移数据。
+`GEER_AGENT_DATABASE` 默认为 `sqlite`；选择其他后端时必须设置对应 URL。省略 `GEER_AGENT_DATABASE_URL` 才会使用上述同目录默认路径。Trace 和会话共用这组数据库配置，可分别通过 `GEER_AGENT_TRACE` 和 `GEER_AGENT_SESSION_PERSISTENCE` 关闭。已有数据库可以通过公共配置指定原地址，无需迁移数据。
 
 ## 执行预算
 
@@ -82,6 +99,6 @@ GEER_AGENT_DATABASE_URL='sqlite://.db/geer.sqlite?mode=rwc'
 cargo build --release --features embed-env
 ```
 
-构建产物位于 `target/release/geer-agent`，可复制到没有 `.env` 的目录运行。启用此 feature 时，构建目录缺少 `.env` 会导致编译失败。配置优先级为进程环境变量 > 运行目录 `.env` > 构建时内嵌的 `.env`。默认构建不包含 `.env`。
+构建产物位于 `target/release/geer-agent`，可复制到没有 `.env` 的目录运行。启用此 feature 时，构建目录缺少 `.env` 会导致编译失败。配置优先级为进程环境变量 > 可执行文件同级 `.env` > `~/.geer-agent/.env` > 构建时内嵌的 `.env`；只使用内嵌配置时，默认数据库位于 `~/.geer-agent/.db/`。内嵌构建不会把项目根目录的文件当作运行时外部 `.env`。默认构建不包含 `.env`。
 
 **内嵌的 `.env` 原文可从二进制提取，其中的 API key 不是加密存储。请只向可信对象分发此产物；修改内嵌配置后需重新构建。**

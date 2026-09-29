@@ -25,6 +25,8 @@ use crate::{
     },
 };
 use guard::{LoopGuard, StopReason, call_fingerprint, result_fingerprint};
+#[cfg(feature = "gui")]
+pub(crate) use session::SessionEntry;
 use session::{SessionManager, SessionRuntime};
 
 static NEXT_RUN_ID: AtomicU64 = AtomicU64::new(0);
@@ -429,6 +431,29 @@ pub(crate) struct Agent {
 impl Agent {
     pub(crate) fn set_confirm(&mut self, confirm: impl FnMut(&str) -> io::Result<bool> + 'static) {
         self.tools.set_confirm(confirm);
+    }
+
+    #[cfg(feature = "gui")]
+    pub(crate) fn transcript(&self) -> Vec<crate::prompt::TranscriptEntry> {
+        self.sessions.active.prompt.transcript()
+    }
+
+    #[cfg(feature = "gui")]
+    pub(crate) async fn session_entries(&self) -> Result<Vec<SessionEntry>, Box<dyn Error>> {
+        self.sessions
+            .list_entries()
+            .await
+            .map_err(|error| io::Error::other(error).into())
+    }
+
+    #[cfg(feature = "gui")]
+    pub(crate) fn unsaved_ids(&self) -> Vec<String> {
+        self.sessions.unsaved_ids()
+    }
+
+    #[cfg(feature = "gui")]
+    pub(crate) fn volatile_ids(&self) -> Vec<String> {
+        self.sessions.volatile_ids()
     }
 
     fn record_ui_usage(&mut self, metrics: &AgentMetrics) {

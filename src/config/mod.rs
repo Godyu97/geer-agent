@@ -2,14 +2,33 @@
 
 use std::{
     error::Error,
-    fmt, io,
+    fmt, fs, io,
     path::{Path, PathBuf},
     time::Duration,
 };
 
 const DEFAULT_BASE_URL: &str = "https://api.openai.com/v1";
-const DEFAULT_DATABASE_URL: &str = "sqlite://.db/geer.sqlite?mode=rwc";
 const DEFAULT_MAX_DURATION: Duration = Duration::from_secs(600);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum UiMode {
+    Auto,
+    Gui,
+    Tui,
+    Repl,
+}
+
+impl UiMode {
+    pub(crate) fn parse(value: Option<&str>) -> Result<Self, String> {
+        match value.map(str::trim) {
+            None | Some("") | Some("auto") => Ok(Self::Auto),
+            Some("gui") => Ok(Self::Gui),
+            Some("tui") => Ok(Self::Tui),
+            Some("repl") => Ok(Self::Repl),
+            Some(_) => Err("GEER_AGENT_UI 只能是 auto、gui、tui 或 repl。".to_owned()),
+        }
+    }
+}
 pub(crate) const DEFAULT_RESOURCE_LIMITS: ResourceLimits = ResourceLimits {
     max_input_tokens: None,
     max_output_tokens: None,
@@ -60,7 +79,11 @@ impl fmt::Debug for TraceDatabaseConfig {
 }
 
 impl TraceDatabaseConfig {
-    fn from_values(database: Option<String>, url: Option<String>) -> Result<Self, String> {
+    fn from_values(
+        database: Option<String>,
+        url: Option<String>,
+        program_dir: &Path,
+    ) -> Result<Self, String> {
         let database = database
             .as_deref()
             .map(str::trim)
@@ -77,12 +100,15 @@ impl TraceDatabaseConfig {
                 );
             }
         };
-        let url = url
+        let url = match url
             .as_deref()
             .map(str::trim)
             .filter(|value| !value.is_empty())
-            .or_else(|| (kind == TraceDatabase::Sqlite).then_some(DEFAULT_DATABASE_URL))
-            .ok_or("选择非 SQLite 数据库时必须设置 GEER_AGENT_DATABASE_URL。")?;
+        {
+            Some(url) => url.to_owned(),
+            None if kind == TraceDatabase::Sqlite => default_database_url(program_dir)?,
+            None => return Err("选择非 SQLite 数据库时必须设置 GEER_AGENT_DATABASE_URL。".into()),
+        };
         let protocol_valid = match kind {
             TraceDatabase::Sqlite => url.starts_with("sqlite:"),
             TraceDatabase::Postgres => {
@@ -109,11 +135,21 @@ impl TraceDatabaseConfig {
                 return Err("MongoDB URI 必须包含数据库名。".to_owned());
             }
         }
-        Ok(Self {
-            kind,
-            url: url.to_owned(),
-        })
+        Ok(Self { kind, url })
     }
+}
+
+fn default_database_url(program_dir: &Path) -> Result<String, String> {
+    let path = program_dir.join(".db").join("geer.sqlite");
+    let path = path
+        .to_str()
+        .ok_or("默认 SQLite 路径包含非 UTF-8 字符，无法生成数据库 URL。")?;
+    // SQLite URL 会解码百分号并用问号分隔参数，目录名需先转义。
+    let path = path
+        .replace('%', "%25")
+        .replace('?', "%3F")
+        .replace('#', "%23");
+    Ok(format!("sqlite://{path}?mode=rwc"))
 }
 
 #[derive(Default)]
@@ -134,8 +170,12 @@ impl DatabaseInputs {
         }
     }
 
-    fn resolve(self) -> Result<(Option<TraceDatabaseConfig>, Option<TraceDatabaseConfig>), String> {
-        let database = TraceDatabaseConfig::from_values(self.common_kind, self.common_url)?;
+    fn resolve(
+        self,
+        program_dir: &Path,
+    ) -> Result<(Option<TraceDatabaseConfig>, Option<TraceDatabaseConfig>), String> {
+        let database =
+            TraceDatabaseConfig::from_values(self.common_kind, self.common_url, program_dir)?;
         Ok((
             parse_on_off(self.trace_enabled, "GEER_AGENT_TRACE")?.then(|| database.clone()),
             parse_on_off(self.session_enabled, "GEER_AGENT_SESSION_PERSISTENCE")?
@@ -312,14 +352,93 @@ fn parse_nonnegative_f64(value: Option<String>, name: &str) -> Result<Option<f64
         .transpose()
 }
 
+fn user_home() -> Option<PathBuf> {
+    #[cfg(windows)]
+    let name = "USERPROFILE";
+    #[cfg(not(windows))]
+    let name = "HOME";
+    std::env::var_os(name)
+        .map(PathBuf::from)
+        .filter(|path| path.is_absolute())
+}
+
+fn local_project_dir(executable: &Path) -> Option<PathBuf> {
+    #[cfg(feature = "embed-env")]
+    {
+        let _ = executable;
+        None
+    }
+
+    #[cfg(not(feature = "embed-env"))]
+    {
+        let project_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let target_dir = option_env!("CARGO_TARGET_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| project_dir.join("target"));
+        let target_dir = if target_dir.is_absolute() {
+            target_dir
+        } else {
+            project_dir.join(target_dir)
+        };
+        executable.starts_with(target_dir).then_some(project_dir)
+    }
+}
+
+fn existing_env(dir: &Path) -> io::Result<Option<PathBuf>> {
+    let file = dir.join(".env");
+    match fs::metadata(&file) {
+        Ok(_) => Ok(Some(file)),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error),
+    }
+}
+
+fn selected_env(
+    exe_dir: &Path,
+    project_dir: Option<&Path>,
+    home: Option<&Path>,
+) -> io::Result<(PathBuf, Option<PathBuf>)> {
+    if let Some(file) = existing_env(exe_dir)? {
+        return Ok((exe_dir.to_path_buf(), Some(file)));
+    }
+    if let Some(project_dir) = project_dir
+        && let Some(file) = existing_env(project_dir)?
+    {
+        return Ok((project_dir.to_path_buf(), Some(file)));
+    }
+
+    let home = home.ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::NotFound,
+            "无法确定用户主目录，不能定位 ~/.geer-agent/.env",
+        )
+    })?;
+    let program_dir = home.join(".geer-agent");
+    let file = existing_env(&program_dir)?;
+    Ok((program_dir, file))
+}
+
+pub(crate) fn load_environment() -> Result<PathBuf, Box<dyn Error>> {
+    let executable = std::env::current_exe()?;
+    let exe_dir = executable
+        .parent()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "无法确定可执行文件所在目录"))?;
+    let project_dir = local_project_dir(&executable);
+    let home = user_home();
+    let (program_dir, env_file) = selected_env(exe_dir, project_dir.as_deref(), home.as_deref())?;
+    if let Some(env_file) = env_file {
+        dotenvy::from_path(env_file)?;
+    }
+
+    #[cfg(feature = "embed-env")]
+    dotenvy::from_read(EMBEDDED_ENV.as_bytes())?;
+
+    Ok(program_dir)
+}
+
 impl Config {
     pub(crate) fn load() -> Result<Self, Box<dyn Error>> {
-        if Path::new(".env").is_file() {
-            dotenvy::dotenv()?;
-        }
-
-        #[cfg(feature = "embed-env")]
-        dotenvy::from_read(EMBEDDED_ENV.as_bytes())?;
+        let program_dir = load_environment()?;
 
         let mut config = Self::from_values(
             std::env::var("OPENAI_API_KEY").ok(),
@@ -340,7 +459,7 @@ impl Config {
         ])
         .map_err(|message| io::Error::new(io::ErrorKind::InvalidInput, message))?;
         (config.trace_database, config.session_database) = DatabaseInputs::from_env()
-            .resolve()
+            .resolve(&program_dir)
             .map_err(|message| io::Error::new(io::ErrorKind::InvalidInput, message))?;
         config.compaction = CompactionConfig::from_values(
             std::env::var("GEER_AGENT_CONTEXT_WINDOW_TOKENS").ok(),
@@ -424,25 +543,104 @@ fn required_value(value: Option<String>, name: &str) -> Result<String, String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        CompactionConfig, Config, DEFAULT_BASE_URL, DEFAULT_DATABASE_URL, DatabaseInputs,
-        OpenAiApi, ResourceLimits, TraceDatabase, TraceDatabaseConfig,
+        CompactionConfig, Config, DEFAULT_BASE_URL, DatabaseInputs, OpenAiApi, ResourceLimits,
+        TraceDatabase, TraceDatabaseConfig, UiMode, default_database_url, local_project_dir,
+        selected_env,
     };
 
     #[test]
+    fn ui_mode_has_safe_default_and_rejects_unknown_values() {
+        assert_eq!(UiMode::parse(None), Ok(UiMode::Auto));
+        assert_eq!(UiMode::parse(Some(" gui ")), Ok(UiMode::Gui));
+        assert_eq!(UiMode::parse(Some("tui")), Ok(UiMode::Tui));
+        assert_eq!(UiMode::parse(Some("repl")), Ok(UiMode::Repl));
+        assert!(UiMode::parse(Some("window")).is_err());
+    }
+
+    fn program_dir() -> std::path::PathBuf {
+        std::env::temp_dir().join("geer-config-tests")
+    }
+
+    #[test]
+    fn selects_executable_env_before_home_and_ignores_working_dir() {
+        let root = std::env::temp_dir().join(format!("geer-config-{}", uuid::Uuid::new_v4()));
+        let exe_dir = root.join("bin");
+        let home = root.join("home");
+        std::fs::create_dir_all(&exe_dir).unwrap();
+        std::fs::create_dir_all(home.join(".geer-agent")).unwrap();
+        std::fs::write(exe_dir.join(".env"), "OPENAI_MODEL=exe\n").unwrap();
+        std::fs::write(home.join(".geer-agent/.env"), "OPENAI_MODEL=home\n").unwrap();
+        std::fs::write(root.join(".env"), "OPENAI_MODEL=cwd\n").unwrap();
+
+        assert_eq!(
+            selected_env(&exe_dir, None, Some(&home)).unwrap(),
+            (exe_dir.clone(), Some(exe_dir.join(".env")))
+        );
+        std::fs::remove_file(exe_dir.join(".env")).unwrap();
+        assert_eq!(
+            selected_env(&exe_dir, None, Some(&home)).unwrap(),
+            (
+                home.join(".geer-agent"),
+                Some(home.join(".geer-agent/.env"))
+            )
+        );
+        std::fs::remove_file(home.join(".geer-agent/.env")).unwrap();
+        assert_eq!(
+            selected_env(&exe_dir, None, Some(&home)).unwrap(),
+            (home.join(".geer-agent"), None)
+        );
+        assert!(selected_env(&exe_dir, None, None).is_err());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn local_cargo_build_can_use_project_env() {
+        let root = std::env::temp_dir().join(format!("geer-project-env-{}", uuid::Uuid::new_v4()));
+        let exe_dir = root.join("target/debug");
+        let home = root.join("home");
+        std::fs::create_dir_all(&exe_dir).unwrap();
+        std::fs::create_dir_all(home.join(".geer-agent")).unwrap();
+        std::fs::write(root.join(".env"), "OPENAI_MODEL=project\n").unwrap();
+        std::fs::write(home.join(".geer-agent/.env"), "OPENAI_MODEL=home\n").unwrap();
+
+        assert_eq!(
+            selected_env(&exe_dir, Some(&root), Some(&home)).unwrap(),
+            (root.clone(), Some(root.join(".env")))
+        );
+        let built_executable = std::env::current_exe().unwrap();
+        #[cfg(not(feature = "embed-env"))]
+        assert!(local_project_dir(&built_executable).is_some());
+        #[cfg(feature = "embed-env")]
+        assert!(local_project_dir(&built_executable).is_none());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn database_defaults_and_shared_override() {
-        let (trace, session) = DatabaseInputs::default().resolve().unwrap();
+        let (trace, session) = DatabaseInputs::default().resolve(&program_dir()).unwrap();
         assert_eq!(trace, session);
-        assert_eq!(trace.unwrap().url, DEFAULT_DATABASE_URL);
+        assert_eq!(
+            trace.unwrap().url,
+            default_database_url(&program_dir()).unwrap()
+        );
 
         let (trace, session) = DatabaseInputs {
             common_kind: Some("sqlite".into()),
             common_url: Some("sqlite://custom.sqlite?mode=rwc".into()),
             ..Default::default()
         }
-        .resolve()
+        .resolve(&program_dir())
         .unwrap();
         assert_eq!(trace, session);
         assert_eq!(trace.unwrap().url, "sqlite://custom.sqlite?mode=rwc");
+    }
+
+    #[test]
+    fn default_database_url_keeps_special_directory_characters() {
+        let program_dir = program_dir().join("100%?#");
+        let url = default_database_url(&program_dir).unwrap();
+        let options: sea_orm::sqlx::sqlite::SqliteConnectOptions = url.parse().unwrap();
+        assert_eq!(options.get_filename(), program_dir.join(".db/geer.sqlite"));
     }
 
     #[test]
@@ -451,14 +649,14 @@ mod tests {
             trace_enabled: Some("off".into()),
             ..Default::default()
         }
-        .resolve()
+        .resolve(&program_dir())
         .unwrap();
         assert!(trace.is_none() && session.is_some());
         let (trace, session) = DatabaseInputs {
             session_enabled: Some("off".into()),
             ..Default::default()
         }
-        .resolve()
+        .resolve(&program_dir())
         .unwrap();
         assert!(trace.is_some() && session.is_none());
     }
@@ -470,7 +668,7 @@ mod tests {
                 common_kind: Some("postgres".into()),
                 ..Default::default()
             }
-            .resolve()
+            .resolve(&program_dir())
             .unwrap_err()
             .contains("GEER_AGENT_DATABASE_URL")
         );
@@ -479,7 +677,7 @@ mod tests {
                 common_url: Some("postgres://localhost/db".into()),
                 ..Default::default()
             }
-            .resolve()
+            .resolve(&program_dir())
             .is_err()
         );
         assert!(
@@ -487,7 +685,7 @@ mod tests {
                 trace_enabled: Some("no".into()),
                 ..Default::default()
             }
-            .resolve()
+            .resolve(&program_dir())
             .is_err()
         );
         assert!(
@@ -495,7 +693,7 @@ mod tests {
                 common_kind: Some("unknown".into()),
                 ..Default::default()
             }
-            .resolve()
+            .resolve(&program_dir())
             .is_err()
         );
     }
@@ -522,11 +720,13 @@ mod tests {
     #[test]
     fn database_config_accepts_supported_backends_and_requires_matching_url() {
         assert_eq!(
-            TraceDatabaseConfig::from_values(None, None).unwrap().url,
-            DEFAULT_DATABASE_URL
+            TraceDatabaseConfig::from_values(None, None, &program_dir())
+                .unwrap()
+                .url,
+            default_database_url(&program_dir()).unwrap()
         );
         assert_eq!(
-            TraceDatabaseConfig::from_values(None, Some("sqlite::memory:".into()))
+            TraceDatabaseConfig::from_values(None, Some("sqlite::memory:".into()), &program_dir())
                 .unwrap()
                 .kind,
             TraceDatabase::Sqlite
@@ -545,21 +745,39 @@ mod tests {
                 TraceDatabase::Mongodb,
             ),
         ] {
-            let config =
-                TraceDatabaseConfig::from_values(Some(database.into()), Some(url.into())).unwrap();
+            let config = TraceDatabaseConfig::from_values(
+                Some(database.into()),
+                Some(url.into()),
+                &program_dir(),
+            )
+            .unwrap();
             assert_eq!(config.kind, expected);
             assert!(!format!("{config:?}").contains(url));
         }
-        assert!(TraceDatabaseConfig::from_values(Some("other".into()), Some("x".into())).is_err());
-        assert!(TraceDatabaseConfig::from_values(Some("mysql".into()), None).is_err());
         assert!(
-            TraceDatabaseConfig::from_values(Some("mysql".into()), Some("sqlite::memory:".into()))
-                .is_err()
+            TraceDatabaseConfig::from_values(
+                Some("other".into()),
+                Some("x".into()),
+                &program_dir()
+            )
+            .is_err()
+        );
+        assert!(
+            TraceDatabaseConfig::from_values(Some("mysql".into()), None, &program_dir()).is_err()
+        );
+        assert!(
+            TraceDatabaseConfig::from_values(
+                Some("mysql".into()),
+                Some("sqlite::memory:".into()),
+                &program_dir()
+            )
+            .is_err()
         );
         assert!(
             TraceDatabaseConfig::from_values(
                 Some("mongodb".into()),
-                Some("mongodb://localhost/".into())
+                Some("mongodb://localhost/".into()),
+                &program_dir()
             )
             .is_err()
         );

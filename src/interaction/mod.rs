@@ -2,11 +2,12 @@
 
 mod diagnostic;
 
+use serde::Serialize;
 use std::{error::Error, io};
 
 pub(crate) use diagnostic::{DiagnosticBuffer, emit_diagnostic};
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize)]
 pub(crate) struct SessionStatus {
     pub(crate) model: String,
     pub(crate) session_id: String,
@@ -17,7 +18,7 @@ pub(crate) struct SessionStatus {
     pub(crate) usage_complete: bool,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 pub(crate) struct Usage {
     pub(crate) input: u64,
     pub(crate) output: u64,

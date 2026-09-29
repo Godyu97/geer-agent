@@ -1,0 +1,504 @@
+import {
+  useEffect,
+  useLayoutEffect,
+  useReducer,
+  useRef,
+  useState,
+} from "react";
+import type { KeyboardEvent, ReactNode } from "react";
+import ReactMarkdown from "react-markdown";
+import remarkGfm from "remark-gfm";
+import { Channel, invoke } from "@tauri-apps/api/core";
+import { getCurrentWindow } from "@tauri-apps/api/window";
+import { writeText } from "@tauri-apps/plugin-clipboard-manager";
+import {
+  applyEvent,
+  initialState,
+  safeExternalHref,
+  shouldSubmit,
+} from "./model";
+import type { Entry, Event, Pending } from "./model";
+import "./style.css";
+
+function plainText(node: ReactNode): string {
+  if (typeof node === "string" || typeof node === "number") return String(node);
+  if (Array.isArray(node)) return node.map(plainText).join("");
+  if (node && typeof node === "object" && "props" in node) {
+    return plainText((node.props as { children?: ReactNode }).children);
+  }
+  return "";
+}
+
+function Message({
+  entry,
+  onCopyError,
+}: {
+  entry: Entry;
+  onCopyError: (message: string) => void;
+}) {
+  const label = {
+    user: "你",
+    assistant: "Agent",
+    tool: "工具",
+    system: "系统",
+  }[entry.role];
+  return (
+    <article className={`message message-${entry.role}`}>
+      <div className="message-label">{label}</div>
+      <div className="message-body">
+        {entry.role === "assistant" ? (
+          <ReactMarkdown
+            remarkPlugins={[remarkGfm]}
+            components={{
+              a: ({ children, href }) =>
+                safeExternalHref(href) ? (
+                  <a href={href} target="_blank" rel="noopener noreferrer">
+                    {children}
+                  </a>
+                ) : (
+                  <span>{children}</span>
+                ),
+              pre: ({ children }) => (
+                <div className="code-wrap">
+                  <button
+                    className="copy"
+                    onClick={() =>
+                      void writeText(plainText(children)).catch((error) =>
+                        onCopyError(String(error)),
+                      )
+                    }
+                  >
+                    复制代码
+                  </button>
+                  <pre>{children}</pre>
+                </div>
+              ),
+            }}
+          >
+            {entry.text}
+          </ReactMarkdown>
+        ) : (
+          <pre className="plain">{entry.text}</pre>
+        )}
+      </div>
+    </article>
+  );
+}
+
+function shortId(id: string): string {
+  return id.slice(0, 8);
+}
+
+export default function App() {
+  const [state, dispatch] = useReducer(applyEvent, initialState);
+  const [input, setInput] = useState("");
+  const [visibleCount, setVisibleCount] = useState(120);
+  const [localError, setLocalError] = useState<string | null>(null);
+  const nextRequest = useRef(1);
+  const current = useRef(state);
+  current.current = state;
+  const stream = useRef<HTMLDivElement>(null);
+  const followBottom = useRef(true);
+  const lastSession = useRef<string | null>(null);
+  const prependHeight = useRef<number | null>(null);
+
+  useEffect(() => {
+    const channel = new Channel<Event>();
+    channel.onmessage = (event) => dispatch(event);
+    void invoke("gui_connect", { onEvent: channel }).catch((error) => {
+      dispatch({ type: "startup_error", message: String(error) });
+    });
+  }, []);
+
+  const sessionId = state.snapshot?.status.session_id ?? null;
+  useEffect(() => {
+    if (sessionId !== lastSession.current) {
+      followBottom.current = true;
+      lastSession.current = sessionId;
+      setVisibleCount(120);
+    }
+  }, [sessionId]);
+  useLayoutEffect(() => {
+    if (prependHeight.current !== null && stream.current) {
+      stream.current.scrollTop +=
+        stream.current.scrollHeight - prependHeight.current;
+      prependHeight.current = null;
+    }
+  }, [visibleCount]);
+  useEffect(() => {
+    if (followBottom.current && stream.current)
+      stream.current.scrollTop = stream.current.scrollHeight;
+  }, [state.snapshot?.transcript, state.live, sessionId]);
+
+  async function submit(line: string) {
+    if (
+      !line.trim() ||
+      !current.current.snapshot ||
+      current.current.pending ||
+      current.current.closing ||
+      current.current.startupError ||
+      current.current.authorization
+    )
+      return;
+    const pending: Pending = { id: nextRequest.current++, line: line.trim() };
+    current.current = { ...current.current, pending, live: "", liveUsage: 0 };
+    dispatch({ type: "queued", pending });
+    setLocalError(null);
+    try {
+      await invoke("gui_submit", { requestId: pending.id, line: pending.line });
+      setInput("");
+    } catch (error) {
+      current.current = { ...current.current, pending: null };
+      dispatch({
+        type: "submit_failed",
+        request_id: pending.id,
+        message: String(error),
+      });
+      setLocalError(String(error));
+    }
+  }
+
+  async function authorize(allowed: boolean) {
+    const request = current.current.authorization;
+    if (!request) return;
+    try {
+      await invoke("gui_authorize", { id: request.id, allowed });
+    } catch (error) {
+      setLocalError(String(error));
+    }
+    dispatch({ type: "authorization_cleared" });
+  }
+
+  async function retryClose() {
+    dispatch({ type: "closing" });
+    try {
+      await getCurrentWindow().close();
+    } catch (error) {
+      setLocalError(String(error));
+    }
+  }
+
+  const transcript = state.snapshot?.transcript ?? [];
+  const visible = transcript.slice(-visibleCount);
+  const status = state.snapshot?.status;
+  const disabled =
+    !state.snapshot ||
+    !!state.pending ||
+    state.closing ||
+    !!state.startupError ||
+    !!state.authorization;
+  const contextPercent = status
+    ? Math.min(
+        100,
+        Math.round(
+          (status.context_tokens / Math.max(1, status.context_window_tokens)) *
+            100,
+        ),
+      )
+    : 0;
+  const isChat = state.pending && !state.pending.line.startsWith("/");
+
+  return (
+    <div className="app-shell">
+      <aside className="sidebar">
+        <div className="brand">
+          <div className="brand-mark">
+            g<span>·</span>
+          </div>
+          <div>
+            <strong>geer-agent</strong>
+            <small>Desktop workspace</small>
+          </div>
+        </div>
+        <button
+          className="new-session"
+          disabled={disabled}
+          onClick={() => void submit("/new")}
+        >
+          ＋ 新建会话
+        </button>
+        <div className="section-title">
+          会话 <span>{state.snapshot?.sessions.length ?? 0}</span>
+        </div>
+        <div className="session-list">
+          {state.snapshot?.sessions.map((session) => (
+            <button
+              key={session.id}
+              disabled={disabled}
+              className={`session-item ${session.active ? "active" : ""}`}
+              title={session.id}
+              onClick={() => void submit(`/open ${session.id}`)}
+            >
+              <span className="session-dot" />
+              <span className="session-detail">
+                <strong>{shortId(session.id)}</strong>
+                <small>
+                  {new Date(session.updated_at_ms).toLocaleString()} ·{" "}
+                  {session.status}
+                </small>
+              </span>
+              {session.uncertain_tools && <span title="工具状态未确认">!</span>}
+            </button>
+          ))}
+        </div>
+        <div className="sidebar-footer">
+          <span className="connection-dot" />
+          {state.startupError
+            ? "启动失败"
+            : state.snapshot
+              ? "本地运行"
+              : "正在连接"}
+        </div>
+      </aside>
+
+      <main className="main-panel">
+        <header className="topbar">
+          <div>
+            <strong>对话</strong>
+            <span className="session-id">
+              {status ? shortId(status.session_id) : "初始化中"}
+            </span>
+          </div>
+          <div className="top-actions">
+            <button disabled={disabled} onClick={() => void submit("/compact")}>
+              压缩
+            </button>
+            <button disabled={disabled} onClick={() => void submit("/save")}>
+              保存
+            </button>
+            <button disabled={disabled} onClick={() => void submit("/help")}>
+              帮助
+            </button>
+          </div>
+        </header>
+        {state.startupError ? (
+          <div className="startup-error">
+            <h2>无法启动 Agent</h2>
+            <p>{state.startupError}</p>
+            <p>请检查程序选用的 .env 和模型配置，然后重新启动。</p>
+          </div>
+        ) : (
+          <>
+            <div
+              className="feed"
+              ref={stream}
+              onScroll={(event) => {
+                const node = event.currentTarget;
+                followBottom.current =
+                  node.scrollHeight - node.scrollTop - node.clientHeight < 64;
+              }}
+            >
+              {transcript.length === 0 && !state.pending && (
+                <div className="empty">
+                  <div className="empty-symbol">✦</div>
+                  <h1>从这里开始</h1>
+                  <p>向 Agent 提问，或输入 /help 查看已有命令。</p>
+                </div>
+              )}
+              {transcript.length > visibleCount && (
+                <button
+                  className="older"
+                  onClick={() => {
+                    prependHeight.current =
+                      stream.current?.scrollHeight ?? null;
+                    followBottom.current = false;
+                    setVisibleCount((count) => count + 120);
+                  }}
+                >
+                  显示更早记录 · 还有 {transcript.length - visibleCount} 条
+                </button>
+              )}
+              {visible.map((entry, index) => (
+                <Message
+                  key={`${status?.session_id}-${transcript.length - visible.length + index}`}
+                  entry={entry}
+                  onCopyError={setLocalError}
+                />
+              ))}
+              {isChat && (
+                <>
+                  <Message
+                    entry={{ role: "user", text: state.pending!.line }}
+                    onCopyError={setLocalError}
+                  />
+                  {state.live && (
+                    <Message
+                      entry={{ role: "assistant", text: state.live }}
+                      onCopyError={setLocalError}
+                    />
+                  )}
+                </>
+              )}
+              {state.pending && (
+                <div className="working">
+                  <span className="pulse" />
+                  {state.closing
+                    ? "等待当前操作完成并保存…"
+                    : "Agent 正在工作…"}
+                  {state.liveUsage > 0
+                    ? ` · 已报告 ${state.liveUsage} tokens`
+                    : state.live
+                      ? ` · 临时估算约 ${Math.max(1, Math.ceil(state.live.length / 4))} tokens`
+                      : ""}
+                </div>
+              )}
+              {state.notice && (
+                <div className="notice">
+                  <pre>{state.notice}</pre>
+                </div>
+              )}
+              {(localError || state.error) && (
+                <div className="error-banner">{localError || state.error}</div>
+              )}
+              {state.diagnostics.length > 0 && (
+                <details className="diagnostics">
+                  <summary>运行诊断 ({state.diagnostics.length})</summary>
+                  {state.diagnostics.map((message, index) => (
+                    <pre key={index}>{message}</pre>
+                  ))}
+                </details>
+              )}
+            </div>
+            <div className="composer">
+              <div className="composer-inner">
+                <textarea
+                  aria-label="消息"
+                  placeholder="发送消息给 Agent…"
+                  value={input}
+                  disabled={disabled}
+                  rows={3}
+                  onChange={(event) => setInput(event.target.value)}
+                  onKeyDown={(event: KeyboardEvent<HTMLTextAreaElement>) => {
+                    if (shouldSubmit(event.nativeEvent)) {
+                      event.preventDefault();
+                      void submit(input);
+                    }
+                  }}
+                />
+                <div className="composer-bottom">
+                  <span>Enter 发送 · Shift+Enter 换行</span>
+                  <button
+                    disabled={disabled || !input.trim()}
+                    onClick={() => void submit(input)}
+                  >
+                    发送 ↗
+                  </button>
+                </div>
+              </div>
+            </div>
+          </>
+        )}
+      </main>
+
+      <aside className="info-panel">
+        <div className="section-title">运行状态</div>
+        <div className="info-card">
+          <small>模型</small>
+          <strong>{status?.model ?? "—"}</strong>
+        </div>
+        <div className="info-card">
+          <small>上下文估算</small>
+          <strong>
+            {status
+              ? `${status.context_tokens.toLocaleString()} / ${status.context_window_tokens.toLocaleString()}`
+              : "—"}
+          </strong>
+          <div className="meter">
+            <span style={{ width: `${contextPercent}%` }} />
+          </div>
+          <small>{contextPercent}%</small>
+        </div>
+        <div className="info-card">
+          <small>Token 用量</small>
+          <div className="metric">
+            <span>本轮</span>
+            <strong>{status?.turn_tokens.toLocaleString() ?? "—"}</strong>
+          </div>
+          <div className="metric">
+            <span>累计</span>
+            <strong>{status?.total_tokens.toLocaleString() ?? "—"}</strong>
+          </div>
+          {status && !status.usage_complete && (
+            <small className="warning">部分用量不可用</small>
+          )}
+        </div>
+        <div className="info-card">
+          <small>待保存会话</small>
+          <strong>{state.snapshot?.unsaved_ids.length ?? 0}</strong>
+          {state.snapshot?.unsaved_ids.map((id) => (
+            <small key={id}>{shortId(id)}</small>
+          ))}
+        </div>
+      </aside>
+
+      {state.authorization && (
+        <div className="modal-backdrop">
+          <div
+            className="modal"
+            role="dialog"
+            aria-modal="true"
+            aria-label="工具授权"
+          >
+            <div className="modal-icon">!</div>
+            <h2>允许工具操作？</h2>
+            <p>请确认以下操作范围。允许后，本会话中同类工具将不再重复询问。</p>
+            <pre>{state.authorization.prompt}</pre>
+            <div className="modal-actions">
+              <button
+                className="secondary"
+                autoFocus
+                onClick={() => void authorize(false)}
+              >
+                拒绝
+              </button>
+              <button className="primary" onClick={() => void authorize(true)}>
+                本会话允许
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+      {state.closeFailed && (
+        <div className="modal-backdrop">
+          <div
+            className="modal"
+            role="dialog"
+            aria-modal="true"
+            aria-label="保存失败"
+          >
+            <div className="modal-icon">!</div>
+            <h2>部分会话未保存</h2>
+            <p>
+              {state.closeFailed.can_retry
+                ? "以下会话仍在内存中。可以重试保存，返回继续使用，或明确退出。"
+                : "以下会话仅保存在内存中，当前无法写入数据库。请返回继续使用或明确退出。"}
+            </p>
+            <pre>{state.closeFailed.report}</pre>
+            <div className="modal-actions">
+              <button
+                className="secondary"
+                onClick={() => dispatch({ type: "close_dismissed" })}
+              >
+                返回
+              </button>
+              <button
+                className="secondary"
+                onClick={() => void invoke("gui_force_close")}
+              >
+                仍然退出
+              </button>
+              {state.closeFailed.can_retry && (
+                <button className="primary" onClick={() => void retryClose()}>
+                  重试保存
+                </button>
+              )}
+            </div>
+          </div>
+        </div>
+      )}
+      {state.closing && (
+        <div className="closing-overlay">正在等待当前操作完成并保存会话…</div>
+      )}
+    </div>
+  );
+}

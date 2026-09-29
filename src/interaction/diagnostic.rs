@@ -30,6 +30,17 @@ impl DiagnosticBuffer {
         Self { active: true }
     }
 
+    #[cfg(feature = "gui")]
+    pub(crate) fn drain(&self) -> Vec<String> {
+        BUFFER.with(|buffer| {
+            buffer
+                .borrow_mut()
+                .as_mut()
+                .map(std::mem::take)
+                .unwrap_or_default()
+        })
+    }
+
     pub(crate) fn finish(&mut self) {
         if !self.active {
             return;

@@ -29,6 +29,8 @@ pub(crate) struct Prompt {
     current_user: Option<String>,
     message_serial: usize,
     events: Vec<RawEvent>,
+    #[cfg(any(feature = "gui", test))]
+    display_events: Vec<RawEvent>,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -46,6 +48,13 @@ enum State {
 pub(crate) struct RawEvent {
     pub(crate) kind: String,
     pub(crate) payload: Value,
+}
+
+#[cfg(any(feature = "gui", test))]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub(crate) struct TranscriptEntry {
+    pub(crate) role: &'static str,
+    pub(crate) text: String,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -86,13 +95,15 @@ impl Prompt {
             current_user: None,
             message_serial: 0,
             events: Vec::new(),
+            #[cfg(any(feature = "gui", test))]
+            display_events: Vec::new(),
         }
     }
 
     pub(crate) fn begin_turn(&mut self, input: &str) {
         self.turn_start = Some(self.len());
         self.current_user = Some(input.to_owned());
-        self.events.push(RawEvent {
+        self.record_event(RawEvent {
             kind: "user".to_owned(),
             payload: json!({"text": input}),
         });
@@ -169,7 +180,7 @@ impl Prompt {
     }
 
     pub(crate) fn apply_tool_results(&mut self, step: ModelStep, results: &[(ToolCall, String)]) {
-        self.events.push(RawEvent {
+        self.record_event(RawEvent {
             kind: "tool_step".to_owned(),
             payload: json!({
                 "text": step.text,
@@ -251,7 +262,7 @@ impl Prompt {
     }
 
     pub(crate) fn finish_turn(&mut self, step: ModelStep) {
-        self.events.push(RawEvent {
+        self.record_event(RawEvent {
             kind: "assistant".to_owned(),
             payload: json!({"text": step.text, "output": step.output}),
         });
@@ -287,7 +298,7 @@ impl Prompt {
     }
 
     pub(crate) fn rollback_turn(&mut self) {
-        self.events.push(RawEvent {
+        self.record_event(RawEvent {
             kind: "rollback".to_owned(),
             payload: Value::Null,
         });
@@ -310,6 +321,8 @@ impl Prompt {
         self.current_user = None;
         self.message_serial = 0;
         self.events.clear();
+        #[cfg(any(feature = "gui", test))]
+        self.display_events.clear();
         match &mut self.state {
             State::Chat { history } => history.clear(),
             State::Responses { history, pending } => {
@@ -366,7 +379,82 @@ impl Prompt {
         self.current_user = snapshot.current_user;
         self.message_serial = snapshot.message_serial;
         self.events.clear();
+        #[cfg(any(feature = "gui", test))]
+        self.display_events.clear();
         Ok(())
+    }
+
+    fn record_event(&mut self, event: RawEvent) {
+        #[cfg(any(feature = "gui", test))]
+        self.display_events.push(event.clone());
+        self.events.push(event);
+    }
+
+    #[cfg(any(feature = "gui", test))]
+    pub(crate) fn restore_display_events(&mut self, events: Vec<RawEvent>) {
+        self.display_events = events;
+    }
+
+    #[cfg(any(feature = "gui", test))]
+    pub(crate) fn transcript(&self) -> Vec<TranscriptEntry> {
+        let mut entries = Vec::new();
+        for event in &self.display_events {
+            let text = event.payload.get("text").and_then(Value::as_str);
+            match event.kind.as_str() {
+                "user" | "assistant" => {
+                    if let Some(text) = text.filter(|text| !text.is_empty()) {
+                        entries.push(TranscriptEntry {
+                            role: if event.kind == "user" {
+                                "user"
+                            } else {
+                                "assistant"
+                            },
+                            text: text.to_owned(),
+                        });
+                    }
+                }
+                "tool_step" => {
+                    if let Some(text) = text.filter(|text| !text.is_empty()) {
+                        entries.push(TranscriptEntry {
+                            role: "assistant",
+                            text: text.to_owned(),
+                        });
+                    }
+                    if let Some(results) = event.payload.get("results").and_then(Value::as_array) {
+                        for result in results {
+                            let name = event
+                                .payload
+                                .get("calls")
+                                .and_then(Value::as_array)
+                                .and_then(|calls| {
+                                    calls.iter().find(|call| call.get("id") == result.get("id"))
+                                })
+                                .and_then(|call| call.get("name"))
+                                .and_then(Value::as_str)
+                                .unwrap_or("tool");
+                            let output = result
+                                .get("text")
+                                .and_then(Value::as_str)
+                                .unwrap_or_default();
+                            entries.push(TranscriptEntry {
+                                role: "tool",
+                                text: format!("{name}\n{output}"),
+                            });
+                        }
+                    }
+                }
+                "rollback" => entries.push(TranscriptEntry {
+                    role: "system",
+                    text: "上一条请求未完成，模型上下文已回滚。".to_owned(),
+                }),
+                "compaction" => entries.push(TranscriptEntry {
+                    role: "system",
+                    text: "早期上下文已压缩；完整会话记录仍保留。".to_owned(),
+                }),
+                _ => {}
+            }
+        }
+        entries
     }
 
     pub(crate) fn pending_events(&self) -> &[RawEvent] {
@@ -543,7 +631,7 @@ impl Prompt {
             self.summary = old_summary;
             return Err("摘要没有缩小上下文。".to_owned());
         }
-        self.events.push(RawEvent {
+        self.record_event(RawEvent {
             kind: "compaction".to_owned(),
             payload: json!({"summary": self.summary, "old_items": plan.old_items}),
         });
@@ -668,6 +756,32 @@ mod tests {
         prompt.reset();
         assert_eq!(body(&prompt).as_array().expect("Chat 消息").len(), 1);
         assert_eq!(body(&prompt)[0]["content"], "system");
+    }
+
+    #[test]
+    fn transcript_survives_checkpoints_for_both_protocols() {
+        for api in [OpenAiApi::ChatCompletions, OpenAiApi::Responses] {
+            let mut prompt = Prompt::new(api, "system".to_owned());
+            prompt.begin_turn("first");
+            prompt.finish_turn(text_step("answer"));
+            prompt.clear_pending_events();
+            prompt.begin_turn("second");
+            prompt.finish_turn(text_step("another"));
+            assert_eq!(
+                prompt
+                    .transcript()
+                    .iter()
+                    .map(|entry| entry.text.as_str())
+                    .collect::<Vec<_>>(),
+                vec!["first", "answer", "second", "another"]
+            );
+            let events = prompt.display_events.clone();
+            let snapshot = prompt.snapshot();
+            let mut restored = Prompt::new(api, "system".into());
+            restored.restore(snapshot).unwrap();
+            restored.restore_display_events(events);
+            assert_eq!(restored.transcript(), prompt.transcript());
+        }
     }
 
     #[test]
@@ -838,6 +952,10 @@ mod tests {
         assert!(!messages.contains(&"A".repeat(1_200)));
         assert!(!messages.contains(&"B".repeat(1_200)));
         assert!(messages.contains(&"C".repeat(1_200)));
+        let display = prompt.transcript();
+        assert!(display.iter().any(|entry| entry.text == "A".repeat(1_200)));
+        assert!(display.iter().any(|entry| entry.text == "B".repeat(1_200)));
+        assert!(display.iter().any(|entry| entry.text == "C".repeat(1_200)));
     }
 
     #[test]

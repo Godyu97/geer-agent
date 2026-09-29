@@ -10,7 +10,6 @@ mod tools;
 mod trace;
 mod ui;
 
-#[tokio::main(flavor = "current_thread")]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    ui::run().await
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    ui::run()
 }
