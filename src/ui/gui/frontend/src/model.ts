@@ -18,6 +18,7 @@ export type Usage = { input: number; output: number };
 export type Status = {
   model: string;
   session_id: string;
+  workspace: string;
   context_tokens: number;
   context_window_tokens: number;
   turn_tokens: number;
@@ -31,10 +32,12 @@ export type SessionEntry = {
   status: string;
   active: boolean;
   uncertain_tools: boolean;
+  workspace: string;
 };
 export type Snapshot = {
   status: Status;
   sessions: SessionEntry[];
+  all_sessions: SessionEntry[];
   transcript: Entry[];
   unsaved_ids: string[];
 };

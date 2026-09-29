@@ -8,14 +8,13 @@ use crate::{
     config::OpenAiApi,
     dao::{SESSION_REVISION_CONFLICT, SessionStore},
     interaction::emit_diagnostic,
-    prompt::{Prompt, PromptSnapshot, RawEvent},
-    session::{SessionEvent, SessionRecord},
+    prompt::{Prompt, PromptContext, PromptSnapshot, RawEvent},
+    session::{SessionEvent, SessionRecord, Workspace},
     trace::{now_unix_ms, redact_json},
 };
 
-pub(super) struct SessionRuntime {
+pub(crate) struct SessionRuntime {
     store: SessionStore,
-    workspace: String,
     api: String,
     model: String,
     endpoint: String,
@@ -31,16 +30,15 @@ pub(super) struct SessionRuntime {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) enum SaveStatus {
+pub(crate) enum SaveStatus {
     Saved,
     Pending,
     Conflict,
 }
 
 impl SessionRuntime {
-    pub(super) fn new(
+    pub(crate) fn new(
         store: SessionStore,
-        workspace: String,
         api: String,
         model: String,
         base_url: &str,
@@ -49,7 +47,6 @@ impl SessionRuntime {
         secrets.push(base_url.to_owned());
         Self {
             store,
-            workspace,
             api,
             model,
             endpoint: endpoint_identity(base_url),
@@ -65,10 +62,9 @@ impl SessionRuntime {
         }
     }
 
-    pub(super) fn fresh(&self) -> Self {
+    pub(crate) fn fresh(&self) -> Self {
         Self {
             store: self.store.clone(),
-            workspace: self.workspace.clone(),
             api: self.api.clone(),
             model: self.model.clone(),
             endpoint: self.endpoint.clone(),
@@ -84,9 +80,10 @@ impl SessionRuntime {
         }
     }
 
-    pub(super) async fn save(
+    pub(crate) async fn save(
         &mut self,
         id: &str,
+        workspace: &Workspace,
         prompt: &mut Prompt,
         uncertain_tools: bool,
     ) -> SaveStatus {
@@ -121,7 +118,7 @@ impl SessionRuntime {
         redact_session_value(&mut snapshot, &secrets);
         let record = SessionRecord {
             id: id.to_owned(),
-            workspace: self.workspace.clone(),
+            workspace: workspace.as_str(),
             api: self.api.clone(),
             model: self.model.clone(),
             endpoint: self.endpoint.clone(),
@@ -176,30 +173,32 @@ impl SessionRuntime {
         self.status
     }
 
-    pub(super) async fn list(&self) -> Result<Vec<SessionRecord>, String> {
-        self.store
-            .list(&self.workspace)
-            .await
-            .map_err(|error| error.to_string())
+    pub(crate) async fn list(
+        &self,
+        workspace: Option<&Workspace>,
+    ) -> Result<Vec<SessionRecord>, String> {
+        let result = match workspace {
+            Some(workspace) => self.store.list(&workspace.as_str()).await,
+            None => self.store.list_all().await,
+        };
+        result.map_err(|error| error.to_string())
     }
 
-    pub(super) async fn load(
+    pub(crate) async fn load(
         &self,
         id: &str,
-    ) -> Result<(SessionRecord, PromptSnapshot, Vec<RawEvent>), String> {
+    ) -> Result<(SessionRecord, Workspace, PromptSnapshot, Vec<RawEvent>), String> {
         let record = self
             .store
             .load(id)
             .await
             .map_err(|error| error.to_string())?
             .ok_or_else(|| "没有找到该 Session ID。".to_owned())?;
-        if record.workspace != self.workspace
-            || record.api != self.api
-            || record.model != self.model
-            || record.endpoint != self.endpoint
+        if record.api != self.api || record.model != self.model || record.endpoint != self.endpoint
         {
-            return Err("会话的工作目录、接口、模型或端点与当前配置不兼容。".to_owned());
+            return Err("会话的接口、模型或端点与当前配置不兼容。".to_owned());
         }
+        let workspace = Workspace::from_stored(&record.workspace)?;
         let events = self
             .store
             .history(&record)
@@ -218,10 +217,10 @@ impl SessionRuntime {
             .collect();
         #[cfg(not(any(feature = "gui", test)))]
         let display_events = Vec::new();
-        Ok((record, snapshot, display_events))
+        Ok((record, workspace, snapshot, display_events))
     }
 
-    pub(super) fn adopt(&mut self, record: &SessionRecord) {
+    pub(crate) fn adopt(&mut self, record: &SessionRecord) {
         self.revision = Some(record.revision);
         self.head_event_id = record.head_event_id.clone();
         self.queued.clear();
@@ -230,17 +229,17 @@ impl SessionRuntime {
         self.status = SaveStatus::Saved;
     }
 
-    pub(super) fn uncertain_tools(&self) -> bool {
+    pub(crate) fn uncertain_tools(&self) -> bool {
         self.uncertain_tools
     }
 
-    pub(super) fn status(&self) -> SaveStatus {
+    pub(crate) fn status(&self) -> SaveStatus {
         self.status
     }
 }
 
 impl SaveStatus {
-    pub(super) fn label(self) -> &'static str {
+    pub(crate) fn label(self) -> &'static str {
         match self {
             Self::Saved => "已保存",
             Self::Pending => "待补写",
@@ -249,20 +248,28 @@ impl SaveStatus {
     }
 }
 
-pub(super) struct SessionState {
-    pub(super) id: String,
-    pub(super) prompt: Prompt,
-    pub(super) context_token_bias: u64,
-    pub(super) runtime: Option<SessionRuntime>,
+pub(crate) struct SessionState {
+    pub(crate) id: String,
+    pub(crate) workspace: Workspace,
+    pub(crate) prompt: Prompt,
+    pub(crate) context_token_bias: u64,
+    pub(crate) runtime: Option<SessionRuntime>,
     updated_at_ms: i64,
     dirty: bool,
 }
 
 impl SessionState {
-    fn new(api: OpenAiApi, system: &str, runtime: Option<SessionRuntime>) -> Self {
+    fn new(
+        api: OpenAiApi,
+        prompt_context: &PromptContext,
+        workspace: Workspace,
+        runtime: Option<SessionRuntime>,
+    ) -> Self {
+        let system = prompt_context.compose(workspace.as_path());
         Self {
             id: Uuid::new_v4().to_string(),
-            prompt: Prompt::new(api, system.to_owned()),
+            workspace,
+            prompt: Prompt::new(api, system),
             context_token_bias: 0,
             runtime,
             updated_at_ms: now_unix_ms(),
@@ -270,15 +277,17 @@ impl SessionState {
         }
     }
 
-    pub(super) fn changed(&mut self) {
+    pub(crate) fn changed(&mut self) {
         self.dirty = true;
         self.updated_at_ms = now_unix_ms();
     }
 
-    pub(super) async fn save(&mut self) -> Option<SaveStatus> {
+    pub(crate) async fn save(&mut self) -> Option<SaveStatus> {
         let runtime = self.runtime.as_mut()?;
         let uncertain = runtime.uncertain_tools();
-        let result = runtime.save(&self.id, &mut self.prompt, uncertain).await;
+        let result = runtime
+            .save(&self.id, &self.workspace, &mut self.prompt, uncertain)
+            .await;
         self.dirty = result != SaveStatus::Saved;
         Some(result)
     }
@@ -296,12 +305,12 @@ impl SessionState {
     }
 }
 
-pub(super) struct SessionManager {
-    pub(super) active: SessionState,
+pub(crate) struct SessionManager {
+    pub(crate) active: SessionState,
     parked: HashMap<String, SessionState>,
     runtime_template: Option<SessionRuntime>,
     api: OpenAiApi,
-    system: String,
+    prompt_context: PromptContext,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -312,49 +321,74 @@ pub(crate) struct SessionEntry {
     pub(crate) status: String,
     pub(crate) active: bool,
     pub(crate) uncertain_tools: bool,
+    pub(crate) workspace: String,
 }
 
 impl SessionManager {
-    pub(super) fn new(api: OpenAiApi, system: String, runtime: Option<SessionRuntime>) -> Self {
-        let active = SessionState::new(api, &system, runtime.as_ref().map(SessionRuntime::fresh));
+    pub(crate) fn new(
+        api: OpenAiApi,
+        prompt_context: PromptContext,
+        workspace: Workspace,
+        runtime: Option<SessionRuntime>,
+    ) -> Self {
+        let active = SessionState::new(
+            api,
+            &prompt_context,
+            workspace,
+            runtime.as_ref().map(SessionRuntime::fresh),
+        );
         Self {
             active,
             parked: HashMap::new(),
             runtime_template: runtime,
             api,
-            system,
+            prompt_context,
         }
     }
 
-    fn fresh(&self) -> SessionState {
+    fn fresh(&self, workspace: Workspace) -> SessionState {
         SessionState::new(
             self.api,
-            &self.system,
+            &self.prompt_context,
+            workspace,
             self.runtime_template.as_ref().map(SessionRuntime::fresh),
         )
     }
 
-    pub(super) async fn new_session(&mut self) -> String {
-        let next = self.fresh();
+    pub(crate) async fn new_session(&mut self) -> String {
+        let next = self.fresh(self.active.workspace.clone());
         self.active.save().await;
         let previous = std::mem::replace(&mut self.active, next);
         self.parked.insert(previous.id.clone(), previous);
         self.active.id.clone()
     }
 
-    pub(super) async fn open(&mut self, id: &str) -> Result<Option<bool>, String> {
+    pub(crate) async fn set_workspace(&mut self, workspace: Workspace) -> Option<String> {
+        if self.active.workspace == workspace {
+            return None;
+        }
+        let next = self.fresh(workspace);
+        self.active.save().await;
+        let previous = std::mem::replace(&mut self.active, next);
+        self.parked.insert(previous.id.clone(), previous);
+        Some(self.active.id.clone())
+    }
+
+    pub(crate) async fn open(&mut self, id: &str) -> Result<Option<bool>, String> {
         if self.active.id == id {
             return Ok(None);
         }
-        let target = if self.parked.contains_key(id) {
+        let target = if let Some(state) = self.parked.get(id) {
+            Workspace::from_stored(&state.workspace.as_str())?;
             None
         } else {
             let runtime = self
                 .runtime_template
                 .as_ref()
                 .ok_or_else(|| "未配置会话数据库，无法恢复。".to_owned())?;
-            let (record, snapshot, display_events) = runtime.load(id).await?;
-            let mut prompt = Prompt::new(self.api, self.system.clone());
+            let (record, workspace, snapshot, display_events) = runtime.load(id).await?;
+            let mut prompt =
+                Prompt::new(self.api, self.prompt_context.compose(workspace.as_path()));
             prompt.restore(snapshot)?;
             #[cfg(any(feature = "gui", test))]
             prompt.restore_display_events(display_events);
@@ -365,6 +399,7 @@ impl SessionManager {
             runtime.adopt(&record);
             Some(SessionState {
                 id: record.id,
+                workspace,
                 prompt,
                 context_token_bias: 0,
                 runtime: Some(runtime),
@@ -386,7 +421,7 @@ impl SessionManager {
         Ok(Some(interrupted))
     }
 
-    pub(super) async fn save_all(&mut self) -> Vec<(String, SaveStatus)> {
+    pub(crate) async fn save_all(&mut self) -> Vec<(String, SaveStatus)> {
         let mut results = Vec::new();
         if self.active.needs_save() {
             let id = self.active.id.clone();
@@ -406,7 +441,7 @@ impl SessionManager {
         results
     }
 
-    pub(super) fn unsaved_ids(&self) -> Vec<String> {
+    pub(crate) fn unsaved_ids(&self) -> Vec<String> {
         let mut ids: Vec<_> = std::iter::once(&self.active)
             .chain(self.parked.values())
             .filter(|state| state.needs_save())
@@ -417,7 +452,7 @@ impl SessionManager {
     }
 
     #[cfg(any(feature = "gui", test))]
-    pub(super) fn volatile_ids(&self) -> Vec<String> {
+    pub(crate) fn volatile_ids(&self) -> Vec<String> {
         let mut ids: Vec<_> = std::iter::once(&self.active)
             .chain(self.parked.values())
             .filter(|state| state.runtime.is_none() && !state.prompt.pending_events().is_empty())
@@ -427,9 +462,9 @@ impl SessionManager {
         ids
     }
 
-    pub(super) async fn list(&self) -> Result<Vec<String>, String> {
+    pub(crate) async fn list(&self, all: bool) -> Result<Vec<String>, String> {
         Ok(self
-            .list_entries()
+            .list_entries(all)
             .await?
             .into_iter()
             .map(|entry| {
@@ -437,7 +472,7 @@ impl SessionManager {
                     chrono::DateTime::<chrono::Utc>::from_timestamp_millis(entry.updated_at_ms)
                         .map_or_else(|| entry.updated_at_ms.to_string(), |time| time.to_rfc3339());
                 format!(
-                    "{}{}  {}  {}  [{}{}]",
+                    "{}{}  {}  {}  [{}{}]{}",
                     if entry.active { "* " } else { "  " },
                     entry.id,
                     time,
@@ -447,16 +482,22 @@ impl SessionManager {
                         "，工具状态未确认"
                     } else {
                         ""
+                    },
+                    if all {
+                        format!("  {}", entry.workspace)
+                    } else {
+                        String::new()
                     }
                 )
             })
             .collect())
     }
 
-    pub(super) async fn list_entries(&self) -> Result<Vec<SessionEntry>, String> {
+    pub(crate) async fn list_entries(&self, all: bool) -> Result<Vec<SessionEntry>, String> {
         let mut entries: HashMap<String, SessionEntry> = HashMap::new();
         if let Some(runtime) = &self.runtime_template {
-            match runtime.list().await {
+            let workspace = (!all).then_some(&self.active.workspace);
+            match runtime.list(workspace).await {
                 Ok(records) => {
                     for record in records {
                         entries.insert(
@@ -468,6 +509,7 @@ impl SessionManager {
                                 status: "已保存".to_owned(),
                                 active: false,
                                 uncertain_tools: record.uncertain_tools,
+                                workspace: record.workspace,
                             },
                         );
                     }
@@ -477,7 +519,10 @@ impl SessionManager {
                 }
             }
         }
-        for state in std::iter::once(&self.active).chain(self.parked.values()) {
+        for state in std::iter::once(&self.active)
+            .chain(self.parked.values())
+            .filter(|state| all || state.workspace == self.active.workspace)
+        {
             entries.insert(
                 state.id.clone(),
                 SessionEntry {
@@ -493,6 +538,7 @@ impl SessionManager {
                         .runtime
                         .as_ref()
                         .is_some_and(SessionRuntime::uncertain_tools),
+                    workspace: state.workspace.as_str(),
                 },
             );
         }
@@ -617,7 +663,7 @@ mod tests {
     use super::*;
     use crate::{
         config::{OpenAiApi, TraceDatabase, TraceDatabaseConfig},
-        provider::ModelStep,
+        provider::{Messages, ModelStep},
     };
 
     fn reply(text: &str) -> ModelStep {
@@ -629,10 +675,81 @@ mod tests {
         }
     }
 
+    fn workspace(path: &str) -> Workspace {
+        std::fs::create_dir_all(path).unwrap();
+        Workspace::from_stored(path).unwrap()
+    }
+
+    fn context(label: &str) -> PromptContext {
+        PromptContext::for_test(label)
+    }
+
+    fn system_prompt(prompt: &Prompt) -> String {
+        match prompt.messages() {
+            Messages::Chat(messages) => serde_json::to_value(messages).unwrap()[0]["content"]
+                .as_str()
+                .unwrap()
+                .to_owned(),
+            Messages::Responses { instructions, .. } => instructions,
+        }
+    }
+
+    #[tokio::test]
+    async fn workspace_switch_rebuilds_both_protocol_prompts_and_deleted_target_is_atomic() {
+        for api in [OpenAiApi::ChatCompletions, OpenAiApi::Responses] {
+            let root =
+                std::env::temp_dir().join(format!("geer-session-workspaces-{}", Uuid::new_v4()));
+            let path_a = root.join("workspace A");
+            let path_b = root.join("工作区 B");
+            std::fs::create_dir_all(&path_a).unwrap();
+            std::fs::create_dir_all(&path_b).unwrap();
+            let workspace_a = Workspace::from_stored(path_a.to_str().unwrap()).unwrap();
+            let workspace_b = Workspace::from_stored(path_b.to_str().unwrap()).unwrap();
+            let mut manager =
+                SessionManager::new(api, context("system"), workspace_a.clone(), None);
+            let id_a = manager.active.id.clone();
+            manager.active.prompt.begin_turn("A history");
+            manager.active.prompt.finish_turn(reply("A answer"));
+            assert!(system_prompt(&manager.active.prompt).contains(&workspace_a.as_str()));
+
+            let id_b = manager.set_workspace(workspace_b.clone()).await.unwrap();
+            assert_ne!(id_a, id_b);
+            assert!(manager.active.prompt.transcript().is_empty());
+            let prompt_b = system_prompt(&manager.active.prompt);
+            assert!(prompt_b.contains(&workspace_b.as_str()));
+            assert!(!prompt_b.contains(&workspace_a.as_str()));
+            manager.active.prompt.begin_turn("B history");
+            manager.active.prompt.finish_turn(reply("B answer"));
+
+            assert_eq!(manager.list_entries(false).await.unwrap().len(), 1);
+            assert_eq!(manager.list_entries(true).await.unwrap().len(), 2);
+            assert_eq!(manager.open(&id_a).await.unwrap(), Some(false));
+            assert_eq!(manager.active.workspace, workspace_a);
+            assert!(system_prompt(&manager.active.prompt).contains(&path_a.display().to_string()));
+            assert_eq!(manager.active.prompt.transcript()[0].text, "A history");
+
+            std::fs::remove_dir_all(&path_b).unwrap();
+            let before_id = manager.active.id.clone();
+            let before_prompt = serde_json::to_value(manager.active.prompt.snapshot()).unwrap();
+            assert!(manager.open(&id_b).await.unwrap_err().contains("无法访问"));
+            assert_eq!(manager.active.id, before_id);
+            assert_eq!(
+                serde_json::to_value(manager.active.prompt.snapshot()).unwrap(),
+                before_prompt
+            );
+            std::fs::remove_dir_all(root).unwrap();
+        }
+    }
+
     #[tokio::test]
     async fn memory_switch_preserves_each_prompt_summary_bias_and_pending_events() {
         for api in [OpenAiApi::ChatCompletions, OpenAiApi::Responses] {
-            let mut manager = SessionManager::new(api, "current system".into(), None);
+            let mut manager = SessionManager::new(
+                api,
+                context("current system"),
+                workspace("/tmp/geer-memory-workspace"),
+                None,
+            );
             let a = manager.active.id.clone();
             manager.active.prompt.begin_turn("A-first");
             manager.active.prompt.finish_turn(reply("A-answer"));
@@ -680,8 +797,8 @@ mod tests {
             let before = manager.active.id.clone();
             assert!(manager.open("missing").await.is_err());
             assert_eq!(manager.active.id, before);
-            let listed = manager.list().await.unwrap();
-            let structured = manager.list_entries().await.unwrap();
+            let listed = manager.list(false).await.unwrap();
+            let structured = manager.list_entries(false).await.unwrap();
             assert_eq!(structured.len(), 2);
             assert!(structured.iter().any(|entry| entry.id == b && entry.active));
             assert!(
@@ -714,14 +831,17 @@ mod tests {
         let store = SessionStore::connect(&config).await.unwrap();
         let runtime = SessionRuntime::new(
             store.clone(),
-            "/tmp/test-workspace".into(),
             "chat-completions".into(),
             "test-model".into(),
             "https://example.test/v1",
             vec![],
         );
-        let mut manager =
-            SessionManager::new(OpenAiApi::ChatCompletions, "system".into(), Some(runtime));
+        let mut manager = SessionManager::new(
+            OpenAiApi::ChatCompletions,
+            context("system"),
+            workspace("/tmp/test-workspace"),
+            Some(runtime),
+        );
         let a = manager.active.id.clone();
         manager.active.prompt.begin_turn("A-private");
         manager.active.prompt.finish_turn(reply("A-answer"));
@@ -732,7 +852,7 @@ mod tests {
         assert_eq!(manager.parked[&a].prompt.pending_events().len(), 2);
         assert!(
             manager
-                .list()
+                .list(false)
                 .await
                 .unwrap()
                 .iter()
@@ -767,7 +887,7 @@ mod tests {
         assert_eq!(manager.unsaved_ids(), vec![a.clone()]);
         assert!(
             manager
-                .list()
+                .list(false)
                 .await
                 .unwrap()
                 .iter()
@@ -777,7 +897,81 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn invalid_or_foreign_snapshot_does_not_change_active_state() {
+    async fn failed_save_before_workspace_switch_retries_with_original_workspace() {
+        let root = std::env::temp_dir().join(format!("geer-session-retry-{}", Uuid::new_v4()));
+        let path_a = root.join("workspace A");
+        let path_b = root.join("workspace B");
+        let workspace_a = workspace(path_a.to_str().unwrap());
+        let workspace_b = workspace(path_b.to_str().unwrap());
+        let config = TraceDatabaseConfig {
+            kind: TraceDatabase::Sqlite,
+            url: format!(
+                "sqlite://{}?mode=rwc",
+                root.join("sessions.sqlite").display()
+            ),
+        };
+        let store = SessionStore::connect(&config).await.unwrap();
+        let runtime = SessionRuntime::new(
+            store.clone(),
+            "chat-completions".into(),
+            "test-model".into(),
+            "https://example.test/v1",
+            vec![],
+        );
+        let mut manager = SessionManager::new(
+            OpenAiApi::ChatCompletions,
+            context("system"),
+            workspace_a.clone(),
+            Some(runtime.fresh()),
+        );
+        let a = manager.active.id.clone();
+        manager.active.prompt.begin_turn("A-private");
+        manager.active.prompt.finish_turn(reply("A-answer"));
+        manager.active.changed();
+        manager.active.runtime.as_mut().unwrap().fail_next_save = true;
+
+        let b = manager.set_workspace(workspace_b.clone()).await.unwrap();
+        assert!(store.load(&a).await.unwrap().is_none());
+        assert!(manager.unsaved_ids().contains(&a));
+        assert_eq!(manager.parked[&a].workspace, workspace_a);
+        manager.active.prompt.begin_turn("B-private");
+        manager.active.prompt.finish_turn(reply("B-answer"));
+        manager.active.changed();
+
+        let results = manager.save_all().await;
+        assert!(results.contains(&(a.clone(), SaveStatus::Saved)));
+        assert!(results.contains(&(b.clone(), SaveStatus::Saved)));
+        let record_a = store.load(&a).await.unwrap().unwrap();
+        assert_eq!(record_a.workspace, workspace_a.as_str());
+        assert_eq!(store.history(&record_a).await.unwrap().len(), 2);
+        assert_eq!(
+            store.load(&b).await.unwrap().unwrap().workspace,
+            workspace_b.as_str()
+        );
+        let all = manager.list_entries(true).await.unwrap();
+        assert_eq!(all.len(), 2);
+        assert!(
+            all.iter()
+                .any(|entry| entry.id == a && entry.workspace == workspace_a.as_str())
+        );
+        assert_eq!(manager.list_entries(false).await.unwrap().len(), 1);
+
+        let mut restarted = SessionManager::new(
+            OpenAiApi::ChatCompletions,
+            context("system"),
+            workspace_b.clone(),
+            Some(runtime),
+        );
+        let current_id = restarted.active.id.clone();
+        std::fs::remove_dir_all(&path_a).unwrap();
+        assert!(restarted.open(&a).await.unwrap_err().contains("无法访问"));
+        assert_eq!(restarted.active.id, current_id);
+        assert_eq!(restarted.active.workspace, workspace_b);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn invalid_snapshot_does_not_change_active_state_and_foreign_workspace_opens() {
         let path =
             std::env::temp_dir().join(format!("geer-session-invalid-{}.sqlite", Uuid::new_v4()));
         let config = TraceDatabaseConfig {
@@ -787,14 +981,17 @@ mod tests {
         let store = SessionStore::connect(&config).await.unwrap();
         let runtime = SessionRuntime::new(
             store.clone(),
-            "/tmp/workspace-a".into(),
             "responses".into(),
             "test-model".into(),
             "https://example.test/v1",
             vec![],
         );
-        let mut source =
-            SessionManager::new(OpenAiApi::Responses, "system".into(), Some(runtime.fresh()));
+        let mut source = SessionManager::new(
+            OpenAiApi::Responses,
+            context("system"),
+            workspace("/tmp/workspace-a"),
+            Some(runtime.fresh()),
+        );
         let saved_id = source.active.id.clone();
         source.active.prompt.begin_turn("saved input");
         source.active.prompt.finish_turn(reply("saved answer"));
@@ -803,7 +1000,8 @@ mod tests {
 
         let mut compatible = SessionManager::new(
             OpenAiApi::Responses,
-            "restored system".into(),
+            context("restored system"),
+            workspace("/tmp/workspace-b"),
             Some(runtime.fresh()),
         );
         assert!(compatible.open(&saved_id).await.is_ok());
@@ -818,45 +1016,46 @@ mod tests {
             ["saved input", "saved answer"]
         );
 
-        let foreign = SessionRuntime::new(
-            store.clone(),
-            "/tmp/workspace-b".into(),
-            "responses".into(),
-            "test-model".into(),
-            "https://example.test/v1",
-            vec![],
+        assert_eq!(compatible.active.workspace, workspace("/tmp/workspace-a"));
+
+        let mut manager = SessionManager::new(
+            OpenAiApi::Responses,
+            context("current system"),
+            workspace("/tmp/workspace-b"),
+            Some(runtime.fresh()),
         );
-        let mut manager =
-            SessionManager::new(OpenAiApi::Responses, "current system".into(), Some(foreign));
         let current_id = manager.active.id.clone();
         manager.active.prompt.begin_turn("local input");
         let original = serde_json::to_value(manager.active.prompt.snapshot()).unwrap();
-        assert!(
-            manager
-                .open(&saved_id)
-                .await
-                .unwrap_err()
-                .contains("不兼容")
-        );
-        assert_eq!(manager.active.id, current_id);
+        assert_eq!(manager.open(&saved_id).await.unwrap(), Some(false));
+        assert_eq!(manager.active.workspace, workspace("/tmp/workspace-a"));
+        assert_eq!(manager.open(&current_id).await.unwrap(), Some(false));
         assert_eq!(
             serde_json::to_value(manager.active.prompt.snapshot()).unwrap(),
             original
         );
-        assert!(store.load(&current_id).await.unwrap().is_none());
+        let current_revision = store.load(&current_id).await.unwrap().unwrap().revision;
 
         let mut corrupted = store.load(&saved_id).await.unwrap().unwrap();
+        let expected_revision = corrupted.revision;
         corrupted.revision += 1;
         corrupted.snapshot = Value::Null;
-        store.save(&corrupted, &[], Some(0)).await.unwrap();
+        store
+            .save(&corrupted, &[], Some(expected_revision))
+            .await
+            .unwrap();
         manager.runtime_template = Some(runtime);
+        manager.parked.remove(&saved_id);
         assert!(manager.open(&saved_id).await.unwrap_err().contains("快照"));
         assert_eq!(manager.active.id, current_id);
         assert_eq!(
             serde_json::to_value(manager.active.prompt.snapshot()).unwrap(),
             original
         );
-        assert!(store.load(&current_id).await.unwrap().is_none());
+        assert_eq!(
+            store.load(&current_id).await.unwrap().unwrap().revision,
+            current_revision
+        );
         let _ = std::fs::remove_file(path);
     }
 
@@ -871,24 +1070,24 @@ mod tests {
         let store = SessionStore::connect(&config).await.unwrap();
         let mut runtime = SessionRuntime::new(
             store,
-            "/tmp/test-workspace".into(),
             "chat-completions".into(),
             "test-model".into(),
             "https://user:pass@example.test/v1?key=hidden",
             vec!["known-key".into(), config.url.clone()],
         );
         let id = Uuid::new_v4().to_string();
+        let workspace = workspace("/tmp/test-workspace");
         let mut prompt = Prompt::new(OpenAiApi::ChatCompletions, "fresh system".into());
         prompt.begin_turn("Authorization: Bearer my-secret\nX-API-Key: extra-secret\nknown-key");
         prompt.finish_turn(reply("first answer"));
         runtime.fail_next_save = true;
-        runtime.save(&id, &mut prompt, false).await;
+        runtime.save(&id, &workspace, &mut prompt, false).await;
         assert!(runtime.store.load(&id).await.unwrap().is_none());
         assert_eq!(prompt.pending_events().len(), 2);
 
         prompt.begin_turn("second");
         prompt.finish_turn(reply("second answer"));
-        runtime.save(&id, &mut prompt, false).await;
+        runtime.save(&id, &workspace, &mut prompt, false).await;
         let record = runtime.store.load(&id).await.unwrap().unwrap();
         assert_eq!(record.revision, 0);
         assert_eq!(runtime.store.history(&record).await.unwrap().len(), 4);
@@ -896,7 +1095,7 @@ mod tests {
         assert!(!record.snapshot.to_string().contains("extra-secret"));
         assert!(!record.snapshot.to_string().contains("known-key"));
         assert_eq!(record.endpoint, "https://example.test/v1");
-        let (_, snapshot, display_events) = runtime.load(&id).await.unwrap();
+        let (_, _, snapshot, display_events) = runtime.load(&id).await.unwrap();
         let mut recovered = Prompt::new(OpenAiApi::ChatCompletions, "new system".into());
         recovered.restore(snapshot).unwrap();
         recovered.restore_display_events(display_events);
@@ -912,16 +1111,15 @@ mod tests {
         let store = SessionStore::connect(&config).await.unwrap();
         let mut restarted = SessionRuntime::new(
             store,
-            "/tmp/test-workspace".into(),
             "chat-completions".into(),
             "test-model".into(),
             "https://example.test/v1",
             vec!["known-key".into(), config.url.clone()],
         );
-        let (record, _, _) = restarted.load(&id).await.unwrap();
+        let (record, _, _, _) = restarted.load(&id).await.unwrap();
         restarted.adopt(&record);
         recovered.begin_turn("third");
-        restarted.save(&id, &mut recovered, true).await;
+        restarted.save(&id, &workspace, &mut recovered, true).await;
         assert_eq!(
             restarted.store.load(&id).await.unwrap().unwrap().revision,
             1

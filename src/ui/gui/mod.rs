@@ -8,6 +8,7 @@ use tauri::{Manager, WindowEvent};
 pub(super) fn run() -> Result<(), Box<dyn Error>> {
     tauri::Builder::default()
         .plugin(tauri_plugin_clipboard_manager::init())
+        .plugin(tauri_plugin_dialog::init())
         .invoke_handler(tauri::generate_handler![
             bridge::gui_connect,
             bridge::gui_submit,

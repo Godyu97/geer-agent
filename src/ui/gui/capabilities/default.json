@@ -3,5 +3,5 @@
   "identifier": "default",
   "description": "Main geer-agent window",
   "windows": ["main"],
-  "permissions": ["core:default", "core:window:allow-close", "clipboard-manager:allow-write-text"]
+  "permissions": ["core:default", "core:window:allow-close", "clipboard-manager:allow-write-text", "dialog:allow-open"]
 }

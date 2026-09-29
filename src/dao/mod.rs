@@ -65,6 +65,13 @@ impl SessionStore {
         }
     }
 
+    pub(crate) async fn list_all(&self) -> Result<Vec<SessionRecord>, TraceError> {
+        match self {
+            Self::Sql(store) => store.list_all_sessions().await,
+            Self::Mongo(store) => store.list_all_sessions().await,
+        }
+    }
+
     pub(crate) async fn history(
         &self,
         record: &SessionRecord,
@@ -413,6 +420,23 @@ mod tests {
                 .iter()
                 .any(|item| item.id == id)
         );
+        let mut other = first.clone();
+        other.id = Uuid::new_v4().to_string();
+        other.workspace = "/tmp/workspace-b".into();
+        other.head_event_id = None;
+        other.updated_at_ms = 200;
+        store.save(&other, &[], None).await.unwrap();
+        assert!(
+            store
+                .list("/tmp/workspace-b")
+                .await
+                .unwrap()
+                .iter()
+                .any(|item| item.id == other.id)
+        );
+        let all = store.list_all().await.unwrap();
+        assert!(all.iter().any(|item| item.id == id));
+        assert!(all.iter().any(|item| item.id == other.id));
         let mut newer = first.clone();
         newer.revision = 1;
         newer.updated_at_ms = 101;

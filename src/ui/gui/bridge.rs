@@ -23,7 +23,7 @@ use crate::{
 pub(super) enum GuiEvent {
     Snapshot {
         request_id: Option<u64>,
-        snapshot: GuiSnapshot,
+        snapshot: Box<GuiSnapshot>,
         notice: Option<String>,
         error: Option<String>,
     },
@@ -64,6 +64,7 @@ pub(super) enum GuiEvent {
 pub(super) struct GuiSnapshot {
     status: SessionStatus,
     sessions: Vec<SessionEntry>,
+    all_sessions: Vec<SessionEntry>,
     transcript: Vec<TranscriptEntry>,
     unsaved_ids: Vec<String>,
 }
@@ -340,7 +341,7 @@ fn send_snapshot(
     notice: Option<String>,
     error: Option<String>,
 ) {
-    let sessions = match runtime.block_on(agent.session_entries()) {
+    let sessions = match runtime.block_on(agent.session_entries(false)) {
         Ok(sessions) => sessions,
         Err(error) => {
             bus.send(GuiEvent::Diagnostic {
@@ -349,14 +350,24 @@ fn send_snapshot(
             Vec::new()
         }
     };
+    let all_sessions = match runtime.block_on(agent.session_entries(true)) {
+        Ok(sessions) => sessions,
+        Err(error) => {
+            bus.send(GuiEvent::Diagnostic {
+                message: format!("全部会话列表读取失败：{error}"),
+            });
+            Vec::new()
+        }
+    };
     bus.send(GuiEvent::Snapshot {
         request_id,
-        snapshot: GuiSnapshot {
+        snapshot: Box::new(GuiSnapshot {
             status: agent.status(),
             sessions,
+            all_sessions,
             transcript: agent.transcript(),
             unsaved_ids: agent.unsaved_ids(),
-        },
+        }),
         notice,
         error,
     });

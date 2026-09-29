@@ -508,6 +508,17 @@ impl SqlStore {
             .map(|rows| rows.into_iter().map(from_session_model).collect())
             .map_err(|_| TraceError("SQL 会话列表读取失败".into()))
     }
+
+    pub(super) async fn list_all_sessions(&self) -> Result<Vec<SessionRecord>, TraceError> {
+        session_entity::Entity::find()
+            .order_by_desc(session_entity::Column::UpdatedAtMs)
+            .order_by_desc(session_entity::Column::Id)
+            .limit(20)
+            .all(&self.db)
+            .await
+            .map(|rows| rows.into_iter().map(from_session_model).collect())
+            .map_err(|_| TraceError("SQL 会话列表读取失败".into()))
+    }
 }
 
 fn from_session_model(row: session_entity::Model) -> SessionRecord {

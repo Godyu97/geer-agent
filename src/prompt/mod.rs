@@ -12,19 +12,44 @@ pub(crate) use conversation::{CompactionPlan, Prompt, PromptSnapshot, RawEvent};
 
 const BASH_VERSION_TIMEOUT: Duration = Duration::from_secs(3);
 
-pub(crate) async fn load(bash_bin: &Path) -> io::Result<String> {
-    let bash_version = bash_version(bash_bin).await?;
-    let current_dir = std::env::current_dir()?;
-    Ok(compose(
-        &system_version().await,
-        &bash_version,
-        &current_dir.display().to_string(),
-    ))
+#[derive(Clone)]
+pub(crate) struct PromptContext {
+    system_version: String,
+    bash_version: String,
+}
+
+impl PromptContext {
+    pub(crate) async fn load(bash_bin: &Path) -> io::Result<Self> {
+        Ok(Self {
+            system_version: system_version().await,
+            bash_version: bash_version(bash_bin).await?,
+        })
+    }
+
+    pub(crate) fn compose(&self, workspace: &Path) -> String {
+        compose(
+            &self.system_version,
+            &self.bash_version,
+            &workspace.display().to_string(),
+        )
+    }
+
+    #[cfg(test)]
+    pub(crate) fn for_test(system_version: &str) -> Self {
+        Self {
+            system_version: system_version.to_owned(),
+            bash_version: "GNU bash, version test".to_owned(),
+        }
+    }
 }
 
 async fn bash_version(bash_bin: &Path) -> io::Result<String> {
     let mut command = Command::new(bash_bin);
-    command.arg("--version").kill_on_drop(true);
+    // 中文等本地化环境会把首行翻译成「GNU bash，版本」，固定 C locale 才能稳定识别。
+    command
+        .arg("--version")
+        .env("LC_ALL", "C")
+        .kill_on_drop(true);
     let output = timeout(BASH_VERSION_TIMEOUT, command.output())
         .await
         .map_err(|_| {

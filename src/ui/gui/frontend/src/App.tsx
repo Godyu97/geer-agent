@@ -12,6 +12,7 @@ import remarkGfm from "remark-gfm";
 import { Channel, invoke } from "@tauri-apps/api/core";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { writeText } from "@tauri-apps/plugin-clipboard-manager";
+import { open } from "@tauri-apps/plugin-dialog";
 import {
   applyEvent,
   groupTranscript,
@@ -152,12 +153,18 @@ export default function App() {
   const [input, setInput] = useState("");
   const [visibleCount, setVisibleCount] = useState(120);
   const [localError, setLocalError] = useState<string | null>(null);
+  const [workspaceEditing, setWorkspaceEditing] = useState(false);
+  const [workspaceInput, setWorkspaceInput] = useState("");
+  const [sessionScope, setSessionScope] = useState<"current" | "all">(
+    "current",
+  );
   const nextRequest = useRef(1);
   const current = useRef(state);
   current.current = state;
   const stream = useRef<HTMLDivElement>(null);
   const followBottom = useRef(true);
   const lastSession = useRef<string | null>(null);
+  const lastWorkspace = useRef<string | null>(null);
   const prependHeight = useRef<number | null>(null);
 
   useEffect(() => {
@@ -169,6 +176,7 @@ export default function App() {
   }, []);
 
   const sessionId = state.snapshot?.status.session_id ?? null;
+  const workspace = state.snapshot?.status.workspace ?? null;
   useEffect(() => {
     if (sessionId !== lastSession.current) {
       followBottom.current = true;
@@ -176,6 +184,25 @@ export default function App() {
       setVisibleCount(120);
     }
   }, [sessionId]);
+  useEffect(() => {
+    if (workspace && workspace !== lastWorkspace.current) {
+      lastWorkspace.current = workspace;
+      setWorkspaceInput(workspace);
+      setWorkspaceEditing(false);
+      setLocalError(null);
+    }
+  }, [workspace]);
+  useEffect(() => {
+    if (
+      workspaceEditing &&
+      !state.pending &&
+      state.notice?.startsWith("Workspace 未改变")
+    ) {
+      setWorkspaceInput(workspace ?? "");
+      setWorkspaceEditing(false);
+      setLocalError(null);
+    }
+  }, [state.notice, state.pending, workspace, workspaceEditing]);
   useLayoutEffect(() => {
     if (prependHeight.current !== null && stream.current) {
       stream.current.scrollTop +=
@@ -188,7 +215,7 @@ export default function App() {
       stream.current.scrollTop = stream.current.scrollHeight;
   }, [state.snapshot?.transcript, state.live, state.liveTools, sessionId]);
 
-  async function submit(line: string) {
+  async function submit(line: string, clearComposer = true) {
     if (
       !line.trim() ||
       !current.current.snapshot ||
@@ -210,7 +237,7 @@ export default function App() {
     setLocalError(null);
     try {
       await invoke("gui_submit", { requestId: pending.id, line: pending.line });
-      setInput("");
+      if (clearComposer) setInput("");
     } catch (error) {
       current.current = { ...current.current, pending: null };
       dispatch({
@@ -231,6 +258,20 @@ export default function App() {
       setLocalError(String(error));
     }
     dispatch({ type: "authorization_cleared" });
+  }
+
+  async function browseWorkspace() {
+    setLocalError(null);
+    try {
+      const selected = await open({
+        directory: true,
+        multiple: false,
+        defaultPath: workspaceInput || status?.workspace,
+      });
+      if (typeof selected === "string") setWorkspaceInput(selected);
+    } catch (error) {
+      setLocalError(String(error));
+    }
   }
 
   async function retryClose() {
@@ -262,6 +303,10 @@ export default function App() {
       )
     : 0;
   const isChat = state.pending && !state.pending.line.startsWith("/");
+  const displayedSessions =
+    sessionScope === "all"
+      ? (state.snapshot?.all_sessions ?? [])
+      : (state.snapshot?.sessions ?? []);
 
   return (
     <div className="app-shell">
@@ -275,6 +320,67 @@ export default function App() {
             <small>Desktop workspace</small>
           </div>
         </div>
+        <div className="workspace-card">
+          <div className="workspace-heading">
+            <span>WORKSPACE</span>
+            {!workspaceEditing && (
+              <button
+                disabled={disabled}
+                onClick={() => {
+                  setWorkspaceInput(status?.workspace ?? "");
+                  setLocalError(null);
+                  setWorkspaceEditing(true);
+                }}
+              >
+                更改
+              </button>
+            )}
+          </div>
+          {workspaceEditing ? (
+            <div className="workspace-editor">
+              <input
+                aria-label="Workspace 路径"
+                value={workspaceInput}
+                disabled={disabled}
+                onChange={(event) => setWorkspaceInput(event.target.value)}
+              />
+              <div className="workspace-actions">
+                <button disabled={disabled} onClick={() => void browseWorkspace()}>
+                  浏览
+                </button>
+                <button
+                  className="workspace-confirm"
+                  disabled={disabled || !workspaceInput.trim()}
+                  onClick={() =>
+                    void submit(`/workspace ${workspaceInput.trim()}`, false)
+                  }
+                >
+                  切换并新建会话
+                </button>
+              </div>
+              {(localError || state.error) && (
+                <small className="workspace-error">
+                  {localError || state.error}
+                </small>
+              )}
+              <button
+                className="workspace-cancel"
+                disabled={disabled}
+                onClick={() => {
+                  setWorkspaceInput(status?.workspace ?? "");
+                  setLocalError(null);
+                  setWorkspaceEditing(false);
+                }}
+              >
+                取消
+              </button>
+            </div>
+          ) : (
+            <strong className="workspace-path" title={status?.workspace}>
+              {status?.workspace ?? "正在读取…"}
+            </strong>
+          )}
+        </div>
         <button
           className="new-session"
           disabled={disabled}
@@ -282,11 +388,25 @@ export default function App() {
         >
           ＋ 新建会话
         </button>
-        <div className="section-title">
-          会话 <span>{state.snapshot?.sessions.length ?? 0}</span>
+        <div className="section-title session-title">
+          <span>会话 {displayedSessions.length}</span>
+          <span className="scope-toggle" role="group" aria-label="会话范围">
+            <button
+              className={sessionScope === "current" ? "active" : ""}
+              onClick={() => setSessionScope("current")}
+            >
+              当前
+            </button>
+            <button
+              className={sessionScope === "all" ? "active" : ""}
+              onClick={() => setSessionScope("all")}
+            >
+              全部
+            </button>
+          </span>
         </div>
         <div className="session-list">
-          {state.snapshot?.sessions.map((session) => (
+          {displayedSessions.map((session) => (
             <button
               key={session.id}
               disabled={disabled}
@@ -301,6 +421,9 @@ export default function App() {
                   {new Date(session.updated_at_ms).toLocaleString()} ·{" "}
                   {session.status}
                 </small>
+                {sessionScope === "all" && (
+                  <small title={session.workspace}>{session.workspace}</small>
+                )}
               </span>
               {session.uncertain_tools && <span title="工具状态未确认">!</span>}
             </button>
@@ -420,7 +543,7 @@ export default function App() {
                   <pre>{state.notice}</pre>
                 </div>
               )}
-              {(localError || state.error) && (
+              {!workspaceEditing && (localError || state.error) && (
                 <div className="error-banner">{localError || state.error}</div>
               )}
               {state.diagnostics.length > 0 && (

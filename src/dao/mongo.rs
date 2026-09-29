@@ -182,6 +182,20 @@ impl MongoStore {
         Ok(docs.into_iter().map(|doc| doc.record).collect())
     }
 
+    pub(super) async fn list_all_sessions(&self) -> Result<Vec<SessionRecord>, TraceError> {
+        let docs: Vec<SessionDocument> = self
+            .sessions
+            .find(doc! {})
+            .sort(doc! {"record.updated_at_ms": -1, "_id": -1})
+            .limit(20)
+            .await
+            .map_err(|_| TraceError("MongoDB 会话列表读取失败".into()))?
+            .try_collect()
+            .await
+            .map_err(|_| TraceError("MongoDB 会话列表读取失败".into()))?;
+        Ok(docs.into_iter().map(|doc| doc.record).collect())
+    }
+
     pub(super) async fn insert_one(&self, record: &TraceRecord) -> Result<(), TraceError> {
         self.collection
             .insert_one(TraceDocument::from(record))

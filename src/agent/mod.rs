@@ -1,7 +1,6 @@
 //! 主业务：提供会话能力，不选择具体界面。
 
 mod guard;
-mod session;
 
 use serde_json::{Value, json};
 use std::{
@@ -13,21 +12,21 @@ use std::{
 use tokio::time::{Instant, timeout_at};
 use uuid::Uuid;
 
+#[cfg(feature = "gui")]
+pub(crate) use crate::session::SessionEntry;
 use crate::{
     config::{CompactionConfig, Config, DEFAULT_RESOURCE_LIMITS, OpenAiApi, ResourceLimits},
     dao::{SessionStore, TraceStore},
-    interaction::{Session, SessionStatus, Usage, emit_diagnostic},
+    interaction::{Session, SessionScope, SessionStatus, Usage, emit_diagnostic},
     prompt::{self, Prompt},
     provider::{ChatProvider, TokenUsage, ToolSpec, openai::Provider},
+    session::{SessionManager, SessionRuntime, Workspace},
     tools::Tools,
     trace::{
         TraceCapture, TraceRecord, TraceStatus, TraceWriter, now_unix_ms, redact_json, redact_text,
     },
 };
 use guard::{LoopGuard, StopReason, call_fingerprint, result_fingerprint};
-#[cfg(feature = "gui")]
-pub(crate) use session::SessionEntry;
-use session::{SessionManager, SessionRuntime};
 
 static NEXT_RUN_ID: AtomicU64 = AtomicU64::new(0);
 
@@ -356,14 +355,10 @@ pub(crate) async fn create() -> Result<Agent, Box<dyn Error>> {
     } else {
         None
     };
-    let workspace = std::env::current_dir()?
-        .canonicalize()?
-        .to_string_lossy()
-        .into_owned();
+    let workspace = Workspace::current().map_err(io::Error::other)?;
     let session_runtime = session_store.map(|store| {
         SessionRuntime::new(
             store,
-            workspace.clone(),
             config.api.as_str().to_owned(),
             config.model.clone(),
             &config.base_url,
@@ -380,7 +375,7 @@ pub(crate) async fn create() -> Result<Agent, Box<dyn Error>> {
             ],
         )
     });
-    let system_prompt = prompt::load(&config.bash_bin).await?;
+    let prompt_context = prompt::PromptContext::load(&config.bash_bin).await?;
     let agent = Agent {
         chat: Provider::new(&config),
         tools: Tools::new(config.tools_enabled, config.bash_bin.clone())?,
@@ -390,7 +385,7 @@ pub(crate) async fn create() -> Result<Agent, Box<dyn Error>> {
         },
         compaction: config.compaction,
         model: config.model.clone(),
-        sessions: SessionManager::new(config.api, system_prompt, session_runtime),
+        sessions: SessionManager::new(config.api, prompt_context, workspace, session_runtime),
         trace_store,
         api: config.api,
         api_key: config.api_key.clone(),
@@ -439,9 +434,12 @@ impl Agent {
     }
 
     #[cfg(feature = "gui")]
-    pub(crate) async fn session_entries(&self) -> Result<Vec<SessionEntry>, Box<dyn Error>> {
+    pub(crate) async fn session_entries(
+        &self,
+        all: bool,
+    ) -> Result<Vec<SessionEntry>, Box<dyn Error>> {
         self.sessions
-            .list_entries()
+            .list_entries(all)
             .await
             .map_err(|error| io::Error::other(error).into())
     }
@@ -479,12 +477,17 @@ impl Session for Agent {
         &self.sessions.active.id
     }
 
+    fn workspace(&self) -> String {
+        self.sessions.active.workspace.as_str()
+    }
+
     fn status(&self) -> SessionStatus {
         let state = &self.sessions.active;
         let specs = tool_specs(&self.tools);
         SessionStatus {
             model: self.model.clone(),
             session_id: state.id.clone(),
+            workspace: state.workspace.as_str(),
             context_tokens: state
                 .prompt
                 .estimated_context_tokens(tool_specs_size(&specs), None)
@@ -511,7 +514,9 @@ impl Session for Agent {
         state.prompt.begin_turn(input);
         state.changed();
         if let Some(session) = state.runtime.as_mut() {
-            session.save(&state.id, &mut state.prompt, false).await;
+            session
+                .save(&state.id, &state.workspace, &mut state.prompt, false)
+                .await;
         }
         let trace = TraceContext {
             session_id: &state.id,
@@ -550,6 +555,7 @@ impl Session for Agent {
             Some(&trace),
             self.compaction,
             &mut state.context_token_bias,
+            &state.workspace,
             state.runtime.as_mut(),
             &state.id,
         )
@@ -572,6 +578,18 @@ impl Session for Agent {
         self.tools.reset();
         self.turn_tokens = 0;
         id
+    }
+
+    async fn set_workspace(&mut self, path: &str) -> Result<String, Box<dyn Error>> {
+        let workspace =
+            Workspace::parse(path, &self.sessions.active.workspace).map_err(io::Error::other)?;
+        let display = workspace.as_str();
+        let Some(id) = self.sessions.set_workspace(workspace).await else {
+            return Ok(format!("Workspace 未改变：{display}"));
+        };
+        self.tools.reset();
+        self.turn_tokens = 0;
+        Ok(format!("已切换 workspace：{display}\nSession ID: {id}"))
     }
 
     async fn flush(&mut self) -> String {
@@ -647,9 +665,9 @@ impl Session for Agent {
         Ok(message)
     }
 
-    async fn sessions(&self) -> Result<Vec<String>, Box<dyn Error>> {
+    async fn sessions(&self, scope: SessionScope) -> Result<Vec<String>, Box<dyn Error>> {
         self.sessions
-            .list()
+            .list(scope == SessionScope::All)
             .await
             .map_err(|error| io::Error::other(error).into())
     }
@@ -661,12 +679,13 @@ impl Session for Agent {
             Some(interrupted) => {
                 self.tools.reset();
                 self.turn_tokens = 0;
-                Ok(if interrupted {
+                let message = if interrupted {
                     "已恢复会话；上次工具执行可能已产生副作用，状态未确认。请核对后再继续。"
                         .to_owned()
                 } else {
                     "已恢复会话。".to_owned()
-                })
+                };
+                Ok(format!("{message}\nWorkspace: {}", self.workspace()))
             }
         }
     }
@@ -807,6 +826,7 @@ where
     P: ChatProvider,
     F: FnMut(&str) -> io::Result<()>,
 {
+    let workspace = Workspace::current().map_err(io::Error::other)?;
     run_tool_loop_with_session(
         chat,
         tools,
@@ -818,6 +838,7 @@ where
         trace,
         compaction,
         context_token_bias,
+        &workspace,
         None,
         "",
     )
@@ -836,6 +857,7 @@ async fn run_tool_loop_with_session<P, F>(
     trace: Option<&TraceContext<'_>>,
     compaction: CompactionConfig,
     context_token_bias: &mut u64,
+    workspace: &Workspace,
     mut session: Option<&mut SessionRuntime>,
     session_id: &str,
 ) -> Result<AgentMetrics, Box<dyn Error>>
@@ -912,7 +934,7 @@ where
                         *context_token_bias = 0;
                         failed_prefix = None;
                         if let Some(session) = session.as_deref_mut() {
-                            session.save(session_id, prompt, false).await;
+                            session.save(session_id, workspace, prompt, false).await;
                         }
                         on_delta(&format!(
                             "\n[上下文压缩: {count} 条旧消息，估算 {before} → {after} tokens]\n"
@@ -1017,7 +1039,7 @@ where
                     .await
                 {
                     if let Some(session) = session.as_deref_mut() {
-                        session.save(session_id, prompt, false).await;
+                        session.save(session_id, workspace, prompt, false).await;
                     }
                     *context_token_bias = 0;
                     retried_overflow = true;
@@ -1079,7 +1101,7 @@ where
 
         used_tools = true;
         if let Some(session) = session.as_deref_mut() {
-            session.save(session_id, prompt, true).await;
+            session.save(session_id, workspace, prompt, true).await;
         }
         for call in &step.calls {
             on_delta(&format!("\n[调用工具 {}]\n", call.name))?;
@@ -1089,7 +1111,7 @@ where
             .iter()
             .map(|call| (call.name.as_str(), call.args.as_str()))
             .collect();
-        let executions = tools.execute_batch(&calls).await;
+        let executions = tools.execute_batch_in(workspace.as_path(), &calls).await;
         for (call, execution) in step.calls.iter().zip(&executions) {
             emit_diagnostic(
                 tool_record(&runtime.run_id, runtime.metrics.turns, call, execution).to_string(),
@@ -1108,7 +1130,7 @@ where
             .collect();
         prompt.apply_tool_results(step, &results);
         if let Some(session) = session.as_deref_mut() {
-            session.save(session_id, prompt, false).await;
+            session.save(session_id, workspace, prompt, false).await;
         }
         if let Some(reason) = stop {
             return finalize_without_tools(
@@ -1346,7 +1368,6 @@ fn is_context_overflow(error: &(dyn Error + 'static)) -> bool {
 mod tests {
     use std::{cell::Cell, collections::VecDeque, error::Error, fs, io, rc::Rc, time::SystemTime};
 
-    use super::session::{SessionManager, SessionRuntime};
     use super::{
         Agent, AgentBudget, AgentMetrics, AgentRuntime, DEFAULT_AGENT_BUDGET,
         FINALIZATION_FALLBACK, SOFT_BUDGET_HINT, TerminationReason, TraceContext, run_record,
@@ -1359,10 +1380,11 @@ mod tests {
         },
         dao::{SessionStore, TraceStore},
         interaction::Session,
-        prompt::Prompt,
+        prompt::{Prompt, PromptContext},
         provider::{
             ChatProvider, Messages, ModelStep, TokenUsage, ToolCall, ToolSpec, openai::Provider,
         },
+        session::{SessionManager, SessionRuntime, Workspace},
         tools::{ToolExecution, ToolOutput, Tools},
         trace::{TraceCapture, TraceReader, TraceStatus},
     };
@@ -1473,6 +1495,7 @@ mod tests {
         let mut tools = Tools::new(true, "bash".into()).unwrap();
         let mut prompt = prompt();
         let mut reported = Vec::new();
+        let workspace = Workspace::current().unwrap();
         let metrics = run_tool_loop_with_session(
             &mut provider,
             &mut tools,
@@ -1488,6 +1511,7 @@ mod tests {
             None,
             CompactionConfig::default(),
             &mut 0,
+            &workspace,
             None,
             "",
         )
@@ -1675,9 +1699,12 @@ mod tests {
             url: format!("sqlite://{}?mode=rwc", path.display()),
         };
         let store = SessionStore::connect(&db_config).await.unwrap();
+        let workspace_path =
+            std::env::temp_dir().join(format!("geer-resume-workspace-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&workspace_path).unwrap();
+        let workspace = Workspace::from_stored(workspace_path.to_str().unwrap()).unwrap();
         let mut runtime = SessionRuntime::new(
             store,
-            "/tmp/workspace".into(),
             "chat-completions".into(),
             "test-model".into(),
             "http://example.test/v1",
@@ -1687,7 +1714,9 @@ mod tests {
         let mut prompt = Prompt::new(OpenAiApi::ChatCompletions, "current system".into());
         prompt.begin_turn("hello");
         prompt.finish_turn(text_step("answer"));
-        runtime.save(&saved_id, &mut prompt, false).await;
+        runtime
+            .save(&saved_id, &workspace, &mut prompt, false)
+            .await;
         let config = Config {
             api_key: "test-key".into(),
             model: "test-model".into(),
@@ -1708,7 +1737,12 @@ mod tests {
             budget: DEFAULT_AGENT_BUDGET,
             compaction: config.compaction,
             model: config.model.clone(),
-            sessions: SessionManager::new(config.api, "current system".into(), Some(runtime)),
+            sessions: SessionManager::new(
+                config.api,
+                PromptContext::for_test("current system"),
+                workspace.clone(),
+                Some(runtime),
+            ),
             trace_store: None,
             api: config.api,
             api_key: config.api_key.clone(),
@@ -1752,7 +1786,43 @@ mod tests {
         agent.tools.grant_for_test("read");
         agent.open(&saved_id).await.unwrap();
         assert!(!agent.tools.granted_for_test("read"));
+        agent.tools.grant_for_test("read");
+        let same_id = agent.session_id().to_owned();
+        let same_message = agent.set_workspace(&workspace.as_str()).await.unwrap();
+        assert!(same_message.contains("未改变"));
+        assert_eq!(agent.session_id(), same_id);
+        assert!(agent.tools.granted_for_test("read"));
+        assert!(agent.set_workspace("missing-workspace").await.is_err());
+        assert_eq!(agent.session_id(), same_id);
+        assert!(agent.tools.granted_for_test("read"));
+
+        let other_workspace_path = std::env::temp_dir().join(format!(
+            "geer-resume-workspace-other-{}",
+            uuid::Uuid::new_v4()
+        ));
+        fs::create_dir_all(&other_workspace_path).unwrap();
+        let switched = agent
+            .set_workspace(other_workspace_path.to_str().unwrap())
+            .await
+            .unwrap();
+        assert!(switched.contains("已切换 workspace"));
+        assert_ne!(agent.session_id(), same_id);
+        assert_eq!(
+            agent.status().workspace,
+            fs::canonicalize(&other_workspace_path)
+                .unwrap()
+                .display()
+                .to_string()
+        );
+        assert_eq!(agent.status().turn_tokens, 0);
+        assert_eq!(agent.status().total_tokens, 32);
+        assert!(!agent.tools.granted_for_test("read"));
+        let switched_workspace = agent.status().workspace;
+        agent.new_session().await;
+        assert_eq!(agent.status().workspace, switched_workspace);
         let _ = fs::remove_file(path);
+        let _ = fs::remove_dir_all(workspace_path);
+        let _ = fs::remove_dir_all(other_workspace_path);
     }
 
     async fn run(chat: &mut FakeProvider, prompt: &mut Prompt) -> Result<String, Box<dyn Error>> {

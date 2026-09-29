@@ -7,6 +7,15 @@ pub(super) struct Input {
 }
 
 impl Input {
+    pub(super) fn set(&mut self, value: &str) {
+        self.chars = value.chars().filter(|ch| !ch.is_control()).collect();
+        self.cursor = self.chars.len();
+    }
+
+    pub(super) fn text(&self) -> String {
+        self.chars.iter().collect()
+    }
+
     pub(super) fn insert(&mut self, ch: char) {
         if ch.is_control() {
             return;

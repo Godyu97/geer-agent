@@ -108,6 +108,92 @@ fn run_repl_with_env(
     (output, bodies)
 }
 
+#[test]
+fn repl_workspace_commands_create_isolated_sessions_and_filter_lists() {
+    for api in ["chat-completions", "responses"] {
+        let root = std::env::temp_dir().join(format!("geer-repl-workspace-{}", Uuid::new_v4()));
+        let workspace_a = root.join("workspace A");
+        let workspace_b = root.join("中文 workspace B");
+        std::fs::create_dir_all(&workspace_a).unwrap();
+        std::fs::create_dir_all(&workspace_b).unwrap();
+        let input = format!(
+            "/workspace \"{}\"\n/new\n/workspace \"{}\"\n/sessions\n/sessions --all\n/workspace missing\n/workspace\n/exit\n",
+            workspace_a.display(),
+            workspace_b.display()
+        );
+        let (output, requests) = run_repl(api, vec![], &input);
+        assert!(requests.is_empty());
+        assert!(
+            output.status.success(),
+            "{api}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let stdout = String::from_utf8(output.stdout).unwrap();
+        let stderr = String::from_utf8(output.stderr).unwrap();
+        let ids: Vec<_> = stdout
+            .lines()
+            .filter_map(|line| line.strip_prefix("Session ID: "))
+            .collect();
+        assert_eq!(ids.len(), 4, "{stdout}");
+        assert_eq!(
+            ids.iter().collect::<std::collections::HashSet<_>>().len(),
+            4
+        );
+        assert_eq!(stdout.matches(ids[0]).count(), 2, "{stdout}");
+        assert_eq!(stdout.matches(ids[1]).count(), 2, "{stdout}");
+        assert_eq!(stdout.matches(ids[2]).count(), 2, "{stdout}");
+        assert_eq!(stdout.matches(ids[3]).count(), 3, "{stdout}");
+        assert!(stdout.contains(&format!("Workspace: {}", workspace_b.display())));
+        assert!(stdout.contains(&workspace_a.display().to_string()));
+        assert!(stdout.contains(&workspace_b.display().to_string()));
+        assert!(stderr.contains("Workspace 切换失败"), "{stderr}");
+        std::fs::remove_dir_all(root).unwrap();
+    }
+}
+
+#[test]
+fn model_requests_follow_workspace_and_isolate_history_for_both_apis() {
+    for api in ["chat-completions", "responses"] {
+        let root = std::env::temp_dir().join(format!("geer-prompt-workspace-{}", Uuid::new_v4()));
+        let workspace_a = root.join("workspace A");
+        let workspace_b = root.join("workspace B");
+        std::fs::create_dir_all(&workspace_a).unwrap();
+        std::fs::create_dir_all(&workspace_b).unwrap();
+        let replies = if api == "responses" {
+            vec![Reply::ResponsesFinal, Reply::ResponsesFinal]
+        } else {
+            vec![Reply::ChatFinal, Reply::ChatFinal]
+        };
+        let input = format!(
+            "/workspace \"{}\"\nquestion-in-A\n/workspace \"{}\"\nquestion-in-B\n/exit\n",
+            workspace_a.display(),
+            workspace_b.display()
+        );
+        let (output, requests) = run_repl(api, replies, &input);
+        assert!(
+            output.status.success(),
+            "{api}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(requests.len(), 2);
+        let system = |body: &Value| {
+            if api == "responses" {
+                body["instructions"].as_str().unwrap().to_owned()
+            } else {
+                body["messages"][0]["content"].as_str().unwrap().to_owned()
+            }
+        };
+        assert!(system(&requests[0]).contains(&workspace_a.display().to_string()));
+        assert!(!system(&requests[0]).contains(&workspace_b.display().to_string()));
+        assert!(system(&requests[1]).contains(&workspace_b.display().to_string()));
+        assert!(!system(&requests[1]).contains(&workspace_a.display().to_string()));
+        assert!(requests[0].to_string().contains("question-in-A"));
+        assert!(!requests[1].to_string().contains("question-in-A"));
+        assert!(requests[1].to_string().contains("question-in-B"));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+}
+
 fn read_body(stream: &mut TcpStream) -> Value {
     let mut bytes = Vec::new();
     let mut block = [0_u8; 4096];

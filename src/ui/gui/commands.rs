@@ -41,7 +41,7 @@ where
                 None
             }
         },
-        Input::Sessions => match session.sessions().await {
+        Input::Sessions(scope) => match session.sessions(scope).await {
             Ok(items) if items.is_empty() => Some("没有可列出的会话。".to_owned()),
             Ok(items) => Some(items.join("\n")),
             Err(failure) => {
@@ -53,6 +53,14 @@ where
             Ok(message) => Some(message),
             Err(failure) => {
                 error = Some(format!("会话恢复失败：{failure}"));
+                None
+            }
+        },
+        Input::Workspace(None) => Some(format!("Workspace: {}", session.workspace())),
+        Input::Workspace(Some(path)) => match session.set_workspace(&path).await {
+            Ok(message) => Some(message),
+            Err(failure) => {
+                error = Some(format!("Workspace 切换失败：{failure}"));
                 None
             }
         },
@@ -103,10 +111,15 @@ mod tests {
             "mock-session"
         }
 
+        fn workspace(&self) -> String {
+            "/tmp/mock-workspace".into()
+        }
+
         fn status(&self) -> SessionStatus {
             SessionStatus {
                 model: "mock".into(),
                 session_id: self.session_id().into(),
+                workspace: self.workspace(),
                 context_tokens: 0,
                 context_window_tokens: 100,
                 turn_tokens: 0,
@@ -150,7 +163,14 @@ mod tests {
             Ok("已压缩".into())
         }
 
-        async fn sessions(&self) -> Result<Vec<String>, Box<dyn Error>> {
+        async fn set_workspace(&mut self, path: &str) -> Result<String, Box<dyn Error>> {
+            Ok(format!("已切换 Workspace: {path}"))
+        }
+
+        async fn sessions(
+            &self,
+            _scope: crate::interaction::SessionScope,
+        ) -> Result<Vec<String>, Box<dyn Error>> {
             Ok(vec!["mock-session".into()])
         }
 
@@ -193,6 +213,24 @@ mod tests {
         assert_eq!(
             handle_line(&mut session, "/save", |_| Ok(()), |_| Ok(())).await,
             (Some("已保存".into()), None)
+        );
+        assert_eq!(
+            handle_line(&mut session, "/workspace", |_| Ok(()), |_| Ok(())).await,
+            (Some("Workspace: /tmp/mock-workspace".into()), None)
+        );
+        assert_eq!(
+            handle_line(
+                &mut session,
+                "/workspace /tmp/other space",
+                |_| Ok(()),
+                |_| Ok(()),
+            )
+            .await,
+            (Some("已切换 Workspace: /tmp/other space".into()), None)
+        );
+        assert_eq!(
+            handle_line(&mut session, "/sessions --all", |_| Ok(()), |_| Ok(())).await,
+            (Some("mock-session".into()), None)
         );
         assert_eq!(session.seen, ["你好"]);
     }

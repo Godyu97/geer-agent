@@ -12,6 +12,7 @@ const snapshot: Snapshot = {
   status: {
     model: "test",
     session_id: "one",
+    workspace: "/tmp/one",
     context_tokens: 2,
     context_window_tokens: 10,
     turn_tokens: 0,
@@ -19,6 +20,7 @@ const snapshot: Snapshot = {
     usage_complete: true,
   },
   sessions: [],
+  all_sessions: [],
   transcript: [],
   unsaved_ids: [],
 };

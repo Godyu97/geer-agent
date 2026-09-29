@@ -519,6 +519,48 @@ async fn queries_have_separate_grants_and_batch_respects_mutation_barriers() {
     fs::remove_dir_all(dir).expect("清理");
 }
 
+#[tokio::test]
+async fn explicit_workspace_drives_bash_file_and_default_query_paths() {
+    let root = query_dir();
+    let workspace_a = root.join("workspace A");
+    let workspace_b = root.join("工作区 B");
+    fs::create_dir_all(&workspace_a).expect("创建 A");
+    fs::create_dir_all(&workspace_b).expect("创建 B");
+    fs::write(workspace_a.join("marker.txt"), "alpha-only").expect("写入 A");
+    fs::write(workspace_b.join("marker.txt"), "beta-only").expect("写入 B");
+    fs::write(workspace_a.join("only-a.txt"), "A").expect("写入 A 列表文件");
+    fs::write(workspace_b.join("only-b.txt"), "B").expect("写入 B 列表文件");
+
+    let mut tools = Tools::new(true, "bash".into()).expect("初始化");
+    tools.allow_all_for_test();
+    let read_a = tools
+        .execute_recorded_in(&workspace_a, "read", r#"{"path":"marker.txt"}"#)
+        .await;
+    let read_b = tools
+        .execute_recorded_in(&workspace_b, "read", r#"{"path":"marker.txt"}"#)
+        .await;
+    assert_eq!(body(&read_a), "alpha-only");
+    assert_eq!(body(&read_b), "beta-only");
+
+    let bash = tools
+        .execute_recorded_in(&workspace_b, "bash", r#"{"command":"pwd; cat marker.txt"}"#)
+        .await;
+    assert!(bash.success);
+    assert!(bash.text.contains(&workspace_b.display().to_string()));
+    assert!(bash.text.contains("beta-only"));
+
+    let listing = tools.execute_recorded_in(&workspace_b, "ls", "{}").await;
+    assert!(listing.text.contains("only-b.txt"));
+    assert!(!listing.text.contains("only-a.txt"));
+    let search = tools
+        .execute_recorded_in(&workspace_a, "rg", r#"{"pattern":"alpha-only"}"#)
+        .await;
+    assert!(search.success);
+    assert!(search.text.contains("marker.txt:1:alpha-only"));
+    assert!(!search.text.contains("beta-only"));
+    fs::remove_dir_all(root).expect("清理");
+}
+
 #[cfg(unix)]
 #[tokio::test]
 async fn query_dependencies_are_resolved_by_configured_bash_only() {

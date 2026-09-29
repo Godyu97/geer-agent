@@ -41,7 +41,8 @@ body,
   height: 100%;
 }
 button,
-textarea {
+textarea,
+input {
   font: inherit;
 }
 button {
@@ -129,6 +130,79 @@ button:disabled {
   text-align: left;
   font-weight: 600;
 }
+.workspace-card {
+  margin: 16px 3px 0;
+  padding: 10px;
+  border: 1px solid var(--ctp-surface1);
+  border-radius: 10px;
+  background: var(--ctp-base);
+}
+.workspace-heading {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  color: var(--ctp-subtext0);
+  font-size: 9px;
+  font-weight: 700;
+  letter-spacing: 0.08em;
+}
+.workspace-heading button,
+.workspace-actions button,
+.workspace-cancel {
+  padding: 3px 6px;
+  border: 1px solid var(--ctp-surface1);
+  border-radius: 5px;
+  color: var(--ctp-subtext1);
+  background: var(--ctp-surface0);
+  font-size: 9px;
+}
+.workspace-path {
+  display: block;
+  margin-top: 7px;
+  color: var(--ctp-text);
+  font-family: ui-monospace, monospace;
+  font-size: 10px;
+  line-height: 1.35;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.workspace-editor {
+  display: grid;
+  gap: 7px;
+  margin-top: 8px;
+}
+.workspace-editor input {
+  width: 100%;
+  min-width: 0;
+  padding: 6px 7px;
+  border: 1px solid var(--ctp-surface2);
+  border-radius: 6px;
+  color: var(--ctp-text);
+  background: var(--ctp-mantle);
+  font-family: ui-monospace, monospace;
+  font-size: 10px;
+}
+.workspace-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 5px;
+}
+.workspace-actions .workspace-confirm {
+  color: var(--ctp-mauve);
+  border-color: var(--ctp-mauve);
+}
+.workspace-cancel {
+  justify-self: start;
+  border-color: transparent;
+  background: transparent;
+}
+.workspace-error {
+  color: var(--ctp-red);
+  line-height: 1.35;
+  overflow-wrap: anywhere;
+}
 .new-session:hover:not(:disabled) {
   background: var(--ctp-accent-hover);
 }
@@ -143,6 +217,29 @@ button:disabled {
 }
 .section-title span {
   color: var(--ctp-subtext0);
+}
+.session-title {
+  align-items: center;
+  margin-top: 18px;
+}
+.scope-toggle {
+  display: inline-flex;
+  gap: 2px;
+  padding: 2px;
+  border-radius: 6px;
+  background: var(--ctp-base);
+}
+.scope-toggle button {
+  padding: 2px 5px;
+  border: 0;
+  border-radius: 4px;
+  color: var(--ctp-subtext0);
+  background: transparent;
+  font-size: 9px;
+}
+.scope-toggle button.active {
+  color: var(--ctp-text);
+  background: var(--ctp-surface1);
 }
 .session-list {
   flex: 1;

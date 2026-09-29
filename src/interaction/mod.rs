@@ -11,6 +11,7 @@ pub(crate) use diagnostic::{DiagnosticBuffer, emit_diagnostic};
 pub(crate) struct SessionStatus {
     pub(crate) model: String,
     pub(crate) session_id: String,
+    pub(crate) workspace: String,
     pub(crate) context_tokens: u64,
     pub(crate) context_window_tokens: u64,
     pub(crate) turn_tokens: u64,
@@ -27,6 +28,8 @@ pub(crate) struct Usage {
 pub(crate) trait Session {
     fn session_id(&self) -> &str;
 
+    fn workspace(&self) -> String;
+
     fn status(&self) -> SessionStatus;
 
     async fn handle_message<F, U>(
@@ -41,17 +44,25 @@ pub(crate) trait Session {
 
     async fn new_session(&mut self) -> String;
 
+    async fn set_workspace(&mut self, path: &str) -> Result<String, Box<dyn Error>>;
+
     async fn flush(&mut self) -> String;
 
     async fn compact(&mut self) -> Result<String, Box<dyn Error>>;
 
-    async fn sessions(&self) -> Result<Vec<String>, Box<dyn Error>>;
+    async fn sessions(&self, scope: SessionScope) -> Result<Vec<String>, Box<dyn Error>>;
 
     async fn open(&mut self, id: &str) -> Result<String, Box<dyn Error>>;
 }
 
 pub(crate) fn help_text() -> &'static str {
-    "可用命令：\n  /help                 显示帮助\n  /compact              压缩旧对话\n  /sessions             列出当前目录的近期会话\n  /open <session-id>    打开会话\n  /resume <session-id>  打开会话（兼容命令）\n  /new                  开始新会话\n  /reset                开始新会话\n  /save                 保存所有待写会话\n  /exit                 退出程序"
+    "可用命令：\n  /help                 显示帮助\n  /workspace            显示当前 workspace\n  /workspace <path>     切换 workspace 并新建会话\n  /compact              压缩旧对话\n  /sessions             列出当前 workspace 的近期会话\n  /sessions --all       列出全部 workspace 的近期会话\n  /open <session-id>    打开会话及其 workspace\n  /resume <session-id>  打开会话（兼容命令）\n  /new                  在当前 workspace 开始新会话\n  /reset                在当前 workspace 开始新会话\n  /save                 保存所有待写会话\n  /exit                 退出程序"
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum SessionScope {
+    Current,
+    All,
 }
 
 pub(crate) enum Input {
@@ -61,7 +72,8 @@ pub(crate) enum Input {
     New,
     Save,
     Compact,
-    Sessions,
+    Sessions(SessionScope),
+    Workspace(Option<String>),
     Open(String),
     Exit,
     Unknown(String),
@@ -77,7 +89,12 @@ pub(crate) fn parse_input(line: &str) -> Input {
         "/new" => Input::New,
         "/save" => Input::Save,
         "/compact" => Input::Compact,
-        "/sessions" => Input::Sessions,
+        "/sessions" => Input::Sessions(SessionScope::Current),
+        "/sessions --all" => Input::Sessions(SessionScope::All),
+        "/workspace" => Input::Workspace(None),
+        input if input.starts_with("/workspace ") && !input[11..].trim().is_empty() => {
+            Input::Workspace(Some(input[11..].trim().to_owned()))
+        }
         input if input.starts_with("/resume ") && !input[8..].trim().is_empty() => {
             Input::Open(input[8..].trim().to_owned())
         }

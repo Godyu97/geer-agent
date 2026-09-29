@@ -8,6 +8,7 @@ pub(crate) async fn run(session: &mut impl Session) -> Result<(), Box<dyn Error>
     let stdin = io::stdin();
 
     println!("GeekAgent —— 最简单的 Agent");
+    println!("Workspace: {}", session.workspace());
     println!("Session ID: {}", session.session_id());
     println!("输入 /help 查看命令。\n");
 
@@ -60,7 +61,7 @@ pub(crate) async fn run(session: &mut impl Session) -> Result<(), Box<dyn Error>
                 Ok(message) => println!("{message}"),
                 Err(error) => eprintln!("上下文压缩失败：{error}"),
             },
-            Input::Sessions => match session.sessions().await {
+            Input::Sessions(scope) => match session.sessions(scope).await {
                 Ok(items) if items.is_empty() => {
                     println!("没有可列出的会话（或未配置会话数据库）。")
                 }
@@ -70,6 +71,11 @@ pub(crate) async fn run(session: &mut impl Session) -> Result<(), Box<dyn Error>
                     }
                 }
                 Err(error) => eprintln!("会话列表读取失败：{error}"),
+            },
+            Input::Workspace(None) => println!("Workspace: {}", session.workspace()),
+            Input::Workspace(Some(path)) => match session.set_workspace(&path).await {
+                Ok(message) => println!("{message}"),
+                Err(error) => eprintln!("Workspace 切换失败：{error}"),
             },
             Input::Open(id) => match session.open(&id).await {
                 Ok(message) => {
@@ -152,7 +158,21 @@ mod tests {
         assert!(matches!(parse_input("/new"), Input::New));
         assert!(matches!(parse_input("/save"), Input::Save));
         assert!(matches!(parse_input("/compact"), Input::Compact));
-        assert!(matches!(parse_input("/sessions"), Input::Sessions));
+        assert!(matches!(
+            parse_input("/sessions"),
+            Input::Sessions(crate::interaction::SessionScope::Current)
+        ));
+        assert!(matches!(
+            parse_input("/sessions --all"),
+            Input::Sessions(crate::interaction::SessionScope::All)
+        ));
+        assert!(matches!(parse_input("/workspace"), Input::Workspace(None)));
+        assert!(
+            matches!(parse_input("/workspace ../other"), Input::Workspace(Some(path)) if path == "../other")
+        );
+        assert!(
+            matches!(parse_input("/workspace \"/tmp/foo bar\""), Input::Workspace(Some(path)) if path == "\"/tmp/foo bar\"")
+        );
         assert!(matches!(parse_input("/resume abc"), Input::Open(id) if id == "abc"));
         assert!(matches!(parse_input("/open abc"), Input::Open(id) if id == "abc"));
         assert!(matches!(parse_input("/exit"), Input::Exit));

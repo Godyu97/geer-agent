@@ -141,6 +141,7 @@ impl ToolOutput {
 
 pub(crate) struct Tools {
     enabled: bool,
+    #[cfg(test)]
     cwd: PathBuf,
     bash_bin: PathBuf,
     grants: HashSet<String>,
@@ -175,6 +176,7 @@ impl Tools {
         validate_registry(BUILTINS)?;
         Ok(Self {
             enabled,
+            #[cfg(test)]
             cwd: std::env::current_dir()?,
             bash_bin,
             grants: HashSet::new(),
@@ -194,13 +196,25 @@ impl Tools {
         }
     }
 
+    #[cfg(test)]
     pub(crate) async fn execute_batch(&mut self, calls: &[(&str, &str)]) -> Vec<ToolExecution> {
+        let cwd = self.cwd.clone();
+        self.execute_batch_in(&cwd, calls).await
+    }
+
+    pub(crate) async fn execute_batch_in(
+        &mut self,
+        cwd: &Path,
+        calls: &[(&str, &str)],
+    ) -> Vec<ToolExecution> {
         let mut results = Vec::with_capacity(calls.len());
         let mut index = 0;
         while index < calls.len() {
             if Self::execution_mode(calls[index].0) == ExecutionMode::Sequential {
                 let started = Instant::now();
-                let output = self.execute_recorded(calls[index].0, calls[index].1).await;
+                let output = self
+                    .execute_recorded_in(cwd, calls[index].0, calls[index].1)
+                    .await;
                 results.push(ToolExecution {
                     output,
                     duration: started.elapsed(),
@@ -212,14 +226,14 @@ impl Tools {
             while index < calls.len()
                 && Self::execution_mode(calls[index].0) == ExecutionMode::Parallel
             {
-                prepared.push(self.prepare(calls[index].0, calls[index].1));
+                prepared.push(self.prepare(cwd, calls[index].0, calls[index].1));
                 index += 1;
             }
             // 所有授权在派发前逐项完成；join_all 保留输入次序，写入和 Bash 是段边界。
             let pending = prepared.into_iter().map(|job| async {
                 let started = Instant::now();
                 let output = match job {
-                    Ok(job) => Self::run_prepared(&self.bash_bin, &self.cwd, job).await,
+                    Ok(job) => Self::run_prepared(&self.bash_bin, cwd, job).await,
                     Err(output) => output,
                 };
                 ToolExecution {
@@ -232,7 +246,12 @@ impl Tools {
         results
     }
 
-    fn prepare(&mut self, name: &str, args_json: &str) -> Result<PreparedCall, ToolOutput> {
+    fn prepare(
+        &mut self,
+        cwd: &Path,
+        name: &str,
+        args_json: &str,
+    ) -> Result<PreparedCall, ToolOutput> {
         if !self.enabled {
             return Err(ToolOutput::error("工具已关闭。".to_owned()));
         }
@@ -270,10 +289,8 @@ impl Tools {
                 }
                 ToolKind::Ls | ToolKind::Glob | ToolKind::Rg => {
                     let query = query::Query::parse(kind, &args)?;
-                    let resolved = file::resolve_path(
-                        &self.cwd,
-                        optional_string(&args, "path")?.unwrap_or("."),
-                    )?;
+                    let resolved =
+                        file::resolve_path(cwd, optional_string(&args, "path")?.unwrap_or("."))?;
                     path = Some(resolved.clone());
                     Ok(PreparedCall::Query {
                         path: resolved,
@@ -282,7 +299,7 @@ impl Tools {
                 }
                 ToolKind::Read | ToolKind::Write | ToolKind::Edit => {
                     let operation = file::Operation::parse(name, &args)?;
-                    let resolved = file::resolve_path(&self.cwd, string(&args, "path")?)?;
+                    let resolved = file::resolve_path(cwd, string(&args, "path")?)?;
                     path = Some(resolved.clone());
                     Ok(PreparedCall::File {
                         kind,
@@ -354,9 +371,20 @@ impl Tools {
         self.execute_recorded(name, args_json).await.text
     }
 
+    #[cfg(test)]
     pub(crate) async fn execute_recorded(&mut self, name: &str, args_json: &str) -> ToolOutput {
-        match self.prepare(name, args_json) {
-            Ok(job) => Self::run_prepared(&self.bash_bin, &self.cwd, job).await,
+        let cwd = self.cwd.clone();
+        self.execute_recorded_in(&cwd, name, args_json).await
+    }
+
+    pub(crate) async fn execute_recorded_in(
+        &mut self,
+        cwd: &Path,
+        name: &str,
+        args_json: &str,
+    ) -> ToolOutput {
+        match self.prepare(cwd, name, args_json) {
+            Ok(job) => Self::run_prepared(&self.bash_bin, cwd, job).await,
             Err(output) => output,
         }
     }
@@ -382,13 +410,13 @@ impl Tools {
     }
 
     fn definitions() -> Vec<Spec> {
-        let path = json!({"type":"string","minLength":1,"description":"文件或目录路径；相对启动目录，支持绝对路径和 ~/。不能为空白。"});
-        let query_path = json!({"type":"string","minLength":1,"default":".","description":"目标路径；省略为启动目录。ls/glob 要求目录，rg 可为文件或目录；支持绝对路径和 ~/。"});
+        let path = json!({"type":"string","minLength":1,"description":"文件或目录路径；相对当前 workspace，支持绝对路径和 ~/。不能为空白。"});
+        let query_path = json!({"type":"string","minLength":1,"default":".","description":"目标路径；省略为当前 workspace。ls/glob 要求目录，rg 可为文件或目录；支持绝对路径和 ~/。"});
         let pattern = json!({"type":"string","minLength":1,"description":"ripgrep 路径通配模式，相对搜索根；如 **/*.rs。不是正文正则。"});
         BUILTINS.iter().copied().map(|kind| {
             let (description, properties, required) = match kind {
                 ToolKind::Time => ("获取当前系统本地日期与时间。", json!({}), vec![]),
-                ToolKind::Bash => ("在启动目录执行 Bash 命令，10 秒/2000 字符。目录用 ls、路径用 glob、正文用 rg；读取或局部修改用 read/edit。首次需授权。", json!({"command":{"type":"string","minLength":1,"description":"完整 Bash 命令；用于构建、测试或专用工具不支持的操作。"}}), vec!["command"]),
+                ToolKind::Bash => ("在当前 workspace 执行 Bash 命令，10 秒/2000 字符。目录用 ls、路径用 glob、正文用 rg；读取或局部修改用 read/edit。首次需授权。", json!({"command":{"type":"string","minLength":1,"description":"完整 Bash 命令；用于构建、测试或专用工具不支持的操作。"}}), vec!["command"]),
                 ToolKind::Ls => ("列出目录直接子项，含隐藏项，目录以 / 结尾；不递归。截断时缩小 path 或改用 glob。例：{\"path\":\"src\"}。", json!({"path":query_path}), vec![]),
                 ToolKind::Glob => ("按路径通配查找文件，不搜索正文。沿用 rg 忽略规则；显式 glob 可覆盖忽略/隐藏过滤，不跟随目录符号链接。结果相对 path，截断时收窄范围。例：{\"pattern\":\"**/*.rs\",\"path\":\"src\"}。", json!({"path":query_path,"pattern":pattern}), vec!["pattern"]),
                 ToolKind::Rg => ("按正文正则搜索，glob 仅过滤路径；files 只列正文命中的文件。沿用 rg 忽略规则，显式 path/glob 可覆盖默认过滤；正则不支持环视/回溯引用。截断时收窄范围，命中后用 read。例：{\"pattern\":\"fn .*test\",\"path\":\"src\",\"output\":\"files\"}。", json!({"path":query_path,"pattern":{"type":"string","minLength":1,"description":"非空正文正则；空白有意义，不是文件名模式。"},"glob":pattern,"output":{"type":"string","enum":["content","files"],"default":"content","description":"content 返回路径、1 起始行号及命中行；files 只列正文命中的文件路径。"},"fixed_strings":{"type":"boolean","default":false,"description":"true 将 pattern 当作字面文本，不解释正则元字符。"}}), vec!["pattern"]),

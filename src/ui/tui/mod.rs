@@ -60,15 +60,17 @@ struct Entry {
     text: String,
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Mode {
     Chat,
     Confirm,
+    Workspace,
 }
 
 struct State {
     entries: Vec<Entry>,
     input: Input,
+    workspace_input: Input,
     mode: Mode,
     status: SessionStatus,
     estimating: bool,
@@ -96,10 +98,12 @@ impl Tui {
                 state: State {
                     entries: Vec::new(),
                     input: Input::default(),
+                    workspace_input: Input::default(),
                     mode: Mode::Chat,
                     status: SessionStatus {
                         model: String::new(),
                         session_id: String::new(),
+                        workspace: String::new(),
                         context_tokens: 0,
                         context_window_tokens: 1,
                         turn_tokens: 0,
@@ -191,7 +195,7 @@ impl Tui {
                 Ok(result) => Some(result),
                 Err(error) => Some(format!("上下文压缩失败：{error}")),
             },
-            Command::Sessions => match session.sessions().await {
+            Command::Sessions(scope) => match session.sessions(scope).await {
                 Ok(items) if items.is_empty() => {
                     Some("没有可列出的会话（或未配置会话数据库）。".to_owned())
                 }
@@ -201,6 +205,16 @@ impl Tui {
             Command::Open(id) => match session.open(&id).await {
                 Ok(message) => Some(format!("{message}\nSession ID: {}", session.session_id())),
                 Err(error) => Some(format!("会话恢复失败：{error}")),
+            },
+            Command::Workspace(None) => Some(format!("Workspace: {}", session.workspace())),
+            Command::Workspace(Some(path)) => match session.set_workspace(&path).await {
+                Ok(message) => {
+                    let mut screen = self.screen.borrow_mut();
+                    screen.state.mode = Mode::Chat;
+                    screen.state.workspace_input.clear();
+                    Some(message)
+                }
+                Err(error) => Some(format!("Workspace 切换失败：{error}")),
             },
             Command::Unknown(command) => {
                 Some(format!("未知命令：{command}（输入 /help 查看可用命令）"))
@@ -360,22 +374,38 @@ impl State {
                     return Some(Action::Exit);
                 }
                 match key.code {
+                    KeyCode::F(2) if self.mode == Mode::Chat => {
+                        self.workspace_input.set(&self.status.workspace);
+                        self.mode = Mode::Workspace;
+                    }
+                    KeyCode::Enter if self.mode == Mode::Workspace => {
+                        let path = self.workspace_input.text();
+                        return Some(Action::Submit(if path.trim().is_empty() {
+                            "/workspace \"\"".to_owned()
+                        } else {
+                            format!("/workspace {path}")
+                        }));
+                    }
                     KeyCode::Enter => return Some(Action::Submit(self.input.take())),
                     KeyCode::Char(ch) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
-                        self.input.insert(ch);
+                        self.active_input_mut().insert(ch);
                     }
-                    KeyCode::Backspace => self.input.backspace(),
-                    KeyCode::Delete => self.input.delete(),
-                    KeyCode::Left => self.input.left(),
-                    KeyCode::Right => self.input.right(),
-                    KeyCode::Home => self.input.home(),
-                    KeyCode::End => self.input.end(),
+                    KeyCode::Backspace => self.active_input_mut().backspace(),
+                    KeyCode::Delete => self.active_input_mut().delete(),
+                    KeyCode::Left => self.active_input_mut().left(),
+                    KeyCode::Right => self.active_input_mut().right(),
+                    KeyCode::Home => self.active_input_mut().home(),
+                    KeyCode::End => self.active_input_mut().end(),
                     KeyCode::PageUp => self.scroll_back = self.scroll_back.saturating_add(10),
                     KeyCode::PageDown => self.scroll_back = self.scroll_back.saturating_sub(10),
                     KeyCode::Up => self.scroll_back = self.scroll_back.saturating_add(1),
                     KeyCode::Down => self.scroll_back = self.scroll_back.saturating_sub(1),
                     KeyCode::Esc if self.mode == Mode::Confirm => {
                         return Some(Action::Submit(String::new()));
+                    }
+                    KeyCode::Esc if self.mode == Mode::Workspace => {
+                        self.workspace_input.clear();
+                        self.mode = Mode::Chat;
                     }
                     KeyCode::Esc => {
                         self.input.clear();
@@ -384,10 +414,18 @@ impl State {
                     _ => {}
                 }
             }
-            Event::Paste(value) => self.input.paste(&value),
+            Event::Paste(value) => self.active_input_mut().paste(&value),
             _ => {}
         }
         None
+    }
+
+    fn active_input_mut(&mut self) -> &mut Input {
+        if self.mode == Mode::Workspace {
+            &mut self.workspace_input
+        } else {
+            &mut self.input
+        }
     }
 }
 
@@ -522,6 +560,7 @@ fn render_panel(frame: &mut Frame, state: &State, area: Rect) {
     let lines = vec![
         Line::raw(format!("模型  {}", status.model)),
         Line::raw(format!("会话  {}", status.session_id)),
+        Line::raw(format!("目录  {}（F2）", status.workspace)),
         Line::raw(""),
         Line::raw("── 上下文（估算）──"),
         Line::raw(format!("{context} / {window}")),
@@ -549,10 +588,10 @@ fn render_input(frame: &mut Frame, state: &State, area: Rect) {
     if area.width == 0 || area.height == 0 {
         return;
     }
-    let title = if state.mode == Mode::Confirm {
-        "授权确认"
-    } else {
-        "输入"
+    let title = match state.mode {
+        Mode::Confirm => "授权确认",
+        Mode::Workspace => "Workspace · Enter 切换 · Esc 取消",
+        Mode::Chat => "输入 · F2 Workspace",
     };
     let block = Block::bordered().title(title);
     let inner = if area.height >= 3 {
@@ -566,10 +605,10 @@ fn render_input(frame: &mut Frame, state: &State, area: Rect) {
     if inner.width == 0 || inner.height == 0 {
         return;
     }
-    let full_prompt = if state.mode == Mode::Confirm {
-        "[y/N] "
-    } else {
-        "你 › "
+    let full_prompt = match state.mode {
+        Mode::Confirm => "[y/N] ",
+        Mode::Workspace => "路径 › ",
+        Mode::Chat => "你 › ",
     };
     let prompt = if Line::raw(full_prompt).width() < inner.width as usize {
         full_prompt
@@ -578,7 +617,12 @@ fn render_input(frame: &mut Frame, state: &State, area: Rect) {
     };
     let prompt_width = Line::raw(prompt).width().min(inner.width as usize);
     let available = (inner.width as usize).saturating_sub(prompt_width);
-    let (visible, cursor) = state.input.visible(available);
+    let input = if state.mode == Mode::Workspace {
+        &state.workspace_input
+    } else {
+        &state.input
+    };
+    let (visible, cursor) = input.visible(available);
     frame.render_widget(Paragraph::new(format!("{prompt}{visible}")), inner);
     let x = inner.x + (prompt_width + cursor).min((inner.width - 1) as usize) as u16;
     frame.set_cursor_position(Position::new(x, inner.y));
@@ -598,10 +642,12 @@ mod tests {
         State {
             entries: Vec::new(),
             input: Input::default(),
+            workspace_input: Input::default(),
             mode: Mode::Chat,
             status: SessionStatus {
                 model: "test-model".into(),
                 session_id: "test-session".into(),
+                workspace: "/tmp/test-workspace".into(),
                 context_tokens: 50,
                 context_window_tokens: 100,
                 turn_tokens: 3,
@@ -699,5 +745,48 @@ mod tests {
             KeyModifiers::CONTROL,
         )));
         assert!(matches!(exit, Some(Action::Exit)));
+    }
+
+    #[test]
+    fn workspace_editor_preserves_chat_draft_and_keeps_path_until_cancelled() {
+        let mut state = state();
+        state.input.set("尚未发送的草稿");
+        assert!(
+            state
+                .handle_event(Event::Key(KeyEvent::new(KeyCode::F(2), KeyModifiers::NONE)))
+                .is_none()
+        );
+        assert_eq!(state.mode, Mode::Workspace);
+        assert_eq!(state.workspace_input.text(), "/tmp/test-workspace");
+        state.workspace_input.set("/missing path");
+        let submit = state.handle_event(Event::Key(KeyEvent::new(
+            KeyCode::Enter,
+            KeyModifiers::NONE,
+        )));
+        assert!(matches!(submit, Some(Action::Submit(line)) if line == "/workspace /missing path"));
+        assert_eq!(state.workspace_input.text(), "/missing path");
+        assert_eq!(state.input.text(), "尚未发送的草稿");
+        state.handle_event(Event::Key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)));
+        assert_eq!(state.mode, Mode::Chat);
+        assert_eq!(state.workspace_input.text(), "");
+        assert_eq!(state.input.text(), "尚未发送的草稿");
+
+        assert!(
+            state
+                .handle_event(Event::Key(KeyEvent::new(KeyCode::F(2), KeyModifiers::NONE)))
+                .is_none()
+        );
+        state.workspace_input.set("   ");
+        let empty = state.handle_event(Event::Key(KeyEvent::new(
+            KeyCode::Enter,
+            KeyModifiers::NONE,
+        )));
+        assert!(matches!(empty, Some(Action::Submit(line)) if line == "/workspace \"\""));
+        assert_eq!(state.mode, Mode::Workspace);
+        state.handle_event(Event::Key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)));
+
+        let mut narrow = Terminal::new(TestBackend::new(40, 5)).unwrap();
+        narrow.draw(|frame| render(frame, &state)).unwrap();
+        assert!(rendered_text(narrow.backend().buffer()).contains("F2Workspace"));
     }
 }

@@ -135,6 +135,52 @@ fn run_default(api: &str, base_url: &str, workspace: &std::path::Path, input: &s
     child.wait_with_output().unwrap()
 }
 
+#[test]
+fn persisted_session_restores_its_workspace_across_processes() {
+    for api in ["chat-completions", "responses"] {
+        let root = std::env::temp_dir().join(format!("geer-restore-workspace-{}", Uuid::new_v4()));
+        let target = root.join("中文 workspace");
+        std::fs::create_dir_all(&target).unwrap();
+        let database = root.join("sessions.sqlite");
+        let database_url = format!("sqlite://{}?mode=rwc", database.display());
+        let first = run(
+            api,
+            "http://127.0.0.1:9/v1",
+            &database_url,
+            &format!("/workspace \"{}\"\n/exit\n", target.display()),
+        );
+        assert!(
+            first.status.success(),
+            "{api}: {}",
+            String::from_utf8_lossy(&first.stderr)
+        );
+        let first_stdout = String::from_utf8(first.stdout).unwrap();
+        let saved_id = first_stdout
+            .lines()
+            .filter_map(|line| line.strip_prefix("Session ID: "))
+            .nth(1)
+            .expect("切换后的 Session ID");
+        let second = run(
+            api,
+            "http://127.0.0.1:9/v1",
+            &database_url,
+            &format!("/open {saved_id}\n/workspace\n/exit\n"),
+        );
+        assert!(
+            second.status.success(),
+            "{api}: {}",
+            String::from_utf8_lossy(&second.stderr)
+        );
+        let second_stdout = String::from_utf8(second.stdout).unwrap();
+        assert!(second_stdout.contains("已恢复会话"), "{second_stdout}");
+        assert!(
+            second_stdout.contains(&format!("Workspace: {}", target.display())),
+            "{second_stdout}"
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+}
+
 async fn default_database_is_shared_across_sessions_and_restarts(api: &str) {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     listener.set_nonblocking(true).unwrap();

@@ -16,6 +16,7 @@ const mock = vi.hoisted(() => ({
   channels: [] as Array<{ onmessage: (event: Event) => void }>,
   invoke: vi.fn(),
   close: vi.fn(),
+  dialogOpen: vi.fn(),
 }));
 vi.mock("@tauri-apps/api/core", () => ({
   Channel: class {
@@ -30,11 +31,13 @@ vi.mock("@tauri-apps/api/window", () => ({
   getCurrentWindow: () => ({ close: mock.close }),
 }));
 vi.mock("@tauri-apps/plugin-clipboard-manager", () => ({ writeText: vi.fn() }));
+vi.mock("@tauri-apps/plugin-dialog", () => ({ open: mock.dialogOpen }));
 
 const snapshot: Snapshot = {
   status: {
     model: "test-model",
     session_id: "session-one",
+    workspace: "/tmp/workspace-one",
     context_tokens: 2,
     context_window_tokens: 100,
     turn_tokens: 0,
@@ -42,6 +45,7 @@ const snapshot: Snapshot = {
     usage_complete: true,
   },
   sessions: [],
+  all_sessions: [],
   transcript: [],
   unsaved_ids: [],
 };
@@ -56,6 +60,7 @@ beforeEach(() => {
   mock.channels.length = 0;
   mock.invoke.mockReset().mockResolvedValue(undefined);
   mock.close.mockReset().mockResolvedValue(undefined);
+  mock.dialogOpen.mockReset().mockResolvedValue(null);
 });
 afterEach(cleanup);
 
@@ -267,6 +272,117 @@ it("shows unsaved sessions and retries window close only after user selection", 
   });
   fireEvent.click(screen.getByRole("button", { name: "重试保存" }));
   await waitFor(() => expect(mock.close).toHaveBeenCalledOnce());
+});
+
+it("edits workspace without losing the chat draft and switches session scope", async () => {
+  render(<App />);
+  const currentSession = {
+    id: "11111111-current",
+    updated_at_ms: 1,
+    model: "test-model",
+    status: "已保存",
+    active: true,
+    uncertain_tools: false,
+    workspace: "/tmp/workspace-one",
+  };
+  const otherSession = {
+    ...currentSession,
+    id: "22222222-other",
+    active: false,
+    workspace: "/tmp/workspace-two",
+  };
+  send({
+    type: "snapshot",
+    request_id: null,
+    notice: null,
+    error: null,
+    snapshot: {
+      ...snapshot,
+      sessions: [currentSession],
+      all_sessions: [currentSession, otherSession],
+    },
+  });
+  const message = screen.getByRole("textbox", { name: "消息" });
+  fireEvent.change(message, { target: { value: "保留这段草稿" } });
+  fireEvent.click(screen.getByRole("button", { name: "更改" }));
+  const path = screen.getByRole("textbox", { name: "Workspace 路径" });
+  expect((path as HTMLInputElement).value).toBe("/tmp/workspace-one");
+  mock.dialogOpen.mockResolvedValueOnce("/picked/workspace");
+  fireEvent.click(screen.getByRole("button", { name: "浏览" }));
+  await waitFor(() =>
+    expect(mock.dialogOpen).toHaveBeenCalledWith({
+      directory: true,
+      multiple: false,
+      defaultPath: "/tmp/workspace-one",
+    }),
+  );
+  expect((path as HTMLInputElement).value).toBe("/picked/workspace");
+  mock.dialogOpen.mockResolvedValueOnce(null);
+  fireEvent.click(screen.getByRole("button", { name: "浏览" }));
+  await waitFor(() => expect(mock.dialogOpen).toHaveBeenCalledTimes(2));
+  expect((path as HTMLInputElement).value).toBe("/picked/workspace");
+  expect(
+    mock.invoke.mock.calls.filter(([name]) => name === "gui_submit"),
+  ).toHaveLength(0);
+  fireEvent.change(path, { target: { value: "/missing workspace" } });
+  fireEvent.click(
+    screen.getByRole("button", { name: "切换并新建会话" }),
+  );
+  await waitFor(() =>
+    expect(mock.invoke).toHaveBeenCalledWith("gui_submit", {
+      requestId: 1,
+      line: "/workspace /missing workspace",
+    }),
+  );
+  expect((message as HTMLTextAreaElement).value).toBe("保留这段草稿");
+  expect(
+    (screen.getByRole("button", { name: "浏览" }) as HTMLButtonElement)
+      .disabled,
+  ).toBe(true);
+  send({
+    type: "snapshot",
+    request_id: 1,
+    notice: null,
+    error: "Workspace 切换失败：目录不存在",
+    snapshot: {
+      ...snapshot,
+      sessions: [currentSession],
+      all_sessions: [currentSession, otherSession],
+    },
+  });
+  expect((path as HTMLInputElement).value).toBe("/missing workspace");
+  expect(screen.getByText(/目录不存在/)).toBeTruthy();
+  fireEvent.click(screen.getByRole("button", { name: "全部" }));
+  expect(screen.getByText("22222222")).toBeTruthy();
+  expect(screen.getByText("/tmp/workspace-two")).toBeTruthy();
+  fireEvent.click(screen.getByRole("button", { name: "取消" }));
+  expect(screen.queryByRole("textbox", { name: "Workspace 路径" })).toBeNull();
+  expect((message as HTMLTextAreaElement).value).toBe("保留这段草稿");
+  expect(document.querySelector(".workspace-path")?.textContent).toBe(
+    "/tmp/workspace-one",
+  );
+  send({
+    type: "snapshot",
+    request_id: null,
+    notice: "已切换 workspace：/tmp/workspace-two",
+    error: null,
+    snapshot: {
+      ...snapshot,
+      status: {
+        ...snapshot.status,
+        workspace: "/tmp/workspace-two",
+        session_id: "33333333-new",
+      },
+      sessions: [{ ...otherSession, id: "33333333-new", active: true }],
+      all_sessions: [
+        { ...otherSession, id: "33333333-new", active: true },
+        currentSession,
+      ],
+    },
+  });
+  expect(document.querySelector(".workspace-path")?.textContent).toBe(
+    "/tmp/workspace-two",
+  );
 });
 
 it("does not offer a futile retry when persistence is unavailable", () => {
