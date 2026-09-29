@@ -102,3 +102,14 @@ cargo build --release --features embed-env
 构建产物位于 `target/release/geer-agent`，可复制到没有 `.env` 的目录运行。启用此 feature 时，构建目录缺少 `.env` 会导致编译失败。配置优先级为进程环境变量 > 可执行文件同级 `.env` > `~/.geer-agent/.env` > 构建时内嵌的 `.env`；只使用内嵌配置时，默认数据库位于 `~/.geer-agent/.db/`。内嵌构建不会把项目根目录的文件当作运行时外部 `.env`。默认构建不包含 `.env`。
 
 **内嵌的 `.env` 原文可从二进制提取，其中的 API key 不是加密存储。请只向可信对象分发此产物；修改内嵌配置后需重新构建。**
+
+## 开发命令
+
+根目录 `Makefile` 包装了常用 Cargo / 前端命令（需要 GNU Make；Windows 可用 Git for Windows 自带的 `make`）：
+
+```sh
+make help      # 列出目标
+make check     # fmt -> test -> clippy
+make run       # 终端 TUI / REPL
+make gui       # 构建前端并以 GUI feature 运行
+```

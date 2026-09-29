@@ -78,6 +78,8 @@ cargo fmt --all
 cargo clippy --all-targets --all-features
 ```
 
+根目录 `Makefile` 是这些命令的入口：`make help` 查看目标；收工用 `make check`（`fmt` → `test` → `clippy`）。默认不加 `gui` / `embed-env`；GUI 用 `make gui`，内嵌 `.env` 用 `make embed`。
+
 改了代码再收工时：先 `fmt`，再相关 `test`，再 `clippy`。学习项目不要开 `-D warnings` 当门禁，但新引入的 clippy 警告要处理，不要留 `todo!()` / 无故 `unwrap`。
 
 还没有 CI。本地命令就是质量门。
