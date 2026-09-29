@@ -53,6 +53,7 @@ impl Workspace {
 
     fn from_path(path: PathBuf) -> Result<Self, String> {
         let canonical = fs::canonicalize(&path)
+            .map(crate::config::plain_path)
             .map_err(|error| format!("Workspace {} 无法访问：{error}", path.display()))?;
         let metadata = fs::metadata(&canonical)
             .map_err(|error| format!("Workspace {} 无法读取：{error}", canonical.display()))?;
@@ -124,6 +125,7 @@ pub(crate) struct SessionRecord {
 #[cfg(test)]
 mod tests {
     use super::Workspace;
+    use crate::config::plain_path;
     use std::fs;
     use uuid::Uuid;
 
@@ -141,8 +143,9 @@ mod tests {
         let base = Workspace::from_path(root.clone()).unwrap();
         assert_eq!(
             Workspace::parse("'中文 space'", &base).unwrap().as_path(),
-            fs::canonicalize(&nested).unwrap()
+            plain_path(fs::canonicalize(&nested).unwrap())
         );
+        assert!(!base.as_str().starts_with(r"\\?\"));
         assert_eq!(Workspace::parse(".", &base).unwrap(), base);
         assert!(
             Workspace::parse("'missing", &base)
@@ -169,7 +172,7 @@ mod tests {
         let base = Workspace::current().unwrap();
         assert_eq!(
             Workspace::parse("~", &base).unwrap().as_path(),
-            fs::canonicalize(home).unwrap()
+            plain_path(fs::canonicalize(home).unwrap())
         );
     }
 

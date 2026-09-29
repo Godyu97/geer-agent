@@ -177,11 +177,31 @@ impl SessionRuntime {
         &self,
         workspace: Option<&Workspace>,
     ) -> Result<Vec<SessionRecord>, String> {
-        let result = match workspace {
-            Some(workspace) => self.store.list(&workspace.as_str()).await,
-            None => self.store.list_all().await,
+        let Some(workspace) = workspace else {
+            return self
+                .store
+                .list_all()
+                .await
+                .map_err(|error| error.to_string());
         };
-        result.map_err(|error| error.to_string())
+        let mut records = self
+            .store
+            .list(&workspace.as_str())
+            .await
+            .map_err(|error| error.to_string())?;
+        if cfg!(windows) {
+            // 旧版本在 Windows 上保存的是 `\\?\F:\...`；按新写法列出时一并带上。
+            let legacy = self
+                .store
+                .list(&format!(r"\\?\{}", workspace.as_str()))
+                .await
+                .map_err(|error| error.to_string())?;
+            if !legacy.is_empty() {
+                records.extend(legacy);
+                records.sort_by_key(|record| std::cmp::Reverse(record.updated_at_ms));
+            }
+        }
+        Ok(records)
     }
 
     pub(crate) async fn load(

@@ -416,7 +416,7 @@ impl Tools {
         BUILTINS.iter().copied().map(|kind| {
             let (description, properties, required) = match kind {
                 ToolKind::Time => ("获取当前系统本地日期与时间。", json!({}), vec![]),
-                ToolKind::Bash => ("在当前 workspace 执行 Bash 命令，10 秒/2000 字符。目录用 ls、路径用 glob、正文用 rg；读取或局部修改用 read/edit。首次需授权。", json!({"command":{"type":"string","minLength":1,"description":"完整 Bash 命令；用于构建、测试或专用工具不支持的操作。"}}), vec!["command"]),
+                ToolKind::Bash => ("在当前 workspace 执行 Bash（Linux bash / Windows Git Bash，非 cmd/PowerShell），非交互，10 秒/2000 字符。目录用 ls、路径用 glob、正文用 rg；读取或局部修改用 read/edit。首次需授权。", json!({"command":{"type":"string","minLength":1,"description":"兼容 Linux bash 与 Git Bash 的命令：POSIX 语法、GNU 工具、/ 分隔路径；不等待输入、不常驻后台。"}}), vec!["command"]),
                 ToolKind::Ls => ("列出目录直接子项，含隐藏项，目录以 / 结尾；不递归。截断时缩小 path 或改用 glob。例：{\"path\":\"src\"}。", json!({"path":query_path}), vec![]),
                 ToolKind::Glob => ("按路径通配查找文件，不搜索正文。沿用 rg 忽略规则；显式 glob 可覆盖忽略/隐藏过滤，不跟随目录符号链接。结果相对 path，截断时收窄范围。例：{\"pattern\":\"**/*.rs\",\"path\":\"src\"}。", json!({"path":query_path,"pattern":pattern}), vec!["pattern"]),
                 ToolKind::Rg => ("按正文正则搜索，glob 仅过滤路径；files 只列正文命中的文件。沿用 rg 忽略规则，显式 path/glob 可覆盖默认过滤；正则不支持环视/回溯引用。截断时收窄范围，命中后用 read。例：{\"pattern\":\"fn .*test\",\"path\":\"src\",\"output\":\"files\"}。", json!({"path":query_path,"pattern":{"type":"string","minLength":1,"description":"非空正文正则；空白有意义，不是文件名模式。"},"glob":pattern,"output":{"type":"string","enum":["content","files"],"default":"content","description":"content 返回路径、1 起始行号及命中行；files 只列正文命中的文件路径。"},"fixed_strings":{"type":"boolean","default":false,"description":"true 将 pattern 当作字面文本，不解释正则元字符。"}}), vec!["pattern"]),

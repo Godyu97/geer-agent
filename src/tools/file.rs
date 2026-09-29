@@ -113,19 +113,41 @@ pub(super) fn resolve_path(cwd: &Path, raw: &str) -> Result<PathBuf, ToolError> 
             "提供相对启动目录的路径、绝对路径或 ~/ 路径。",
         ));
     }
-    let path = if raw == "~" || raw.starts_with("~/") {
-        let home = std::env::var_os("HOME").ok_or_else(|| {
-            ToolError::invalid("path", "无法展开 ~：HOME 未设置。", "改用绝对路径。")
-        })?;
-        PathBuf::from(home).join(raw.strip_prefix("~/").unwrap_or(""))
+    let windows_raw = cfg!(windows)
+        .then(|| crate::config::from_msys(raw))
+        .flatten();
+    let raw = windows_raw.as_deref().unwrap_or(raw);
+    let path = if raw == "~" || raw.starts_with("~/") || raw.starts_with("~\\") {
+        let home = std::env::var_os("HOME")
+            .or_else(|| std::env::var_os("USERPROFILE"))
+            .ok_or_else(|| {
+                ToolError::invalid(
+                    "path",
+                    "无法展开 ~：HOME/USERPROFILE 未设置。",
+                    "改用绝对路径。",
+                )
+            })?;
+        PathBuf::from(home).join(raw[1..].trim_start_matches(['/', '\\']))
     } else {
         PathBuf::from(raw)
     };
-    Ok(if path.is_absolute() {
+    let path = if path.is_absolute() {
         path
     } else {
         cwd.join(path)
-    })
+    };
+    Ok(native_separators(crate::config::plain_path(path)))
+}
+
+/// Windows 接受 `/` 与 `\` 混用，但工具结果里混用会误导模型；统一成 `\`。
+fn native_separators(path: PathBuf) -> PathBuf {
+    if cfg!(windows)
+        && let Some(raw) = path.to_str()
+        && raw.contains('/')
+    {
+        return PathBuf::from(raw.replace('/', "\\"));
+    }
+    path
 }
 
 fn read_metadata(path: &Path, offset: usize, lines: usize, has_more: bool) -> Value {

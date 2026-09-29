@@ -43,10 +43,10 @@ async fn disabled_and_invalid_arguments() {
     assert_eq!(Tools::execution_mode("read"), ExecutionMode::Parallel);
     assert_eq!(Tools::execution_mode("write"), ExecutionMode::Sequential);
     assert_eq!(Tools::execution_mode("bash"), ExecutionMode::Sequential);
-    let mut tools = Tools::new(false, "bash".into()).expect("工作目录存在");
+    let mut tools = Tools::new(false, crate::config::default_bash_bin()).expect("工作目录存在");
     assert!(tools.specs().is_empty());
     assert_eq!(
-        Tools::new(true, "bash".into())
+        Tools::new(true, crate::config::default_bash_bin())
             .expect("工作目录存在")
             .specs()
             .len(),
@@ -56,7 +56,7 @@ async fn disabled_and_invalid_arguments() {
         tools.execute("get_current_time", "{}").await,
         "工具已关闭。"
     );
-    let mut tools = Tools::new(true, "bash".into()).expect("工作目录存在");
+    let mut tools = Tools::new(true, crate::config::default_bash_bin()).expect("工作目录存在");
     assert!(
         tools
             .execute("get_current_time", "{")
@@ -87,7 +87,7 @@ async fn disabled_and_invalid_arguments() {
 
 #[tokio::test]
 async fn grants_are_per_tool_and_reset_revokes_them() {
-    let mut tools = Tools::new(true, "bash".into()).expect("工作目录存在");
+    let mut tools = Tools::new(true, crate::config::default_bash_bin()).expect("工作目录存在");
     let prompts = Rc::new(Cell::new(0));
     let seen = Rc::clone(&prompts);
     tools.confirm = Box::new(move |prompt| {
@@ -132,7 +132,7 @@ async fn file_tools_use_independent_session_grants_and_absolute_paths() {
     let path = dir.join("file.txt");
     fs::write(&path, "hello").expect("准备文件");
     let path_json = serde_json::to_string(&path.to_string_lossy().to_string()).expect("编码路径");
-    let mut tools = Tools::new(true, "bash".into()).expect("工作目录存在");
+    let mut tools = Tools::new(true, crate::config::default_bash_bin()).expect("工作目录存在");
     let prompts = Rc::new(Cell::new(0));
     let seen = Rc::clone(&prompts);
     tools.confirm = Box::new(move |prompt| {
@@ -182,7 +182,7 @@ async fn batch_preserves_order_across_parallel_reads_and_write() {
     let read1 = format!("{{\"path\":{path1}}}");
     let read2 = format!("{{\"path\":{path2}}}");
     let write = format!("{{\"path\":{path1},\"content\":\"after\"}}");
-    let mut tools = Tools::new(true, "bash".into()).expect("工作目录存在");
+    let mut tools = Tools::new(true, crate::config::default_bash_bin()).expect("工作目录存在");
     tools.confirm = Box::new(|_| Ok(true));
     let results = tools
         .execute_batch(&[
@@ -224,7 +224,7 @@ fn query_dir() -> std::path::PathBuf {
 
 #[tokio::test]
 async fn invalid_parameters_fail_before_authorization_with_field_and_hint() {
-    let mut tools = Tools::new(true, "bash".into()).expect("初始化");
+    let mut tools = Tools::new(true, crate::config::default_bash_bin()).expect("初始化");
     tools.confirm = Box::new(|_| panic!("非法参数不得请求授权"));
     for (name, args, field) in [
         ("read", r#"{"path":"a","offset":0}"#, "offset"),
@@ -296,7 +296,7 @@ async fn real_queries_then_read_edit_and_verify_in_isolated_directory() {
     fs::write(&path, original).expect("准备文件");
     fs::write(nested.join("other.rs"), "needle 99\n").expect("非文本扩展名");
     fs::write(nested.join(".hidden"), "hidden").expect("隐藏文件");
-    let mut tools = Tools::new(true, "bash".into()).expect("初始化");
+    let mut tools = Tools::new(true, crate::config::default_bash_bin()).expect("初始化");
     tools.cwd = dir.clone();
     tools.allow_all_for_test();
     let listing = tools.execute_recorded("ls", "{}").await;
@@ -328,7 +328,10 @@ async fn real_queries_then_read_edit_and_verify_in_isolated_directory() {
         )
         .await;
     assert!(files.success, "{}", files.text);
-    assert_eq!(body(&files), format!("{}\n", path.display()));
+    assert_eq!(
+        body(&files),
+        format!("{}\n", crate::config::bash_arg(path.to_str().unwrap()))
+    );
     let literal = tools.execute_recorded("rg", &json!({"path":path,"pattern":"--flag $(touch INJECTED) `touch ALSO_INJECTED` ' \"","fixed_strings":true}).to_string()).await;
     assert!(literal.success, "{}", literal.text);
     assert!(body(&literal).contains(":4:--flag $(touch INJECTED)"));
@@ -365,10 +368,64 @@ async fn real_queries_then_read_edit_and_verify_in_isolated_directory() {
 }
 
 #[tokio::test]
+async fn query_arguments_reach_rg_without_shell_rewriting() {
+    use serde_json::json;
+    let dir = query_dir();
+    fs::write(dir.join("routes.cfg"), "GET /api/v1/users\n").expect("路由文件");
+    fs::write(dir.join("b.txt"), "x\n").expect("文本文件");
+    fs::write(dir.join("a.txt"), "x\n").expect("文本文件");
+    let mut tools = Tools::new(true, crate::config::default_bash_bin()).expect("初始化");
+    tools.cwd = dir.clone();
+    tools.allow_all_for_test();
+    let slash = tools
+        .execute_recorded(
+            "rg",
+            &json!({"pattern":"/api/v1","fixed_strings":true}).to_string(),
+        )
+        .await;
+    assert!(slash.success, "{}", slash.text);
+    assert!(
+        body(&slash).contains(":1:GET /api/v1/users"),
+        "{}",
+        slash.text
+    );
+    let glob = tools
+        .execute_recorded("glob", r#"{"pattern":"*.txt"}"#)
+        .await;
+    assert!(glob.success, "{}", glob.text);
+    assert_eq!(body(&glob), "./a.txt\n./b.txt\n");
+    fs::remove_dir_all(dir).expect("清理");
+}
+
+#[cfg(windows)]
+#[test]
+fn windows_paths_accept_git_bash_and_verbatim_forms() {
+    use super::file::resolve_path;
+    let cwd = std::path::Path::new(r"F:\repo");
+    let resolved = |raw| resolve_path(cwd, raw).expect("路径有效");
+    assert_eq!(
+        resolved("/f/repo/src/a.rs"),
+        std::path::Path::new(r"F:\repo\src\a.rs")
+    );
+    assert_eq!(
+        resolved("src/a.rs"),
+        std::path::Path::new(r"F:\repo\src\a.rs")
+    );
+    assert_eq!(
+        resolved("F:/other/b.rs"),
+        std::path::Path::new(r"F:\other\b.rs")
+    );
+    assert_eq!(
+        resolved(r"\\?\F:\x\c.rs"),
+        std::path::Path::new(r"F:\x\c.rs")
+    );
+}
+
+#[tokio::test]
 async fn query_empty_errors_ignore_rules_and_truncation_are_distinct() {
     use serde_json::json;
     let dir = query_dir();
-    let mut tools = Tools::new(true, "bash".into()).expect("初始化");
+    let mut tools = Tools::new(true, crate::config::default_bash_bin()).expect("初始化");
     tools.cwd = dir.clone();
     tools.allow_all_for_test();
     let empty = tools.execute_recorded("ls", "{}").await;
@@ -428,7 +485,12 @@ async fn query_empty_errors_ignore_rules_and_truncation_are_distinct() {
         let result = tools.execute_recorded(name, args).await;
         assert!(result.success, "{}", result.text);
         assert!(result.text.chars().count() <= 2000);
-        assert_eq!(metadata(&result)["truncated"], true);
+        assert_eq!(
+            metadata(&result)["truncated"],
+            true,
+            "{name}: {}",
+            result.text
+        );
         assert!(result.text.contains("缩小"));
         assert!(metadata(&result)["next_offset"].is_null());
     }
@@ -440,7 +502,7 @@ async fn queries_have_separate_grants_and_batch_respects_mutation_barriers() {
     use serde_json::json;
     let dir = query_dir();
     fs::write(dir.join("a.txt"), "before").expect("文件");
-    let mut tools = Tools::new(true, "bash".into()).expect("初始化");
+    let mut tools = Tools::new(true, crate::config::default_bash_bin()).expect("初始化");
     tools.cwd = dir.clone();
     let prompts = Rc::new(Cell::new(0));
     let seen = Rc::clone(&prompts);
@@ -531,7 +593,7 @@ async fn explicit_workspace_drives_bash_file_and_default_query_paths() {
     fs::write(workspace_a.join("only-a.txt"), "A").expect("写入 A 列表文件");
     fs::write(workspace_b.join("only-b.txt"), "B").expect("写入 B 列表文件");
 
-    let mut tools = Tools::new(true, "bash".into()).expect("初始化");
+    let mut tools = Tools::new(true, crate::config::default_bash_bin()).expect("初始化");
     tools.allow_all_for_test();
     let read_a = tools
         .execute_recorded_in(&workspace_a, "read", r#"{"path":"marker.txt"}"#)
@@ -546,7 +608,9 @@ async fn explicit_workspace_drives_bash_file_and_default_query_paths() {
         .execute_recorded_in(&workspace_b, "bash", r#"{"command":"pwd; cat marker.txt"}"#)
         .await;
     assert!(bash.success);
-    assert!(bash.text.contains(&workspace_b.display().to_string()));
+    // Git Bash 会把 Windows 临时目录挂载成 /tmp，只比较最后两级目录名。
+    let tail = format!("{}/工作区 B", root.file_name().unwrap().to_string_lossy());
+    assert!(bash.text.contains(&tail), "{}", bash.text);
     assert!(bash.text.contains("beta-only"));
 
     let listing = tools.execute_recorded_in(&workspace_b, "ls", "{}").await;

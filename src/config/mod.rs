@@ -1,5 +1,9 @@
 //! 配置层：可被任意业务模块引用。本模块不依赖其它业务模块。
 
+mod path;
+
+pub(crate) use path::{bash_arg, from_msys, msys_style, plain_path};
+
 use std::{
     error::Error,
     fmt, fs, io,
@@ -352,6 +356,35 @@ fn parse_nonnegative_f64(value: Option<String>, name: &str) -> Result<Option<f64
         .transpose()
 }
 
+/// 未设置 `GEER_AGENT_BASH_BIN` 时选择 Bash。
+/// Windows 的 PATH 常先命中 System32 里的 WSL `bash.exe`，所以先用
+/// `C:\Program Files\Git\bin\bash.exe`，再试其它常见 Git 安装位置，PATH 中的 `bash` 最后。
+/// 非 Windows 直接使用 PATH 中的 `bash`。
+pub(crate) fn default_bash_bin() -> PathBuf {
+    bash_candidates()
+        .into_iter()
+        .find(|path| !path.is_absolute() || path.is_file())
+        .unwrap_or_else(|| PathBuf::from("bash"))
+}
+
+fn bash_candidates() -> Vec<PathBuf> {
+    if !cfg!(windows) {
+        return vec![PathBuf::from("bash")];
+    }
+
+    let mut paths = vec![PathBuf::from(r"C:\Program Files\Git\bin\bash.exe")];
+    paths.extend(
+        ["ProgramFiles", "ProgramW6432", "ProgramFiles(x86)"]
+            .into_iter()
+            .filter_map(std::env::var_os)
+            .map(PathBuf::from)
+            .chain(std::env::var_os("LOCALAPPDATA").map(|dir| PathBuf::from(dir).join("Programs")))
+            .map(|dir| dir.join("Git").join("bin").join("bash.exe")),
+    );
+    paths.push(PathBuf::from("bash"));
+    paths
+}
+
 fn user_home() -> Option<PathBuf> {
     #[cfg(windows)]
     let name = "USERPROFILE";
@@ -507,7 +540,7 @@ impl Config {
             .map(|value| value.trim().to_owned())
             .filter(|value| !value.is_empty())
             .map_or_else(
-                || Ok(PathBuf::from("bash")),
+                || Ok(default_bash_bin()),
                 |value| {
                     let path = PathBuf::from(value);
                     if path.is_absolute() {
@@ -816,7 +849,30 @@ mod tests {
         assert_eq!(config.base_url, DEFAULT_BASE_URL);
         assert_eq!(config.api, OpenAiApi::Responses);
         assert!(config.tools_enabled);
-        assert_eq!(config.bash_bin, std::path::Path::new("bash"));
+        assert_eq!(config.bash_bin, super::default_bash_bin());
+    }
+
+    #[test]
+    fn default_bash_prefers_git_bash_then_path_on_windows() {
+        let candidates = super::bash_candidates();
+        if cfg!(windows) {
+            assert_eq!(
+                candidates.first().map(std::path::PathBuf::as_path),
+                Some(std::path::Path::new(r"C:\Program Files\Git\bin\bash.exe"))
+            );
+            assert_eq!(
+                candidates.last().map(std::path::PathBuf::as_path),
+                Some(std::path::Path::new("bash"))
+            );
+            let chosen = super::default_bash_bin();
+            let preferred = std::path::Path::new(r"C:\Program Files\Git\bin\bash.exe");
+            if preferred.is_file() {
+                assert_eq!(chosen, preferred);
+            }
+        } else {
+            assert_eq!(candidates, vec![std::path::PathBuf::from("bash")]);
+            assert_eq!(super::default_bash_bin(), std::path::Path::new("bash"));
+        }
     }
 
     #[test]

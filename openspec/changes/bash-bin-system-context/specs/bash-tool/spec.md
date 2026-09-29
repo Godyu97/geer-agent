@@ -8,7 +8,7 @@
 
 ### Requirement: Bash 可执行文件配置
 
-系统 MUST 接受可选的 `GEER_AGENT_BASH_BIN` 绝对路径配置，使用所选 Bash 执行已授权命令；未设置或为空时 MUST 从进程 `PATH` 查找 `bash`。
+系统 MUST 接受可选的 `GEER_AGENT_BASH_BIN` 绝对路径配置，使用所选 Bash 执行已授权命令。未设置或为空时，Windows MUST 优先使用 `C:\Program Files\Git\bin\bash.exe`（该文件不存在时再从进程 `PATH` 查找 `bash`）；其它系统 MUST 从进程 `PATH` 查找 `bash`。
 
 #### Scenario: 自定义 Bash
 
@@ -18,7 +18,7 @@
 #### Scenario: 默认 Bash
 
 - **WHEN** 用户未提供 Bash 路径并授权 Bash 工具
-- **THEN** 系统使用进程 `PATH` 找到的 `bash` 运行命令
+- **THEN** Windows 使用 `C:\Program Files\Git\bin\bash.exe`（不存在时再用进程 `PATH` 中的 `bash`）；其它系统使用进程 `PATH` 找到的 `bash`
 
 ### Requirement: 启动时验证 Bash
 
