@@ -7,7 +7,7 @@ mod query;
 
 use std::{
     collections::HashSet,
-    io::{self, IsTerminal, Write},
+    io,
     path::{Path, PathBuf},
     time::{Duration, Instant},
 };
@@ -180,7 +180,7 @@ impl Tools {
             cwd: std::env::current_dir()?,
             bash_bin,
             grants: HashSet::new(),
-            confirm: Box::new(confirm_cli),
+            confirm: Box::new(|_| Ok(false)),
         })
     }
 
@@ -429,20 +429,5 @@ impl Tools {
     }
 }
 
-fn confirm_cli(prompt: &str) -> io::Result<bool> {
-    if !io::stdin().is_terminal() {
-        return Ok(false);
-    }
-    let mut stdout = io::stdout().lock();
-    stdout.write_all(prompt.as_bytes())?;
-    stdout.flush()?;
-    drop(stdout);
-    let mut answer = String::new();
-    io::stdin().read_line(&mut answer)?;
-    Ok(matches!(
-        answer.trim().to_ascii_lowercase().as_str(),
-        "y" | "yes"
-    ))
-}
 #[cfg(test)]
 mod tests;

@@ -2,7 +2,7 @@
 
 use std::io;
 
-use crate::interaction::{self, Input, Session, Usage};
+use crate::interaction::{self, CommandOutcome, Session, Usage};
 use crate::session::{DeletePreview, DeleteReport};
 
 #[derive(Debug, Default)]
@@ -35,87 +35,51 @@ where
     U: FnMut(Option<Usage>) -> io::Result<()>,
 {
     let mut result = CommandResult::default();
-    let mut error = None;
-    let notice = match interaction::parse_input(line) {
-        Input::Empty => None,
-        Input::Invalid(message) => {
-            error = Some(message);
-            None
-        }
-        Input::Delete { ids, confirmed } => {
-            if confirmed {
-                match session.delete_sessions(&ids).await {
-                    Ok(report) => {
-                        let notice = report.text();
-                        result.delete_report = Some(report);
-                        result.notice = Some(notice);
-                        return result;
-                    }
-                    Err(failure) => error = Some(format!("会话删除失败：{failure}")),
+    result.notice =
+        match interaction::execute(session, interaction::parse_input(line), on_delta, on_usage)
+            .await
+        {
+            Err(error) => {
+                result.error = Some(super::commands::error_text(&error));
+                None
+            }
+            Ok(outcome) => match outcome {
+                CommandOutcome::Empty | CommandOutcome::Message | CommandOutcome::Exit => None,
+                CommandOutcome::Help => Some(interaction::help_text().to_owned()),
+                CommandOutcome::NewSession { session_id, .. } => {
+                    Some(format!("已开始新会话。Session ID: {session_id}"))
                 }
-            } else {
-                match session.preview_delete(&ids).await {
-                    Ok(preview) => result.delete_confirmation = Some(preview),
-                    Err(failure) => error = Some(format!("删除预览失败：{failure}")),
+                CommandOutcome::Saved(message)
+                | CommandOutcome::Compacted(message)
+                | CommandOutcome::WorkspaceChanged(message)
+                | CommandOutcome::Opened { message, .. } => Some(message),
+                CommandOutcome::Sessions(items) if items.is_empty() => {
+                    Some("没有可列出的会话。".to_owned())
                 }
-            }
-            None
-        }
-        Input::Help => Some(interaction::help_text().to_owned()),
-        Input::New | Input::Reset => Some(format!(
-            "已开始新会话。Session ID: {}",
-            session.new_session().await
-        )),
-        Input::Save => Some(session.flush().await),
-        Input::Compact => match session.compact().await {
-            Ok(message) => Some(message),
-            Err(failure) => {
-                error = Some(format!("上下文压缩失败：{failure}"));
-                None
-            }
-        },
-        Input::Sessions(scope) => match session.sessions(scope).await {
-            Ok(items) if items.is_empty() => Some("没有可列出的会话。".to_owned()),
-            Ok(items) => Some(items.join("\n")),
-            Err(failure) => {
-                error = Some(format!("会话列表读取失败：{failure}"));
-                None
-            }
-        },
-        Input::Open(id) => match session.open(&id).await {
-            Ok(message) => Some(message),
-            Err(failure) => {
-                error = Some(format!("会话恢复失败：{failure}"));
-                None
-            }
-        },
-        Input::Workspace(None) => Some(format!("Workspace: {}", session.workspace())),
-        Input::Workspace(Some(path)) => match session.set_workspace(&path).await {
-            Ok(message) => Some(message),
-            Err(failure) => {
-                error = Some(format!("Workspace 切换失败：{failure}"));
-                None
-            }
-        },
-        Input::Exit => None,
-        Input::Unknown(command) => Some(format!("未知命令：{command}（输入 /help 查看可用命令）")),
-        Input::Message(message) => {
-            if let Err(failure) = session.handle_message(&message, on_delta, on_usage).await {
-                error = Some(format!("模型请求失败：{failure}"));
-            }
-            None
-        }
-    };
-    result.notice = notice;
-    result.error = error;
+                CommandOutcome::Sessions(items) => Some(items.join("\n")),
+                CommandOutcome::Workspace(path) => Some(format!("Workspace: {path}")),
+                CommandOutcome::DeletePreview(preview) => {
+                    result.delete_confirmation = Some(preview);
+                    None
+                }
+                CommandOutcome::Deleted(report) => {
+                    let message = report.text();
+                    result.delete_report = Some(report);
+                    Some(message)
+                }
+                CommandOutcome::Unknown(command) => {
+                    Some(format!("未知命令：{command}（输入 /help 查看可用命令）"))
+                }
+            },
+        };
     result
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::interaction::SessionStatus;
-    use std::{cell::RefCell, error::Error, rc::Rc};
+    use crate::interaction::test_support::MockSession;
+    use std::{cell::RefCell, rc::Rc};
 
     #[test]
     fn identifies_only_complete_tool_progress_callbacks() {
@@ -132,124 +96,6 @@ mod tests {
             "\n[调用工具 read]\n正文\n[调用工具 ls]\n",
         ] {
             assert_eq!(tool_progress(text), None);
-        }
-    }
-
-    #[derive(Default)]
-    struct MockSession {
-        seen: Vec<String>,
-        fail: bool,
-    }
-
-    impl Session for MockSession {
-        fn session_id(&self) -> &str {
-            "mock-session"
-        }
-
-        fn workspace(&self) -> String {
-            "/tmp/mock-workspace".into()
-        }
-
-        fn status(&self) -> SessionStatus {
-            SessionStatus {
-                model: "mock".into(),
-                session_id: self.session_id().into(),
-                session_title: "新会话".into(),
-                workspace: self.workspace(),
-                context_tokens: 0,
-                context_window_tokens: 100,
-                turn_tokens: 0,
-                total_tokens: 0,
-                usage_complete: true,
-            }
-        }
-
-        async fn handle_message<F, U>(
-            &mut self,
-            input: &str,
-            mut on_delta: F,
-            mut on_usage: U,
-        ) -> Result<(), Box<dyn Error>>
-        where
-            F: FnMut(&str) -> io::Result<()>,
-            U: FnMut(Option<Usage>) -> io::Result<()>,
-        {
-            self.seen.push(input.to_owned());
-            on_delta("你")?;
-            on_usage(Some(Usage {
-                input: 3,
-                output: 4,
-            }))?;
-            on_delta("好")?;
-            if self.fail {
-                return Err(io::Error::other("mock failure").into());
-            }
-            Ok(())
-        }
-
-        async fn new_session(&mut self) -> String {
-            "new-session".into()
-        }
-
-        async fn flush(&mut self) -> String {
-            "已保存".into()
-        }
-
-        async fn compact(&mut self) -> Result<String, Box<dyn Error>> {
-            Ok("已压缩".into())
-        }
-
-        async fn set_workspace(&mut self, path: &str) -> Result<String, Box<dyn Error>> {
-            Ok(format!("已切换 Workspace: {path}"))
-        }
-
-        async fn sessions(
-            &self,
-            _scope: crate::interaction::SessionScope,
-        ) -> Result<Vec<String>, Box<dyn Error>> {
-            Ok(vec!["mock-session".into()])
-        }
-
-        async fn open(&mut self, id: &str) -> Result<String, Box<dyn Error>> {
-            Ok(format!("已打开 {id}"))
-        }
-
-        async fn session_entries(
-            &self,
-            _: crate::interaction::SessionScope,
-        ) -> Result<Vec<crate::session::SessionEntry>, Box<dyn Error>> {
-            Ok(Vec::new())
-        }
-
-        async fn preview_delete(&self, ids: &[String]) -> Result<DeletePreview, Box<dyn Error>> {
-            Ok(DeletePreview {
-                targets: ids
-                    .iter()
-                    .map(|id| crate::session::DeleteTarget {
-                        id: id.clone(),
-                        title: "测试会话".into(),
-                        active: false,
-                    })
-                    .collect(),
-            })
-        }
-
-        async fn delete_sessions(
-            &mut self,
-            ids: &[String],
-        ) -> Result<DeleteReport, Box<dyn Error>> {
-            self.seen.extend(ids.iter().cloned());
-            Ok(DeleteReport {
-                items: ids
-                    .iter()
-                    .map(|id| crate::session::DeleteItem {
-                        id: id.clone(),
-                        state: crate::session::DeleteState::Deleted,
-                        error: None,
-                    })
-                    .collect(),
-                new_session_id: None,
-            })
         }
     }
 

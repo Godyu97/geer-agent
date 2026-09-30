@@ -88,7 +88,7 @@ fn main() {
 
 枚举变体可以带不同字段，因此比“几个 bool 组合状态”更容易保证合法性。`Option<T>` 就是 `Some(T)` 或 `None`；`Result<T, E>` 是 `Ok(T)` 或 `Err(E)`。
 
-[repl::Input](/home/lihongyu/projects/geer-agent/src/repl/index.rs) 区分退出、帮助、消息等输入；[Prompt::State](/home/lihongyu/projects/geer-agent/src/prompt/conversation.rs) 区分两种协议的历史结构。它们比字符串标记更方便让编译器检查分支遗漏。
+[interaction::Input](/home/lihongyu/projects/geer-agent/src/interaction/mod.rs) 区分退出、帮助、消息等输入；[Prompt::State](/home/lihongyu/projects/geer-agent/src/prompt/conversation.rs) 区分两种协议的历史结构。它们比字符串标记更方便让编译器检查分支遗漏。
 
 ## 数组与切片的关系
 

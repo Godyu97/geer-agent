@@ -2,22 +2,25 @@
 
 [返回总目录](../README.md) · [下一篇](02-reading-a-request.md)
 
-以下依据 2026-09-26 检查的提交 `4f6a0a2`。这是当前代码导读；模块注释或治理文件里的早期项目状态不一定同步更新。
+以下按 2026-09-30 的 UI 分层重构更新。文本 REPL、TUI 与 GUI 共用 `interaction` 的执行入口，详细设计见 [架构文档](/home/lihongyu/projects/geer-agent/docs/design/architecture.md)。
 
 ## 从最短文件开始，不要先陷进 SDK 类型
 
 | 顺序 | 文件 | 先找哪个入口 | 能学到的 Rust |
 | --- | --- | --- | --- |
-| 1 | [main.rs](/home/lihongyu/projects/geer-agent/src/main.rs) | `main` | mod、async 入口、Result |
+| 1 | [main.rs](/home/lihongyu/projects/geer-agent/src/main.rs) | `main` | mod、入口、Result |
 | 2 | [config/mod.rs](/home/lihongyu/projects/geer-agent/src/config/mod.rs) | `Config::load` / `from_values` | Option、枚举、组合器、校验 |
-| 3 | [repl/index.rs](/home/lihongyu/projects/geer-agent/src/repl/index.rs) | `parse_input` / `run` | match、BufRead、闭包、trait |
-| 4 | [provider/mod.rs](/home/lihongyu/projects/geer-agent/src/provider/mod.rs) | `ChatProvider` / `ModelStep` | 泛型、数据契约、异步方法 |
-| 5 | [prompt/conversation.rs](/home/lihongyu/projects/geer-agent/src/prompt/conversation.rs) | `Prompt` 的一组方法 | 状态枚举、移动、mem::take |
-| 6 | [agent/mod.rs](/home/lihongyu/projects/geer-agent/src/agent/mod.rs) | `run_tool_loop_with_budget` | 编排、控制流、预算、生命周期 |
-| 7 | [tools/mod.rs](/home/lihongyu/projects/geer-agent/src/tools/mod.rs) | `execute_batch` | Box 闭包、并发分组、所有权转交 |
-| 8 | [provider/openai/responses.rs](/home/lihongyu/projects/geer-agent/src/provider/openai/responses.rs) | `collect_reply` | Stream、timeout、多层错误 |
-| 9 | [trace/mod.rs](/home/lihongyu/projects/geer-agent/src/trace/mod.rs) | `TraceCapture` / `TraceRecord` | Serde、BTreeMap、Arc 原子计数 |
-| 10 | [dao/mod.rs](/home/lihongyu/projects/geer-agent/src/dao/mod.rs) | `TraceStore` 的 trait 实现 | 枚举分派、批量结果、幂等 |
+| 3 | [ui/mod.rs](/home/lihongyu/projects/geer-agent/src/ui/mod.rs) | `run` | 枚举分派、runtime、回调注入 |
+| 4 | [ui/repl/mod.rs](/home/lihongyu/projects/geer-agent/src/ui/repl/mod.rs) | `run` | BufRead、EOF、闭包、展示适配 |
+| 5 | [interaction/mod.rs](/home/lihongyu/projects/geer-agent/src/interaction/mod.rs) 与 [command.rs](/home/lihongyu/projects/geer-agent/src/interaction/command.rs) | `parse_input` / `execute` / `Session` | trait、穷尽匹配、泛型、错误分类 |
+| 6 | [provider/mod.rs](/home/lihongyu/projects/geer-agent/src/provider/mod.rs) | `ChatProvider` / `ModelStep` | 泛型、数据契约、异步方法 |
+| 7 | [prompt/conversation.rs](/home/lihongyu/projects/geer-agent/src/prompt/conversation.rs) | `Prompt` 的一组方法 | 状态枚举、移动、mem::take |
+| 8 | [agent/mod.rs](/home/lihongyu/projects/geer-agent/src/agent/mod.rs) | `impl Session for Agent` / `run_tool_loop_with_session` | 编排、控制流、预算、生命周期 |
+| 9 | [tools/mod.rs](/home/lihongyu/projects/geer-agent/src/tools/mod.rs) | `execute_batch` | Box 闭包、并发分组、所有权转交 |
+| 10 | [session/runtime.rs](/home/lihongyu/projects/geer-agent/src/session/runtime.rs) | `SessionManager` | 会话所有权、状态切换、补写 |
+| 11 | [provider/openai/responses.rs](/home/lihongyu/projects/geer-agent/src/provider/openai/responses.rs) | `collect_reply` | Stream、timeout、多层错误 |
+| 12 | [trace/mod.rs](/home/lihongyu/projects/geer-agent/src/trace/mod.rs) | `TraceCapture` / `TraceRecord` | Serde、BTreeMap、Arc 原子计数 |
+| 13 | [dao/mod.rs](/home/lihongyu/projects/geer-agent/src/dao/mod.rs) | `TraceStore` 的 trait 实现 | 枚举分派、批量结果、幂等 |
 
 每看一个函数先写四句话：接收什么、拥有还是借用、修改什么、失败怎么返回。暂时不懂的外部类型先按角色标注，如“SDK 消息类型”，不必立刻展开所有字段。
 
@@ -25,21 +28,24 @@
 
 ```mermaid
 flowchart TD
-    M[main] --> A[agent：启动和工具循环]
-    A --> C[config：读取与校验]
-    A --> R[repl：输入与展示]
-    A --> P[prompt：环境提示与会话]
+    M[main] --> U[ui：启动组合]
+    U --> C[config：读取与校验]
+    U --> R[ui/repl、tui、gui：输入与展示]
+    U --> A[agent：会话与工具循环]
+    R --> I[interaction：命令解析与共用执行]
+    I -->|Session 契约| A
+    A --> S[session：活动与停放会话]
+    S --> P[prompt：环境提示与模型历史]
     A --> V[provider：一次模型步骤]
     A --> T[tools：工具执行]
     A --> D[dao：数据库适配]
     A --> X[trace：记录与脱敏]
-    R --> P
     P --> V
     V --> X
     D --> X
 ```
 
-这是主要依赖/调用关系的简图。`agent` 把工具说明转换成 `ToolSpec`，因此 provider 不引用工具执行模块，tools 也不引用模型协议模块。
+这是主要运行时调用关系的简图；interaction 到 Agent 的箭头表示通过 Session 契约调用，不表示导入具体 Agent。`agent` 把工具说明转换成 `ToolSpec`，因此 provider 不引用工具执行模块，tools 也不引用模型协议模块。
 
 ## 三组容易混淆的类型
 

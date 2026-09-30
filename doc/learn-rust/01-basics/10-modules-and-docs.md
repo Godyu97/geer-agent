@@ -26,15 +26,18 @@ package 是由 `Cargo.toml` 管理的项目单位，可以包含多个 target；
 
 ## 项目的再导出
 
-[repl/mod.rs](/home/lihongyu/projects/geer-agent/src/repl/mod.rs) 保持内部 `index` 私有，再用 `pub(crate) use index::{Session, run};` 给仓库其他模块提供稳定入口。调用者不必知道实现在哪个文件。
+[interaction/mod.rs](/home/lihongyu/projects/geer-agent/src/interaction/mod.rs) 保持内部 `command` 私有，再用 `pub(crate) use command::{CommandError, CommandOutcome, Operation, execute, save};` 给仓库其他模块提供稳定入口。调用者不必知道执行实现在哪个文件。[ui/repl/mod.rs](/home/lihongyu/projects/geer-agent/src/ui/repl/mod.rs) 的颜色模块也保持私有，文本运行入口只对父 UI 模块开放。
 
 [tools/mod.rs](/home/lihongyu/projects/geer-agent/src/tools/mod.rs) 组织 Bash 和文件工具；Provider 需要的协议描述通过 Agent 转换，因此工具模块不必依赖 SDK 请求类型。这种依赖方向比“每个函数放单独目录”更值得学习。
 
 ```mermaid
 flowchart TD
-    A[main] --> B[agent]
-    B --> C[repl 交互]
-    B --> D[prompt 会话]
+    A[main] --> U[ui 启动组合]
+    U --> C[ui/repl 等界面]
+    U --> B[agent]
+    C --> I[interaction 共用执行]
+    I -->|Session 契约| B
+    B --> D[session / prompt 会话]
     B --> E[provider 协议]
     B --> F[tools 执行]
     B --> G[dao 持久化]

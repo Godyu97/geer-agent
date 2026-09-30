@@ -39,7 +39,7 @@ cargo test -- --test-threads=1
 
 ## 这份仓库的测试值得怎么读
 
-- [repl/index.rs](/home/lihongyu/projects/geer-agent/src/repl/index.rs)：空行、命令、非法 UTF-8 是用户能观察到的行为。
+- [interaction/tests.rs](/home/lihongyu/projects/geer-agent/src/interaction/tests.rs) 与 [ui/repl/mod.rs](/home/lihongyu/projects/geer-agent/src/ui/repl/mod.rs)：命令解析、非法 UTF-8 与确认输入是用户能观察到的行为；[command_tests.rs](/home/lihongyu/projects/geer-agent/src/interaction/command_tests.rs) 检查共用执行中的流式顺序、错误传播与删除边界。
 - [prompt/conversation.rs](/home/lihongyu/projects/geer-agent/src/prompt/conversation.rs)：检查两种协议的历史、提交与重置。
 - [tests/responses_retry.rs](/home/lihongyu/projects/geer-agent/tests/responses_retry.rs)：本地 HTTP 服务检查重试次数与可见输出。
 - [tests/tool_loop.rs](/home/lihongyu/projects/geer-agent/tests/tool_loop.rs)：启动真实二进制，注入测试配置和模型响应，检查完整链路。

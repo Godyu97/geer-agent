@@ -1,12 +1,20 @@
-//! 界面无关的会话操作与命令语义，供终端界面和 Agent 共用。
+//! 界面无关的会话契约、命令语义与执行入口，供所有 UI 复用。
 
+mod command;
 mod diagnostic;
+
+#[cfg(test)]
+mod tests;
 
 use crate::session::{DELETE_USAGE, DeletePreview, DeleteReport, SessionEntry, delete_ids};
 use serde::Serialize;
 use std::{error::Error, io};
 
+pub(crate) use command::{CommandError, CommandOutcome, Operation, execute, save};
 pub(crate) use diagnostic::{DiagnosticBuffer, emit_diagnostic};
+
+#[cfg(test)]
+pub(crate) mod test_support;
 
 #[derive(Clone, Debug, Serialize)]
 pub(crate) struct SessionStatus {

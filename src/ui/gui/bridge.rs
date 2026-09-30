@@ -402,7 +402,7 @@ fn close(
     app: &AppHandle,
 ) {
     let failure = close_failure(
-        runtime.block_on(agent.flush()),
+        runtime.block_on(interaction::save(agent)),
         agent.unsaved_ids(),
         agent.volatile_ids(),
     );

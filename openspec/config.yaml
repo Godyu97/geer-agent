@@ -12,7 +12,7 @@ context: |
   2. 一次变更一个可运行切片：对应教程一天的能力，结束时 cargo run 能看到效果。
   3. 只增量不推翻：在已有模块上扩展。禁止把「重写前一天」写进设计或任务，除非 proposal 标明 BREAKING 且用户同意。
 
-  技术栈：Rust 2024 edition，二进制 crate geer-agent，入口 src/main.rs。当前几乎是空壳。测试与检查用 cargo test / cargo fmt / cargo clippy，没有 CI。
+  技术栈：Rust 2024 edition，二进制 crate geer-agent，main 调 ui::run。已有 Responses/Chat Completions、工具循环、压缩、会话持久化、Ratatui TUI 与可选 Tauri GUI。文本 UI 在 ui/repl，三种 UI 共用 interaction 的命令执行和 Session 契约；Agent 组合模型、工具与会话。没有 CI；格式用 make fmt，测试与 clippy 必须经 make test / make clippy 的独立受限服务，收工顺序执行 make check，不裸跑测试。详见 AGENTS.md 的资源及临时目录隔离约束。
 
   把教程当行为来源，不要当 TypeScript 逐行翻译稿。design 必须说明概念如何映射到 Rust（所有权、错误处理、模块、异步），而不是复刻 dayN/ 目录或 npm 包名。
 
@@ -37,7 +37,7 @@ rules:
     - 为初学者写清「不选另一方案」的原因；Open Questions 只留真正可延后的问题。
     - 不要设计需要推翻已有可运行路径的结构，除非 proposal 已标 BREAKING。
   tasks:
-    - 每个任务一次会话能做完，复选框描述里自带验证（cargo 命令或具体 REPL 步骤）。
+    - 每个任务一次会话能做完，复选框描述里自带验证（受限 make 入口或具体 UI 步骤）。
     - 按依赖排序：先能编译运行，再加行为，最后才是打磨。
     - 禁止「重写 xxx」类任务，除非 proposal 标明 BREAKING。
     - 不要把 git push、openspec archive、或与本 change 无关的重构写进任务。
@@ -47,7 +47,7 @@ operations:
     guidance:
       - 严格按 tasks.md 增量实现；不要顺手重写未列入任务的模块。
       - 新增依赖必须已在 design.md 论证；代码注释用中文写为什么，不要贴教程原文。
-      - 一组相关任务完成后跑 cargo fmt、相关 cargo test，再跑 cargo clippy；不要用 -D warnings 当失败条件。
+      - 一组相关任务完成后顺序跑 make fmt、相关 make test，再跑 make clippy；收工 make check，不绕过受限服务或用 -D warnings 当失败条件。
       - 密钥与 .env 不得入库；缺 API key 的路径要失败可见。
   archive:
     guidance:

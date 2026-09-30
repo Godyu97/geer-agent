@@ -6,13 +6,13 @@
 
 ## 启动：配置与资源建立
 
-[agent::run](/home/lihongyu/projects/geer-agent/src/agent/mod.rs:325) 调 `Config::load()`。缺少必要配置会返回错误；可选 Trace 数据库连接失败则提示并关闭本次持久化。随后探测 Bash/系统/当前目录，组成系统提示，建立 Prompt、Provider、Tools 和会话 ID。
+[ui::run](/home/lihongyu/projects/geer-agent/src/ui/mod.rs) 加载环境配置并选择界面；终端路径建立 Tokio runtime，调用 [agent::create](/home/lihongyu/projects/geer-agent/src/agent/mod.rs) 读取 `Config::load()`。缺少必要配置会返回错误；可选 Trace 数据库连接失败则提示并关闭本次持久化。随后探测 Bash/系统/当前目录，组成系统提示，建立 Prompt、Provider、Tools 和会话管理器。启动组合点注入该界面的工具授权回调，再运行界面；GUI 在工作线程内完成 Agent 初始化。
 
 这里能同时看到四种 Rust 选择：`?` 传播必须成功的初始化；`if let Some` 处理可选配置；`match` 表达允许降级的错误；`clone` 让独立组件拥有各自需要的配置数据。
 
 ## 输入：字节、文本、命令、消息
 
-[repl::run](/home/lihongyu/projects/geer-agent/src/repl/index.rs) 刷新提示符，再读取一行字节。EOF 退出，非法 UTF-8 提示重输；合法字符串进入 `parse_input`。命令在本地处理，普通消息才调用 `prompt.begin_turn` 并进入 Session。
+[ui::repl::run](/home/lihongyu/projects/geer-agent/src/ui/repl/mod.rs) 刷新提示符，再读取一行字节。EOF 结束输入并保存，非法 UTF-8 提示重输；合法字符串交给 `interaction::parse_input`，随后由 [interaction::execute](/home/lihongyu/projects/geer-agent/src/interaction/command.rs) 分派给 Session。会话命令不进入模型对话；普通消息调用 Agent 的 `handle_message`，由业务侧执行 `prompt.begin_turn`。REPL 只负责展示结果和确认输入，TUI 与 GUI 复用相同执行入口。
 
 `flush()` 很重要：没有换行的提示符或分段输出，可能仍停留在缓冲区。写输出使用 Result，终端写失败并非不可能事件。
 
@@ -70,7 +70,7 @@ flowchart LR
 
 普通步骤的外层 deadline 由 Agent 预算提供；无工具收尾调用使用独立的收尾路径，不沿用同一外层 deadline，内部仍有 Provider 的超时逻辑。因此不能把配置秒数宣传为“整个进程绝不超过的硬实时上限”。
 
-[traced_step](/home/lihongyu/projects/geer-agent/src/agent/mod.rs:640) 将成功、失败、超时和采集的片段整理成记录，再交给可选存储。记录成功不等于业务成功；记录失败也有独立降级处理。
+[traced_step](/home/lihongyu/projects/geer-agent/src/agent/mod.rs) 将成功、失败、超时和采集的片段整理成记录，再交给可选存储。记录成功不等于业务成功；记录失败也有独立降级处理。
 
 ## 用一张表复习 Rust 知识
 

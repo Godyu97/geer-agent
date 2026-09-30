@@ -4,7 +4,6 @@ mod dao;
 mod interaction;
 mod prompt;
 mod provider;
-mod repl;
 mod session;
 mod tools;
 mod trace;

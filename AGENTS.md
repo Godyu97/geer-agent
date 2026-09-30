@@ -6,7 +6,7 @@
 
 `geer-agent` 是 [GeekAgent 教程](https://geektutu.com/books/geekagent) 的 **Rust 学习实现**。原教程用 TypeScript 从零做一个最小 Agent/Harness；本仓库用 Rust 跟同一条能力曲线，服务仓库所有者的 Rust 入门，而不是做生产级编码代理。
 
-当前状态：Cargo 二进制 crate（edition 2024），`src/main.rs` 仍是 Hello World。功能按教程天数增量长出来。
+当前状态：Cargo 二进制 crate（edition 2024），已具备两种模型 API、工具循环、压缩、会话持久化、TUI 与可选 GUI。`src/main.rs` 调用 `ui::run`；文本界面位于 `src/ui/repl/`，三种界面通过 `interaction` 共用 Agent 的会话能力。功能继续按教程能力增量增长，架构现状见 `docs/design/architecture.md`。
 
 ## 先读哪份治理文件
 
@@ -14,7 +14,7 @@
 | --- | --- | --- |
 | 本文件 | 日常编码代理 | 仓库约定、命令、安全、何时走 OpenSpec |
 | `openspec/config.yaml` | OpenSpec 工作流（propose / apply / archive 等） | 规划用的项目背景、按产物规则、apply/archive 操作指引 |
-| `openspec/specs/` | 实现与验收 | 已归档的行为契约（现在还是空的） |
+| `openspec/specs/` | 实现与验收 | 已归档的行为契约 |
 | `openspec/changes/` | 进行中的变更 | 提案、delta spec、设计、任务 |
 | `.agents/skills/openspec-*/SKILL.md` | 用户点名 OpenSpec 时 | 工作流步骤；不要把 skill 正文抄进本文件 |
 
@@ -102,7 +102,7 @@ make clippy
 
 - Edition 2024；工具链以本机 `rustc`/`cargo` 为准，不要无故加 `rust-toolchain.toml`。
 - 二进制 crate，入口 `src/main.rs`。模块按能力增长：`src/<module>.rs` 或 `src/<module>/mod.rs`，不要一上来铺 `domain/application/infrastructure`。
-- 模块依赖只允许向下：`config` 可被所有模块引用；`provider` 可被 `repl` / `agent` 引用，且不引用 `tools`；`repl` 是无工具的交互基底，不引用 `tools` / `agent`；`tools` 不引用 `provider` / `repl` / `agent`；`agent` 是带工具的 REPL，可引用 `repl`、`tools` 与 `provider`。入口 `main` 只启动 `agent`。
+- 业务模块不依赖具体 UI：`config` 可被所有模块引用；`provider` 不引用 `tools` / `agent` / `ui`；`tools` 不引用 `provider` / `agent` / `ui`；`agent` 实现 `interaction::Session`，组合模型、工具与会话，不引用 `ui`。`interaction` 定义中立契约并执行共用命令，可使用会话数据类型，但不导入具体 Agent 或 UI。`ui::run` 与 GUI 工作线程是组合点，可创建 Agent、注入授权；`ui/repl` / `ui/tui` / GUI 命令适配通过 `interaction::execute` 执行消息和会话写操作，读取绘图数据可直接使用 Session。入口 `main` 只调用 `ui::run`。
 - 标识符英文；注释只写「为什么」和 Rust 初学者不容易看出来的所有权/生命周期/错误处理选择，用中文。
 - 库路径与可失败逻辑用 `Result`/`Option`。`unwrap`/`expect` 仅限「这是 bug」或测试。禁止 `unsafe`。
 - 优先标准库。新 crate 必须能回答「std 为什么不够」。异步、流式输出、HTTP 客户端等在对应 change 的 design 里论证后再加。

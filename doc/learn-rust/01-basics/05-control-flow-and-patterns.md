@@ -21,7 +21,7 @@ fn main() {
 }
 ```
 
-本项目 [REPL 循环](/home/lihongyu/projects/geer-agent/src/repl/index.rs) 读到 EOF 或 `/exit` 时 `break`；非法 UTF-8 用 `continue` 只跳过这一行，不退出程序。
+本项目 [REPL 循环](/home/lihongyu/projects/geer-agent/src/ui/repl/mod.rs) 读到 EOF 或 `/exit` 时 `break`；非法 UTF-8 用 `continue` 只跳过这一行，不退出程序。
 
 ## `match` 同时检查形状并取出数据
 

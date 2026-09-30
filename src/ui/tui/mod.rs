@@ -20,8 +20,10 @@ use ratatui::{
     widgets::{Block, Paragraph},
 };
 
+use super::commands::error_text;
 use crate::interaction::{
-    self, DiagnosticBuffer, Input as Command, Session, SessionScope, SessionStatus, Usage,
+    self, CommandOutcome, DiagnosticBuffer, Input as Command, Session, SessionScope, SessionStatus,
+    Usage,
 };
 use input::Input;
 use sessions::{SessionAction, SessionPanel};
@@ -163,7 +165,7 @@ impl Tui {
             }
         }
 
-        let report = session.flush().await;
+        let report = interaction::save(session).await;
         self.restore()?;
         if !report.is_empty() {
             println!("{report}");
@@ -189,11 +191,11 @@ impl Tui {
             screen.draw()?;
         }
 
-        let message = match command {
-            Command::Empty => return Ok(false),
-            Command::Exit => return Ok(true),
-            Command::Help => Some(interaction::help_text().to_owned()),
-            Command::Invalid(message) => Some(message),
+        let command = match command {
+            Command::Sessions(scope) => {
+                self.show_sessions(session, scope).await?;
+                return Ok(false);
+            }
             Command::Delete { ids, confirmed } => {
                 if self.screen.borrow().state.mode != Mode::Sessions {
                     self.show_sessions(session, SessionScope::Current).await?;
@@ -209,70 +211,61 @@ impl Tui {
                 .await?;
                 return Ok(false);
             }
-            Command::Reset | Command::New => {
-                session.new_session().await;
-                Some(format!(
-                    "已开始新会话。\nSession ID: {}",
-                    session.session_id()
-                ))
+            command => command,
+        };
+        let streaming = matches!(command, Command::Message(_));
+        if streaming {
+            let mut screen = self.screen.borrow_mut();
+            screen.state.status.turn_tokens = 0;
+            screen.state.estimating = true;
+            screen.state.live_chars = 0;
+            screen.draw()?;
+        }
+        let output = Rc::clone(&self.screen);
+        let usage_output = Rc::clone(&self.screen);
+        let result = interaction::execute(
+            session,
+            command,
+            move |delta| output.borrow_mut().delta(delta),
+            move |usage| usage_output.borrow_mut().usage(usage),
+        )
+        .await;
+        let mut screen = self.screen.borrow_mut();
+        if streaming {
+            screen.state.estimating = false;
+            screen.state.live_chars = 0;
+        }
+        let message = match result {
+            Err(error) => Some(error_text(&error)),
+            Ok(CommandOutcome::Empty | CommandOutcome::Message) => None,
+            Ok(CommandOutcome::Exit) => return Ok(true),
+            Ok(CommandOutcome::Help) => Some(interaction::help_text().to_owned()),
+            Ok(CommandOutcome::NewSession { session_id, .. }) => {
+                Some(format!("已开始新会话。\nSession ID: {session_id}"))
             }
-            Command::Save => Some(session.flush().await),
-            Command::Compact => match session.compact().await {
-                Ok(result) => Some(result),
-                Err(error) => Some(format!("上下文压缩失败：{error}")),
-            },
-            Command::Sessions(scope) => {
-                self.show_sessions(session, scope).await?;
-                return Ok(false);
+            Ok(CommandOutcome::Saved(message) | CommandOutcome::Compacted(message)) => {
+                Some(message)
             }
-            Command::Open(id) => match session.open(&id).await {
-                Ok(message) => Some(format!("{message}\nSession ID: {}", session.session_id())),
-                Err(error) => Some(format!("会话恢复失败：{error}")),
-            },
-            Command::Workspace(None) => Some(format!("Workspace: {}", session.workspace())),
-            Command::Workspace(Some(path)) => match session.set_workspace(&path).await {
-                Ok(message) => {
-                    let mut screen = self.screen.borrow_mut();
-                    screen.state.mode = Mode::Chat;
-                    screen.state.workspace_input.clear();
-                    Some(message)
-                }
-                Err(error) => Some(format!("Workspace 切换失败：{error}")),
-            },
-            Command::Unknown(command) => {
+            Ok(CommandOutcome::Opened {
+                message,
+                session_id,
+            }) => Some(format!("{message}\nSession ID: {session_id}")),
+            Ok(CommandOutcome::Workspace(path)) => Some(format!("Workspace: {path}")),
+            Ok(CommandOutcome::WorkspaceChanged(message)) => {
+                screen.state.mode = Mode::Chat;
+                screen.state.workspace_input.clear();
+                Some(message)
+            }
+            Ok(CommandOutcome::Unknown(command)) => {
                 Some(format!("未知命令：{command}（输入 /help 查看可用命令）"))
             }
-            Command::Message(message) => {
-                {
-                    let mut screen = self.screen.borrow_mut();
-                    screen.state.status.turn_tokens = 0;
-                    screen.state.estimating = true;
-                    screen.state.live_chars = 0;
-                    screen.draw()?;
-                }
-                let output = Rc::clone(&self.screen);
-                let usage_output = Rc::clone(&self.screen);
-                let result = session
-                    .handle_message(
-                        &message,
-                        move |delta| output.borrow_mut().delta(delta),
-                        move |usage| usage_output.borrow_mut().usage(usage),
-                    )
-                    .await;
-                let mut screen = self.screen.borrow_mut();
-                screen.state.estimating = false;
-                screen.state.live_chars = 0;
-                if let Err(error) = result {
-                    screen
-                        .state
-                        .append(Kind::System, format!("模型请求失败：{error}"));
-                }
-                screen.state.sync_session(session.status());
-                screen.draw()?;
-                return Ok(false);
+            Ok(CommandOutcome::Sessions(items)) => Some(items.join("\n")),
+            Ok(CommandOutcome::DeletePreview(preview)) => {
+                screen.state.sessions.confirm(preview);
+                None
             }
+            Ok(CommandOutcome::Deleted(report)) => Some(report.text()),
         };
-        let mut screen = self.screen.borrow_mut();
         screen.state.sync_session(session.status());
         if let Some(message) = message {
             screen.state.append(Kind::System, message);
@@ -313,56 +306,56 @@ impl Tui {
         session: &mut impl Session,
         action: SessionAction,
     ) -> io::Result<()> {
-        match action {
+        let command = match action {
             SessionAction::Reload(scope) => return self.show_sessions(session, scope).await,
             SessionAction::Close => {
                 let mut screen = self.screen.borrow_mut();
                 screen.state.mode = Mode::Chat;
                 screen.state.sessions = SessionPanel::new(SessionScope::Current);
+                screen.state.sync_session(session.status());
+                return screen.draw();
             }
-            SessionAction::Preview(ids) => {
-                let preview = session.preview_delete(&ids).await;
+            SessionAction::Preview(ids) => Command::Delete {
+                ids,
+                confirmed: false,
+            },
+            SessionAction::Delete(ids) => Command::Delete {
+                ids,
+                confirmed: true,
+            },
+            SessionAction::Open(id) => Command::Open(id),
+        };
+        match interaction::execute(session, command, |_| Ok(()), |_| Ok(())).await {
+            Ok(CommandOutcome::DeletePreview(preview)) => {
+                self.screen.borrow_mut().state.sessions.confirm(preview);
+            }
+            Ok(CommandOutcome::Deleted(report)) => {
+                let scope = self.screen.borrow().state.sessions.scope;
+                let entries = session.session_entries(scope).await;
                 let mut screen = self.screen.borrow_mut();
-                match preview {
-                    Ok(preview) => screen.state.sessions.confirm(preview),
-                    Err(error) => screen.state.sessions.message = format!("删除预览失败：{error}"),
+                screen.state.sync_session(session.status());
+                screen.state.append(Kind::System, report.text());
+                screen.state.sessions.report(&report);
+                match entries {
+                    Ok(entries) => screen.state.sessions.refresh(entries),
+                    Err(error) => screen
+                        .state
+                        .sessions
+                        .message
+                        .push_str(&format!("\n列表刷新失败：{error}")),
                 }
             }
-            SessionAction::Delete(ids) => match session.delete_sessions(&ids).await {
-                Ok(report) => {
-                    let scope = self.screen.borrow().state.sessions.scope;
-                    let entries = session.session_entries(scope).await;
-                    let mut screen = self.screen.borrow_mut();
-                    screen.state.sync_session(session.status());
-                    screen.state.append(Kind::System, report.text());
-                    screen.state.sessions.report(&report);
-                    match entries {
-                        Ok(entries) => screen.state.sessions.refresh(entries),
-                        Err(error) => screen
-                            .state
-                            .sessions
-                            .message
-                            .push_str(&format!("\n列表刷新失败：{error}")),
-                    }
-                }
-                Err(error) => {
-                    self.screen.borrow_mut().state.sessions.message =
-                        format!("会话删除失败：{error}")
-                }
-            },
-            SessionAction::Open(id) => match session.open(&id).await {
-                Ok(message) => {
-                    let mut screen = self.screen.borrow_mut();
-                    screen.state.sync_session(session.status());
-                    screen.state.sessions = SessionPanel::new(SessionScope::Current);
-                    screen.state.mode = Mode::Chat;
-                    screen.state.append(Kind::System, message);
-                }
-                Err(error) => {
-                    self.screen.borrow_mut().state.sessions.message =
-                        format!("会话恢复失败：{error}")
-                }
-            },
+            Ok(CommandOutcome::Opened { message, .. }) => {
+                let mut screen = self.screen.borrow_mut();
+                screen.state.sync_session(session.status());
+                screen.state.sessions = SessionPanel::new(SessionScope::Current);
+                screen.state.mode = Mode::Chat;
+                screen.state.append(Kind::System, message);
+            }
+            Err(error) => {
+                self.screen.borrow_mut().state.sessions.message = error_text(&error);
+            }
+            Ok(_) => return Err(io::Error::other("会话面板收到不支持的操作结果")),
         }
         let mut screen = self.screen.borrow_mut();
         screen.state.sync_session(session.status());

@@ -1,5 +1,7 @@
 //! 在入口处组合会话能力与具体终端界面。
 
+mod commands;
+mod repl;
 mod tui;
 
 #[cfg(feature = "gui")]
@@ -25,7 +27,6 @@ use std::{
 use crate::{
     agent,
     config::{self, UiMode},
-    repl,
 };
 
 pub(crate) fn run() -> Result<(), Box<dyn Error>> {
@@ -60,6 +61,7 @@ pub(crate) fn run() -> Result<(), Box<dyn Error>> {
                     agent.set_confirm(ui.confirmer());
                     ui.run(&mut agent).await
                 } else {
+                    agent.set_confirm(repl::confirm);
                     repl::run(&mut agent).await
                 }
             })
