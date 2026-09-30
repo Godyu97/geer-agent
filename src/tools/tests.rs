@@ -604,6 +604,39 @@ async fn explicit_workspace_drives_bash_file_and_default_query_paths() {
     assert_eq!(body(&read_a), "alpha-only");
     assert_eq!(body(&read_b), "beta-only");
 
+    let absolute = tools
+        .execute_recorded_in(
+            &workspace_b,
+            "read",
+            &serde_json::json!({"path":workspace_a.join("marker.txt")}).to_string(),
+        )
+        .await;
+    assert_eq!(body(&absolute), "alpha-only");
+    let quoted = tools
+        .execute_recorded_in(
+            &workspace_b,
+            "read",
+            &serde_json::json!({"path":"\"marker.txt\""}).to_string(),
+        )
+        .await;
+    assert_eq!(body(&quoted), "beta-only");
+    let missing = tools
+        .execute_recorded_in(&workspace_b, "read", r#"{"path":"only-a.txt"}"#)
+        .await;
+    assert!(!missing.success);
+    assert_eq!(metadata(&missing)["code"], "not_found");
+    assert_eq!(
+        metadata(&missing)["path"],
+        serde_json::json!(workspace_b.join("only-a.txt"))
+    );
+    assert!(
+        metadata(&missing)["message"]
+            .as_str()
+            .unwrap()
+            .contains("未获得文件正文")
+    );
+    assert!(metadata(&missing)["empty"].is_null());
+
     let bash = tools
         .execute_recorded_in(&workspace_b, "bash", r#"{"command":"pwd; cat marker.txt"}"#)
         .await;
@@ -638,7 +671,7 @@ async fn query_dependencies_are_resolved_by_configured_bash_only() {
     let wrapper = dir.join(format!("bash-{}", uuid::Uuid::new_v4()));
     let empty_path = dir.join("empty-path");
     fs::create_dir(&empty_path).expect("创建空 PATH 目录");
-    // 清空继承的 Shell 环境；配置只作用于测试子进程，不修改全局 PATH。
+    // 隔离启动钩子和 PATH，同时保留工具通过环境传入的脚本与参数。
     let quoted = format!("'{}'", bash_path.trim().replace('\'', "'\\''"));
     let quoted_path = format!(
         "'{}'",
@@ -646,7 +679,9 @@ async fn query_dependencies_are_resolved_by_configured_bash_only() {
     );
     fs::write(
         &wrapper,
-        format!("#!/bin/sh\nexec /usr/bin/env -i PATH={quoted_path} {quoted} \"$@\"\n"),
+        format!(
+            "#!/bin/sh\nunset BASH_ENV ENV\nPATH={quoted_path}\nexport PATH\nexec {quoted} \"$@\"\n"
+        ),
     )
     .expect("隔离环境");
     fs::set_permissions(&wrapper, fs::Permissions::from_mode(0o700)).expect("执行权限");

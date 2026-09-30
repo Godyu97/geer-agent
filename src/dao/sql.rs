@@ -400,6 +400,11 @@ impl SqlStore {
         events: &[SessionEvent],
         expected_revision: Option<i64>,
     ) -> Result<(), TraceError> {
+        let transaction = self
+            .db
+            .begin()
+            .await
+            .map_err(|_| TraceError("SQL 会话保存事务启动失败".into()))?;
         for event in events {
             let row = session_event_entity::Model {
                 id: event.id.clone(),
@@ -408,18 +413,20 @@ impl SqlStore {
                 kind: event.kind.clone(),
                 payload: event.payload.clone(),
             };
-            if session_event_entity::ActiveModel::from(row.clone())
-                .insert(&self.db)
+            // 冲突不触发 SQL 错误，避免 PostgreSQL 将事务置为失败；再核对内容保证重试安全。
+            session_event_entity::Entity::insert(session_event_entity::ActiveModel::from(
+                row.clone(),
+            ))
+            .on_conflict_do_nothing()
+            .exec_without_returning(&transaction)
+            .await
+            .map_err(|_| TraceError("SQL 会话事件写入失败".into()))?;
+            let stored = session_event_entity::Entity::find_by_id(&event.id)
+                .one(&transaction)
                 .await
-                .is_err()
-            {
-                let stored = session_event_entity::Entity::find_by_id(&event.id)
-                    .one(&self.db)
-                    .await
-                    .map_err(|_| TraceError("SQL 会话事件读取失败".into()))?;
-                if stored != Some(row) {
-                    return Err(TraceError("SQL 会话事件写入冲突".into()));
-                }
+                .map_err(|_| TraceError("SQL 会话事件读取失败".into()))?;
+            if stored != Some(row) {
+                return Err(TraceError("SQL 会话事件写入冲突".into()));
             }
         }
         let row = session_entity::Model {
@@ -449,7 +456,7 @@ impl SqlStore {
                 })
                 .filter(session_entity::Column::Id.eq(&record.id))
                 .filter(session_entity::Column::Revision.eq(expected))
-                .exec(&self.db)
+                .exec(&transaction)
                 .await
                 .map_err(|_| TraceError("SQL 会话检查点更新失败".into()))?;
             if updated.rows_affected != 1 {
@@ -460,10 +467,14 @@ impl SqlStore {
                 return Err(TraceError("初始会话 revision 无效".into()));
             }
             session_entity::ActiveModel::from(row)
-                .insert(&self.db)
+                .insert(&transaction)
                 .await
                 .map_err(|_| TraceError("SQL 会话检查点创建失败或 ID 冲突".into()))?;
         }
+        transaction
+            .commit()
+            .await
+            .map_err(|_| TraceError("SQL 会话保存提交失败，重试可确认状态".into()))?;
         Ok(())
     }
 
@@ -611,4 +622,125 @@ fn from_model(row: entity::Model) -> Result<TraceRecord, TraceError> {
         response: row.response,
         error: row.error,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+    use uuid::Uuid;
+
+    use super::{SessionEvent, SessionRecord, SqlStore};
+
+    async fn fixture() -> (SqlStore, SessionRecord, SessionEvent, std::path::PathBuf) {
+        let root = std::env::temp_dir().join(format!("geer-checkpoint-{}", Uuid::new_v4()));
+        let store = SqlStore::connect(&format!(
+            "sqlite://{}?mode=rwc",
+            root.join("sessions.db").display()
+        ))
+        .await
+        .unwrap();
+        let event = SessionEvent {
+            id: Uuid::new_v4().to_string(),
+            parent_id: None,
+            session_id: Uuid::new_v4().to_string(),
+            kind: "user".to_owned(),
+            payload: json!({"text":"original"}),
+        };
+        let record = SessionRecord {
+            id: event.session_id.clone(),
+            workspace: root.to_string_lossy().into_owned(),
+            api: "responses".to_owned(),
+            model: "test".to_owned(),
+            endpoint: "http://example.test/v1".to_owned(),
+            snapshot: json!({"version":1}),
+            head_event_id: Some(event.id.clone()),
+            revision: 0,
+            updated_at_ms: 1,
+            uncertain_tools: false,
+        };
+        store
+            .save_session(&record, std::slice::from_ref(&event), None)
+            .await
+            .unwrap();
+        (store, record, event, root)
+    }
+
+    #[tokio::test]
+    async fn failed_checkpoint_rolls_back_events_and_allows_identical_retry() {
+        let (store, mut published, original, root) = fixture().await;
+        published.revision = 1;
+        store.save_session(&published, &[], Some(0)).await.unwrap();
+
+        for (revision, expected) in [(1, Some(0)), (2, Some(0)), (0, None)] {
+            let mut event = original.clone();
+            event.id = Uuid::new_v4().to_string();
+            event.parent_id = published.head_event_id.clone();
+            let mut failed = published.clone();
+            failed.revision = revision;
+            failed.head_event_id = Some(event.id.clone());
+            assert!(
+                store
+                    .save_session(&failed, std::slice::from_ref(&event), expected)
+                    .await
+                    .is_err()
+            );
+            assert!(store.load_session_event(&event.id).await.unwrap().is_none());
+            assert_eq!(
+                store.load_session(&published.id).await.unwrap(),
+                Some(published.clone())
+            );
+        }
+
+        published.revision = 2;
+        store
+            .save_session(&published, std::slice::from_ref(&original), Some(1))
+            .await
+            .unwrap();
+        assert_eq!(
+            store.load_session_event(&original.id).await.unwrap(),
+            Some(original)
+        );
+        assert_eq!(
+            store.load_session(&published.id).await.unwrap(),
+            Some(published)
+        );
+        drop(store);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn conflicting_event_rolls_back_earlier_inserts() {
+        let (store, published, original, root) = fixture().await;
+        let mut new_event = original.clone();
+        new_event.id = Uuid::new_v4().to_string();
+        new_event.parent_id = Some(original.id.clone());
+        let mut conflicting = original.clone();
+        conflicting.payload = json!({"text":"conflicting"});
+        let mut failed = published.clone();
+        failed.revision = 1;
+        failed.head_event_id = Some(new_event.id.clone());
+        assert!(
+            store
+                .save_session(&failed, &[new_event.clone(), conflicting], Some(0))
+                .await
+                .is_err()
+        );
+        assert!(
+            store
+                .load_session_event(&new_event.id)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            store.load_session_event(&original.id).await.unwrap(),
+            Some(original)
+        );
+        assert_eq!(
+            store.load_session(&published.id).await.unwrap(),
+            Some(published)
+        );
+        drop(store);
+        std::fs::remove_dir_all(root).unwrap();
+    }
 }

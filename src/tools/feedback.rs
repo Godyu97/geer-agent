@@ -50,11 +50,19 @@ impl ToolError {
     }
 
     pub fn output(self, tool: &str, path: Option<&Path>) -> ToolOutput {
+        let message = if tool == "read" {
+            format!("读取失败，未获得文件正文：{}", self.message)
+        } else {
+            self.message
+        };
         let mut metadata = json!({
             "tool": tool, "status": "error", "path": path,
-            "code": self.code, "field": self.field, "message": self.message,
+            "code": self.code, "field": self.field, "message": message,
             "hint": self.hint, "changed": false,
         });
+        if tool == "read" {
+            metadata["empty"] = Value::Null;
+        }
         if matches!(tool, "ls" | "glob" | "rg") {
             metadata["exit_code"] = Value::Null;
             metadata["truncated"] = json!(false);

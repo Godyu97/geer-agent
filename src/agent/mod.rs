@@ -507,7 +507,13 @@ impl Session for Agent {
         state.changed();
         if let Some(session) = state.runtime.as_mut() {
             session
-                .save(&state.id, &state.workspace, &mut state.prompt, false)
+                .save(
+                    &state.id,
+                    &state.workspace,
+                    &mut state.prompt,
+                    false,
+                    state.context_token_bias,
+                )
                 .await;
         }
         let trace = TraceContext {
@@ -952,7 +958,9 @@ where
                         *context_token_bias = 0;
                         failed_prefix = None;
                         if let Some(session) = session.as_deref_mut() {
-                            session.save(session_id, workspace, prompt, false).await;
+                            session
+                                .save(session_id, workspace, prompt, false, *context_token_bias)
+                                .await;
                         }
                         on_delta(&format!(
                             "\n[上下文压缩: {count} 条旧消息，估算 {before} → {after} tokens]\n"
@@ -1056,10 +1064,12 @@ where
                     )
                     .await
                 {
-                    if let Some(session) = session.as_deref_mut() {
-                        session.save(session_id, workspace, prompt, false).await;
-                    }
                     *context_token_bias = 0;
+                    if let Some(session) = session.as_deref_mut() {
+                        session
+                            .save(session_id, workspace, prompt, false, *context_token_bias)
+                            .await;
+                    }
                     retried_overflow = true;
                     on_delta(&format!(
                         "\n[上下文窗口溢出后压缩: {count} 条旧消息，估算 {before} → {after} tokens；重试当前模型请求]\n"
@@ -1119,7 +1129,9 @@ where
 
         used_tools = true;
         if let Some(session) = session.as_deref_mut() {
-            session.save(session_id, workspace, prompt, true).await;
+            session
+                .save(session_id, workspace, prompt, true, *context_token_bias)
+                .await;
         }
         for call in &step.calls {
             on_delta(&format!("\n[调用工具 {}]\n", call.name))?;
@@ -1148,7 +1160,9 @@ where
             .collect();
         prompt.apply_tool_results(step, &results);
         if let Some(session) = session.as_deref_mut() {
-            session.save(session_id, workspace, prompt, false).await;
+            session
+                .save(session_id, workspace, prompt, false, *context_token_bias)
+                .await;
         }
         if let Some(reason) = stop {
             return finalize_without_tools(
@@ -1426,10 +1440,16 @@ mod tests {
         where
             F: FnMut(&str) -> io::Result<()>,
         {
-            let Messages::Chat(messages) = messages else {
-                panic!("测试只使用 Chat 消息");
+            let snapshot = match messages {
+                Messages::Chat(messages) => serde_json::to_value(messages)?,
+                Messages::Responses {
+                    instructions,
+                    input,
+                } => serde_json::json!({
+                    "instructions":instructions, "input":input,
+                }),
             };
-            self.snapshots.push(serde_json::to_value(messages)?);
+            self.snapshots.push(snapshot);
             self.tool_counts.push(tools.len());
             if let Some(count) = &self.observed_usage_count {
                 self.usage_count_at_call.push(count.get());
@@ -1733,7 +1753,7 @@ mod tests {
         prompt.begin_turn("hello");
         prompt.finish_turn(text_step("answer"));
         runtime
-            .save(&saved_id, &workspace, &mut prompt, false)
+            .save(&saved_id, &workspace, &mut prompt, false, 0)
             .await;
         let config = Config {
             api_key: "test-key".into(),
@@ -2056,6 +2076,141 @@ mod tests {
         assert_eq!(metrics.turns, 2);
         assert_eq!(metrics.tool_calls, 3);
         assert_eq!(printed.matches("[调用工具 get_current_time]").count(), 3);
+    }
+
+    #[tokio::test]
+    async fn file_results_reach_both_protocols_with_workspace_paths_and_explicit_read_states() {
+        for api in [OpenAiApi::ChatCompletions, OpenAiApi::Responses] {
+            let root =
+                std::env::temp_dir().join(format!("geer-read-context-{}", uuid::Uuid::new_v4()));
+            let a = root.join("workspace A");
+            let b = root.join("workspace B");
+            fs::create_dir_all(a.join("src")).unwrap();
+            fs::create_dir_all(b.join("src")).unwrap();
+            fs::write(a.join("src/main.rs"), "workspace A source").unwrap();
+            fs::write(b.join("src/main.rs"), "workspace B source").unwrap();
+            fs::write(a.join("src/only-a.rs"), "must not read from A").unwrap();
+            fs::write(b.join("empty.txt"), "").unwrap();
+            fs::write(b.join("binary.bin"), [0xff, 0xfe]).unwrap();
+            let paths = [
+                "src/main.rs".to_owned(),
+                a.join("src/main.rs").to_string_lossy().into_owned(),
+                "src/only-a.rs".to_owned(),
+                "empty.txt".to_owned(),
+                "src".to_owned(),
+                "binary.bin".to_owned(),
+            ];
+            let calls: Vec<ToolCall> = paths
+                .iter()
+                .enumerate()
+                .map(|(index, path)| ToolCall {
+                    id: format!("read_{index}"),
+                    name: "read".to_owned(),
+                    args: serde_json::json!({"path":path}).to_string(),
+                })
+                .collect();
+            let output = if api == OpenAiApi::Responses {
+                calls
+                    .iter()
+                    .map(|call| {
+                        serde_json::from_value(serde_json::json!({
+                            "type":"function_call", "id":format!("fc_{}", call.id),
+                            "call_id":call.id, "name":call.name, "arguments":call.args,
+                            "status":"completed",
+                        }))
+                        .unwrap()
+                    })
+                    .collect()
+            } else {
+                vec![]
+            };
+            let mut provider = fake(vec![
+                Ok(ModelStep {
+                    text: String::new(),
+                    calls,
+                    output,
+                    usage: None,
+                }),
+                Ok(text_step("done")),
+            ]);
+            let mut tools = Tools::new(true, crate::config::default_bash_bin()).unwrap();
+            tools.allow_all_for_test();
+            let mut prompt = Prompt::new(api, "system".to_owned());
+            prompt.begin_turn("读取当前 workspace 的文件");
+            let workspace = Workspace::from_stored(b.to_str().unwrap()).unwrap();
+            run_tool_loop_with_session(
+                &mut provider,
+                &mut tools,
+                &mut prompt,
+                &mut |_| Ok(()),
+                &mut |_| Ok(()),
+                DEFAULT_AGENT_BUDGET,
+                "test-model",
+                None,
+                CompactionConfig::default(),
+                &mut 0,
+                &workspace,
+                None,
+                "",
+            )
+            .await
+            .unwrap();
+            let outputs: Vec<_> = match api {
+                OpenAiApi::ChatCompletions => provider.snapshots[1]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .filter(|message| message["role"] == "tool")
+                    .map(|message| message["content"].as_str().unwrap())
+                    .collect(),
+                OpenAiApi::Responses => provider.snapshots[1]["input"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .filter(|item| item["type"] == "function_call_output")
+                    .map(|item| item["output"].as_str().unwrap())
+                    .collect(),
+            };
+            assert_eq!(outputs.len(), paths.len());
+            let parts: Vec<_> = outputs
+                .iter()
+                .map(|text| {
+                    let (header, body) = text.split_once("\n\n").unwrap();
+                    (
+                        serde_json::from_str::<serde_json::Value>(header).unwrap(),
+                        body,
+                    )
+                })
+                .collect();
+            assert_eq!(parts[0].1, "workspace B source");
+            assert_eq!(parts[0].0["path"], serde_json::json!(b.join("src/main.rs")));
+            assert_eq!(parts[0].0["empty"], false);
+            assert_eq!(parts[1].1, "workspace A source");
+            assert_eq!(parts[2].0["code"], "not_found");
+            assert_eq!(
+                parts[2].0["path"],
+                serde_json::json!(b.join("src/only-a.rs"))
+            );
+            assert_eq!(parts[3].0["status"], "ok");
+            assert_eq!(parts[3].0["empty"], true);
+            assert!(parts[3].0["message"].as_str().unwrap().contains("文件为空"));
+            assert_eq!(parts[3].1, "");
+            assert_eq!(parts[4].0["code"], "not_a_file");
+            assert_eq!(parts[5].0["code"], "invalid_utf8");
+            for index in [2, 4, 5] {
+                assert_eq!(parts[index].0["status"], "error");
+                assert!(parts[index].0["empty"].is_null());
+                assert!(
+                    parts[index].0["message"]
+                        .as_str()
+                        .unwrap()
+                        .contains("未获得文件正文")
+                );
+                assert!(!parts[index].0["hint"].as_str().unwrap().is_empty());
+                assert_eq!(parts[index].1, "");
+            }
+            fs::remove_dir_all(root).unwrap();
+        }
     }
 
     #[tokio::test]

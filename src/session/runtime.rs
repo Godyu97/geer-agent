@@ -3,7 +3,7 @@ use std::{
     collections::{HashMap, HashSet},
 };
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use uuid::Uuid;
 
@@ -40,6 +40,15 @@ pub(crate) enum SaveStatus {
     Saved,
     Pending,
     Conflict,
+}
+
+#[derive(Serialize, Deserialize)]
+struct SessionSnapshot {
+    #[serde(flatten)]
+    prompt: PromptSnapshot,
+    // 旧会话只保存 Prompt，缺字段时保持原有零校正的行为。
+    #[serde(default)]
+    context_token_bias: u64,
 }
 
 impl SessionRuntime {
@@ -92,6 +101,7 @@ impl SessionRuntime {
         workspace: &Workspace,
         prompt: &mut Prompt,
         uncertain_tools: bool,
+        context_token_bias: u64,
     ) -> SaveStatus {
         self.uncertain_tools = uncertain_tools;
         let secrets: Vec<&str> = self.secrets.iter().map(String::as_str).collect();
@@ -113,7 +123,10 @@ impl SessionRuntime {
             });
         }
         self.staged_count = prompt.pending_events().len();
-        let mut snapshot = match serde_json::to_value(prompt.snapshot()) {
+        let mut snapshot = match serde_json::to_value(SessionSnapshot {
+            prompt: prompt.snapshot(),
+            context_token_bias,
+        }) {
             Ok(snapshot) => snapshot,
             Err(_) => {
                 emit_diagnostic("会话快照编码失败；本次对话继续在内存中运行。");
@@ -210,10 +223,10 @@ impl SessionRuntime {
         Ok(records)
     }
 
-    pub(crate) async fn load(
+    async fn load(
         &self,
         id: &str,
-    ) -> Result<(SessionRecord, Workspace, PromptSnapshot, Vec<RawEvent>), String> {
+    ) -> Result<(SessionRecord, Workspace, SessionSnapshot, Vec<RawEvent>), String> {
         let record = self
             .store
             .load(id)
@@ -309,7 +322,13 @@ impl SessionState {
         let runtime = self.runtime.as_mut()?;
         let uncertain = runtime.uncertain_tools();
         let result = runtime
-            .save(&self.id, &self.workspace, &mut self.prompt, uncertain)
+            .save(
+                &self.id,
+                &self.workspace,
+                &mut self.prompt,
+                uncertain,
+                self.context_token_bias,
+            )
             .await;
         self.dirty = result != SaveStatus::Saved;
         Some(result)
@@ -420,16 +439,15 @@ impl SessionManager {
             let (record, workspace, snapshot, display_events) = runtime.load(id).await?;
             let mut prompt =
                 Prompt::new(self.api, self.prompt_context.compose(workspace.as_path()));
-            prompt.restore(snapshot)?;
+            prompt.restore(snapshot.prompt)?;
             prompt.restore_display_events(display_events);
-            prompt.commit_turn();
             let mut runtime = runtime.fresh();
             runtime.adopt(&record);
             Some(SessionState {
                 id: record.id,
                 workspace,
                 prompt,
-                context_token_bias: 0,
+                context_token_bias: snapshot.context_token_bias,
                 runtime: Some(runtime),
                 updated_at_ms: record.updated_at_ms,
                 dirty: false,
@@ -842,6 +860,98 @@ mod tests {
             Some(runtime),
         );
         (root, config, store, manager)
+    }
+
+    #[tokio::test]
+    async fn disk_restore_preserves_context_bias_and_unfinished_turn_for_both_apis() {
+        for api in [OpenAiApi::ChatCompletions, OpenAiApi::Responses] {
+            let (root, _, store, mut manager) = history_manager(api).await;
+            let id = manager.active.id.clone();
+            manager.active.prompt.begin_turn("已完成的用户输入");
+            manager.active.prompt.finish_turn(reply("已完成的回答"));
+            manager.active.prompt.begin_turn("尚未完成的用户输入");
+            manager.active.context_token_bias = 41;
+            manager.active.runtime.as_mut().unwrap().uncertain_tools = true;
+            let expected = serde_json::to_value(manager.active.prompt.snapshot()).unwrap();
+            assert!(!expected["turn_start"].is_null());
+            assert_eq!(manager.active.save().await, Some(SaveStatus::Saved));
+            let saved = store.load(&id).await.unwrap().unwrap();
+            assert_eq!(saved.snapshot["context_token_bias"], 41);
+
+            let mut restarted = SessionManager::new(
+                api,
+                context("fresh system"),
+                manager.active.workspace.clone(),
+                manager.runtime_template.as_ref().map(SessionRuntime::fresh),
+            );
+            assert_eq!(restarted.open(&id).await.unwrap(), Some(true));
+            assert_eq!(restarted.active.context_token_bias, 41);
+            assert_eq!(
+                serde_json::to_value(restarted.active.prompt.snapshot()).unwrap(),
+                expected
+            );
+            assert_eq!(
+                restarted.active.prompt.transcript().last().unwrap().text,
+                "尚未完成的用户输入"
+            );
+            assert!(restarted.active.prompt.pending_events().is_empty());
+            assert!(restarted.save_all().await.is_empty());
+            assert_eq!(store.load(&id).await.unwrap(), Some(saved));
+            drop((restarted, manager, store));
+            std::fs::remove_dir_all(root).unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn disk_restore_defaults_legacy_bias_and_rejects_invalid_bias_without_switching() {
+        for api in [OpenAiApi::ChatCompletions, OpenAiApi::Responses] {
+            let (root, _, store, mut manager) = history_manager(api).await;
+            let id = manager.active.id.clone();
+            manager.active.prompt.begin_turn("legacy input");
+            manager.active.prompt.finish_turn(reply("legacy answer"));
+            manager.active.context_token_bias = 7;
+            manager.active.save().await;
+            let mut record = store.load(&id).await.unwrap().unwrap();
+            record
+                .snapshot
+                .as_object_mut()
+                .unwrap()
+                .remove("context_token_bias");
+            let revision = record.revision;
+            record.revision += 1;
+            store.save(&record, &[], Some(revision)).await.unwrap();
+
+            let restart = || {
+                SessionManager::new(
+                    api,
+                    context("fresh system"),
+                    manager.active.workspace.clone(),
+                    manager.runtime_template.as_ref().map(SessionRuntime::fresh),
+                )
+            };
+            let mut legacy = restart();
+            legacy.open(&id).await.unwrap();
+            assert_eq!(legacy.active.context_token_bias, 0);
+            assert_eq!(legacy.active.prompt.transcript()[0].text, "legacy input");
+            for invalid in [serde_json::json!(-1), serde_json::json!("41"), Value::Null] {
+                record.snapshot["context_token_bias"] = invalid;
+                let revision = record.revision;
+                record.revision += 1;
+                store.save(&record, &[], Some(revision)).await.unwrap();
+                let mut target = restart();
+                target.active.prompt.begin_turn("保留当前会话");
+                let current = target.active.id.clone();
+                let before = serde_json::to_value(target.active.prompt.snapshot()).unwrap();
+                assert!(target.open(&id).await.is_err());
+                assert_eq!(target.active.id, current);
+                assert_eq!(
+                    serde_json::to_value(target.active.prompt.snapshot()).unwrap(),
+                    before
+                );
+            }
+            drop((legacy, manager, store));
+            std::fs::remove_dir_all(root).unwrap();
+        }
     }
 
     #[tokio::test]
@@ -1463,13 +1573,13 @@ mod tests {
         prompt.begin_turn("Authorization: Bearer my-secret\nX-API-Key: extra-secret\nknown-key");
         prompt.finish_turn(reply("first answer"));
         runtime.fail_next_save = true;
-        runtime.save(&id, &workspace, &mut prompt, false).await;
+        runtime.save(&id, &workspace, &mut prompt, false, 0).await;
         assert!(runtime.store.load(&id).await.unwrap().is_none());
         assert_eq!(prompt.pending_events().len(), 2);
 
         prompt.begin_turn("second");
         prompt.finish_turn(reply("second answer"));
-        runtime.save(&id, &workspace, &mut prompt, false).await;
+        runtime.save(&id, &workspace, &mut prompt, false, 0).await;
         let record = runtime.store.load(&id).await.unwrap().unwrap();
         assert_eq!(record.revision, 0);
         assert_eq!(runtime.store.history(&record).await.unwrap().len(), 4);
@@ -1479,7 +1589,7 @@ mod tests {
         assert_eq!(record.endpoint, "https://example.test/v1");
         let (_, _, snapshot, display_events) = runtime.load(&id).await.unwrap();
         let mut recovered = Prompt::new(OpenAiApi::ChatCompletions, "new system".into());
-        recovered.restore(snapshot).unwrap();
+        recovered.restore(snapshot.prompt).unwrap();
         recovered.restore_display_events(display_events);
         assert_eq!(recovered.transcript().len(), 4);
         assert_eq!(recovered.transcript()[3].text, "second answer");
@@ -1501,7 +1611,9 @@ mod tests {
         let (record, _, _, _) = restarted.load(&id).await.unwrap();
         restarted.adopt(&record);
         recovered.begin_turn("third");
-        restarted.save(&id, &workspace, &mut recovered, true).await;
+        restarted
+            .save(&id, &workspace, &mut recovered, true, 0)
+            .await;
         assert_eq!(
             restarted.store.load(&id).await.unwrap().unwrap().revision,
             1

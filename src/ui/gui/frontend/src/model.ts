@@ -53,6 +53,7 @@ export type Snapshot = {
   all_sessions: SessionEntry[];
   transcript: Entry[];
   unsaved_ids: string[];
+  authorization_id?: number | null;
 };
 export type Event =
   | {
@@ -135,6 +136,7 @@ export function applyEvent(state: ViewState, event: Action): ViewState {
         live: "",
         liveTools: [],
         liveUsage: 0,
+        authorization: null,
         notice: null,
         error: null,
       };
@@ -167,6 +169,10 @@ export function applyEvent(state: ViewState, event: Action): ViewState {
         live: event.request_id === null ? state.live : "",
         liveTools: event.request_id === null ? state.liveTools : [],
         liveUsage: event.request_id === null ? state.liveUsage : 0,
+        authorization:
+          state.authorization?.id === event.snapshot.authorization_id
+            ? state.authorization
+            : null,
         notice: event.notice,
         error: event.error,
         deleteConfirmation: event.delete_confirmation ?? null,

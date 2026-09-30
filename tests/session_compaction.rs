@@ -97,11 +97,8 @@ fn run_default(api: &str, base_url: &str, workspace: &std::path::Path, input: &s
     let executable = workspace.join("bin").join(source.file_name().unwrap());
     if !executable.exists() {
         std::fs::create_dir_all(executable.parent().unwrap()).unwrap();
-        // /tmp 在本机是 tmpfs：复制 300MB+ 调试二进制会直接占用 RAM，OOM 后也无法清理。
-        #[cfg(unix)]
-        std::os::unix::fs::symlink(source, &executable).unwrap();
-        #[cfg(not(unix))]
-        std::fs::copy(source, &executable).unwrap();
+        // 保持独立的可执行文件位置，避免符号链接触发开发模式并读取仓库 .env。
+        std::fs::hard_link(source, &executable).unwrap();
     }
     let mut command = Command::new(executable);
     command
@@ -225,7 +222,8 @@ async fn default_database_is_shared_across_sessions_and_restarts(api: &str) {
         }
         requests
     });
-    let workspace = std::env::temp_dir().join(format!("geer-default-sessions-{}", Uuid::new_v4()));
+    let workspace = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join(format!(".test-default-sessions-{}", Uuid::new_v4()));
     std::fs::create_dir_all(&workspace).unwrap();
     let first = run_default(
         api,
@@ -352,7 +350,8 @@ async fn responses_default_database_shares_session_and_trace() {
 
 #[tokio::test]
 async fn eof_saves_all_default_sessions_without_model_requests() {
-    let workspace = std::env::temp_dir().join(format!("geer-eof-sessions-{}", Uuid::new_v4()));
+    let workspace = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join(format!(".test-eof-sessions-{}", Uuid::new_v4()));
     std::fs::create_dir_all(&workspace).unwrap();
     let output = run_default("responses", "http://127.0.0.1:1/v1", &workspace, "/new\n");
     assert!(
@@ -573,7 +572,8 @@ async fn delete_history_across_restarts(api: &str) {
             reply(&mut stream, &api_owned, answer, index);
         }
     });
-    let workspace = std::env::temp_dir().join(format!("geer-delete-history-{}", Uuid::new_v4()));
+    let workspace = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join(format!(".test-delete-history-{}", Uuid::new_v4()));
     std::fs::create_dir_all(&workspace).unwrap();
     let first = run_default(
         api,

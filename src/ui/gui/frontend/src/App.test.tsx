@@ -275,6 +275,38 @@ it("shows unsaved sessions and retries window close only after user selection", 
   await waitFor(() => expect(mock.close).toHaveBeenCalledOnce());
 });
 
+it("allows sending again after reconnect cancels an outstanding authorization", async () => {
+  render(<App />);
+  showHistory([]);
+  const input = screen.getByRole("textbox", { name: "消息" });
+  fireEvent.change(input, { target: { value: "先检查" } });
+  fireEvent.click(screen.getByRole("button", { name: /发送/ }));
+  send({ type: "authorization", id: 7, prompt: "write /tmp/a" });
+  send({
+    type: "snapshot",
+    request_id: 1,
+    snapshot: { ...snapshot, authorization_id: 7 },
+    notice: null,
+    error: null,
+  });
+  expect(screen.getByRole("button", { name: /发送/ }).hasAttribute("disabled")).toBe(true);
+  expect(screen.getByRole("button", { name: "本会话允许" })).toBeTruthy();
+  send({
+    type: "snapshot",
+    request_id: null,
+    snapshot: { ...snapshot, authorization_id: null },
+    notice: null,
+    error: null,
+  });
+  expect(screen.queryByRole("button", { name: "本会话允许" })).toBeNull();
+  fireEvent.change(input, { target: { value: "重连后继续" } });
+  fireEvent.click(screen.getByRole("button", { name: /发送/ }));
+  await waitFor(() => expect(mock.invoke).toHaveBeenCalledWith("gui_submit", {
+    requestId: 2,
+    line: "重连后继续",
+  }));
+});
+
 it("edits workspace without losing the chat draft and switches session scope", async () => {
   render(<App />);
   const currentSession = {

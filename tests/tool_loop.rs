@@ -1056,6 +1056,62 @@ fn both_apis_pair_multi_read_batch_in_original_order() {
 }
 
 #[test]
+fn both_apis_receive_explicit_failed_read_feedback_without_empty_file_claims() {
+    for api in ["chat-completions", "responses"] {
+        let final_reply = if api == "responses" {
+            Reply::ResponsesFinal
+        } else {
+            Reply::ChatFinal
+        };
+        let (output, bodies) = run_repl(
+            api,
+            vec![
+                named(
+                    api,
+                    "read",
+                    r#"{"path":"src/main.rs","offset":0}"#,
+                    1,
+                    false,
+                ),
+                final_reply,
+            ],
+            "read\n/exit\n",
+        );
+        assert!(output.status.success());
+        let text = if api == "responses" {
+            bodies[1]["input"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|item| item["type"] == "function_call_output" && item["call_id"] == "call_1")
+                .and_then(|item| item["output"].as_str())
+        } else {
+            bodies[1]["messages"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|item| item["role"] == "tool" && item["tool_call_id"] == "call_1")
+                .and_then(|item| item["content"].as_str())
+        }
+        .unwrap();
+        let (header, body) = text.split_once("\n\n").unwrap();
+        let metadata: Value = serde_json::from_str(header).unwrap();
+        assert_eq!(metadata["status"], "error");
+        assert_eq!(metadata["code"], "invalid_argument");
+        assert_eq!(metadata["field"], "offset");
+        assert!(metadata["empty"].is_null());
+        assert!(
+            metadata["message"]
+                .as_str()
+                .unwrap()
+                .contains("未获得文件正文")
+        );
+        assert!(!metadata["hint"].as_str().unwrap().is_empty());
+        assert!(body.is_empty());
+    }
+}
+
+#[test]
 fn successful_tool_breaks_consecutive_error_chain() {
     for api in ["chat-completions", "responses"] {
         let replies = vec![

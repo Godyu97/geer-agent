@@ -138,7 +138,7 @@ impl Tui {
     pub(super) async fn run(&mut self, session: &mut impl Session) -> Result<(), Box<dyn Error>> {
         {
             let mut screen = self.screen.borrow_mut();
-            screen.state.status = session.status();
+            screen.state.sync_session(session.status());
             screen.state.append(Kind::System, "GeekAgent —— 轻量 TUI");
             screen.state.append(
                 Kind::System,
@@ -267,16 +267,16 @@ impl Tui {
                         .state
                         .append(Kind::System, format!("模型请求失败：{error}"));
                 }
-                screen.state.status = session.status();
+                screen.state.sync_session(session.status());
                 screen.draw()?;
                 return Ok(false);
             }
         };
         let mut screen = self.screen.borrow_mut();
+        screen.state.sync_session(session.status());
         if let Some(message) = message {
             screen.state.append(Kind::System, message);
         }
-        screen.state.status = session.status();
         screen.draw()?;
         Ok(false)
     }
@@ -333,11 +333,7 @@ impl Tui {
                     let scope = self.screen.borrow().state.sessions.scope;
                     let entries = session.session_entries(scope).await;
                     let mut screen = self.screen.borrow_mut();
-                    if report.new_session_id.is_some() {
-                        screen.state.entries.clear();
-                        screen.state.input.clear();
-                        screen.state.scroll_back = 0;
-                    }
+                    screen.state.sync_session(session.status());
                     screen.state.append(Kind::System, report.text());
                     screen.state.sessions.report(&report);
                     match entries {
@@ -357,6 +353,7 @@ impl Tui {
             SessionAction::Open(id) => match session.open(&id).await {
                 Ok(message) => {
                     let mut screen = self.screen.borrow_mut();
+                    screen.state.sync_session(session.status());
                     screen.state.sessions = SessionPanel::new(SessionScope::Current);
                     screen.state.mode = Mode::Chat;
                     screen.state.append(Kind::System, message);
@@ -368,7 +365,7 @@ impl Tui {
             },
         }
         let mut screen = self.screen.borrow_mut();
-        screen.state.status = session.status();
+        screen.state.sync_session(session.status());
         screen.draw()
     }
 }
@@ -433,6 +430,19 @@ impl Screen {
 }
 
 impl State {
+    fn sync_session(&mut self, status: SessionStatus) {
+        if self.status.session_id != status.session_id || self.status.workspace != status.workspace
+        {
+            self.entries.clear();
+            self.input.clear();
+            self.workspace_input.clear();
+            self.scroll_back = 0;
+            self.estimating = false;
+            self.live_chars = 0;
+        }
+        self.status = status;
+    }
+
     fn append(&mut self, kind: Kind, text: impl AsRef<str>) {
         self.entries.push(Entry {
             kind,
@@ -661,7 +671,7 @@ fn render_panel(frame: &mut Frame, state: &State, area: Rect) {
     let window = status.context_window_tokens.max(1);
     let percent = ((u128::from(context) * 100).div_ceil(u128::from(window))).min(9999);
     let live = if state.estimating {
-        context.saturating_add(state.live_chars.div_ceil(2))
+        state.live_chars.div_ceil(2)
     } else {
         0
     };
@@ -823,6 +833,85 @@ mod tests {
         let text = rendered_text(terminal.backend().buffer());
         assert!(text.contains("用量部分缺失"));
         assert!(text.contains("~表示流式估算"));
+    }
+
+    #[test]
+    fn stream_estimate_counts_only_new_output_with_existing_context() {
+        let mut state = state();
+        state.status.context_tokens = 1000;
+        state.status.context_window_tokens = 2000;
+        state.status.turn_tokens = 10;
+        state.status.total_tokens = 100;
+        state.append_delta("你好abc");
+        let mut terminal = Terminal::new(TestBackend::new(80, 20)).unwrap();
+        terminal.draw(|frame| render(frame, &state)).unwrap();
+        let text = rendered_text(terminal.backend().buffer());
+        assert!(text.contains("1000/2000"));
+        assert!(text.contains("~13tokens"));
+        assert!(text.contains("~103tokens"));
+        assert!(!text.contains("~1013tokens"));
+
+        state.apply_usage(Some(Usage {
+            input: 20,
+            output: 4,
+        }));
+        terminal.draw(|frame| render(frame, &state)).unwrap();
+        let text = rendered_text(terminal.backend().buffer());
+        assert!(text.contains("34tokens"));
+        assert!(text.contains("124tokens"));
+        assert!(!text.contains('~'));
+    }
+
+    #[test]
+    fn session_or_workspace_change_clears_transient_chat_state() {
+        for (new_id, new_workspace, mode) in [
+            ("new-session", "/tmp/test-workspace", Mode::Chat),
+            ("opened-session", "/tmp/test-workspace", Mode::Sessions),
+            ("test-session", "/tmp/other-workspace", Mode::Workspace),
+        ] {
+            let mut state = state();
+            state.mode = mode;
+            state.append(Kind::User, "旧对话");
+            state.append_delta("旧回答");
+            state.input.set("旧草稿");
+            state.workspace_input.set("旧路径");
+            state.scroll_back = 12;
+            let mut next = self::state().status;
+            next.session_id = new_id.to_owned();
+            next.workspace = new_workspace.to_owned();
+            next.turn_tokens = 0;
+            state.sync_session(next);
+
+            assert!(state.entries.is_empty());
+            assert!(state.input.text().is_empty());
+            assert!(state.workspace_input.text().is_empty());
+            assert_eq!(state.scroll_back, 0);
+            assert!(!state.estimating);
+            assert_eq!(state.live_chars, 0);
+            assert_eq!(state.status.session_id, new_id);
+            assert_eq!(state.mode, mode);
+
+            state.append(Kind::System, "切换成功");
+            let mut terminal = Terminal::new(TestBackend::new(80, 20)).unwrap();
+            terminal.draw(|frame| render(frame, &state)).unwrap();
+            let text = rendered_text(terminal.backend().buffer());
+            assert!(!text.contains("旧对话"));
+            assert!(!text.contains("旧回答"));
+        }
+    }
+
+    #[test]
+    fn unchanged_session_preserves_messages_and_drafts() {
+        let mut state = state();
+        state.append(Kind::User, "原对话");
+        state.input.set("尚未发送");
+        state.workspace_input.set("/missing-path");
+        state.scroll_back = 12;
+        state.sync_session(self::state().status);
+        assert_eq!(state.entries[0].text, "原对话");
+        assert_eq!(state.input.text(), "尚未发送");
+        assert_eq!(state.workspace_input.text(), "/missing-path");
+        assert_eq!(state.scroll_back, 12);
     }
 
     #[test]

@@ -70,6 +70,7 @@ pub(super) struct GuiSnapshot {
     all_sessions: Vec<SessionEntry>,
     transcript: Vec<TranscriptEntry>,
     unsaved_ids: Vec<String>,
+    authorization_id: Option<u64>,
 }
 
 #[derive(Default)]
@@ -261,7 +262,14 @@ fn worker(
     for command in incoming {
         match command {
             Work::Connect => {
-                send_snapshot(&runtime, &agent, &bus, None, CommandResult::default());
+                send_snapshot(
+                    &runtime,
+                    &agent,
+                    &bus,
+                    &authorization,
+                    None,
+                    CommandResult::default(),
+                );
                 for message in diagnostics.drain() {
                     bus.send(GuiEvent::Diagnostic { message });
                 }
@@ -297,7 +305,14 @@ fn worker(
                     bus.send(GuiEvent::Closing);
                 }
                 busy.store(false, Ordering::Release);
-                send_snapshot(&runtime, &agent, &bus, Some(request_id), result);
+                send_snapshot(
+                    &runtime,
+                    &agent,
+                    &bus,
+                    &authorization,
+                    Some(request_id),
+                    result,
+                );
                 for message in diagnostics.drain() {
                     bus.send(GuiEvent::Diagnostic { message });
                 }
@@ -340,6 +355,7 @@ fn send_snapshot(
     runtime: &tokio::runtime::Runtime,
     agent: &Agent,
     bus: &EventBus,
+    authorization: &AuthorizationGate,
     request_id: Option<u64>,
     result: CommandResult,
 ) {
@@ -369,6 +385,7 @@ fn send_snapshot(
             all_sessions,
             transcript: agent.transcript(),
             unsaved_ids: agent.unsaved_ids(),
+            authorization_id: authorization.pending_id(),
         }),
         notice: result.notice,
         error: result.error,

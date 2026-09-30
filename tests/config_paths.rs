@@ -10,7 +10,8 @@ use std::{
 use uuid::Uuid;
 
 fn layout() -> (PathBuf, PathBuf, PathBuf, PathBuf) {
-    let root = std::env::temp_dir().join(format!("geer-config-paths-{}", Uuid::new_v4()));
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join(format!(".test-config-paths-{}", Uuid::new_v4()));
     let bin = root.join("bin");
     let home = root.join("home");
     let cwd = root.join("cwd");
@@ -19,11 +20,8 @@ fn layout() -> (PathBuf, PathBuf, PathBuf, PathBuf) {
     fs::create_dir_all(&cwd).unwrap();
     let source = Path::new(env!("CARGO_BIN_EXE_geer-agent"));
     let executable = bin.join(source.file_name().unwrap());
-    // /tmp 在本机是 tmpfs：复制调试二进制会直接占用 RAM。
-    #[cfg(unix)]
-    std::os::unix::fs::symlink(source, &executable).unwrap();
-    #[cfg(not(unix))]
-    fs::copy(source, &executable).unwrap();
+    // current_exe 会跟随符号链接回到 target；同文件系统硬链接隔离源码配置，也不复制大二进制。
+    fs::hard_link(source, &executable).unwrap();
     (root, executable, home, cwd)
 }
 

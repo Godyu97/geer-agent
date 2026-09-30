@@ -106,11 +106,20 @@ fn positive_number(args: &Value, name: &str) -> Result<Option<usize>, ToolError>
 }
 
 pub(super) fn resolve_path(cwd: &Path, raw: &str) -> Result<PathBuf, ToolError> {
+    let raw = raw.trim();
+    let raw = raw
+        .strip_prefix('"')
+        .and_then(|path| path.strip_suffix('"'))
+        .or_else(|| {
+            raw.strip_prefix('\'')
+                .and_then(|path| path.strip_suffix('\''))
+        })
+        .unwrap_or(raw);
     if raw.trim().is_empty() || raw.contains('\0') {
         return Err(ToolError::invalid(
             "path",
             "path 不能为空白或包含 NUL。",
-            "提供相对启动目录的路径、绝对路径或 ~/ 路径。",
+            "提供相对当前 workspace 的路径、本机绝对路径或 ~/ 路径。",
         ));
     }
     let windows_raw = cfg!(windows)
@@ -152,12 +161,22 @@ fn native_separators(path: PathBuf) -> PathBuf {
 
 fn read_metadata(path: &Path, offset: usize, lines: usize, has_more: bool) -> Value {
     json!({"tool":"read", "status":"ok", "path":path, "lines":lines,
+        "empty":lines == 0,
+        "message":if lines == 0 { "文件为空，没有文本正文。" } else { "成功读取，正文如下。" },
         "start_line": (lines > 0).then_some(offset),
         "end_line": (lines > 0).then(|| offset.saturating_add(lines - 1)),
         "truncated":has_more, "next_offset":has_more.then(|| offset.saturating_add(lines))})
 }
 
 fn read(path: &Path, offset: usize, limit: usize) -> Result<ToolOutput, ToolError> {
+    if !fs::metadata(path).map_err(ToolError::io)?.is_file() {
+        return Err(ToolError::new(
+            "not_a_file",
+            "目标不是普通文件，未读取正文。",
+            "目录请先用 ls/glob 定位文件；其他类型请用 bash 检查后再读取文本文件。",
+        )
+        .at("path"));
+    }
     let file = File::open(path).map_err(ToolError::io)?;
     let mut reader = BufReader::new(file);
     let out_of_range = || {
@@ -210,6 +229,13 @@ fn read(path: &Path, offset: usize, limit: usize) -> Result<ToolOutput, ToolErro
                 "核对文件编码；二进制或其他编码的文件请用 bash 检查或转换。",
             )
         })?;
+        if line.contains('\0') {
+            return Err(ToolError::new(
+                "non_text",
+                "请求片段包含 NUL，无法作为文本正文读取。",
+                "使用 bash 检查文件类型或转换为 UTF-8 文本，再重新读取；不要推测正文。",
+            ));
+        }
         body.push_str(&line);
         lines += 1;
     }
@@ -437,9 +463,55 @@ mod tests {
         assert!(meta["start_line"].is_null());
         assert!(meta["next_offset"].is_null());
         assert_eq!(meta["truncated"], false);
+        assert_eq!(meta["empty"], true);
+        assert!(meta["message"].as_str().unwrap().contains("文件为空"));
         assert!(body.is_empty());
         assert!(read(&path, 2, 1).is_err());
         fs::remove_dir_all(dir).expect("清理");
+    }
+
+    #[test]
+    fn paths_resolve_relative_absolute_and_quoted_without_altering_inner_characters() {
+        let dir = temp_dir();
+        let target = dir.join("nested folder").join("正文.txt");
+        for raw in [
+            "nested folder/正文.txt",
+            "\"nested folder/正文.txt\"",
+            " 'nested folder/正文.txt' ",
+        ] {
+            assert_eq!(
+                resolve_path(&dir, raw).unwrap(),
+                native_separators(target.clone())
+            );
+        }
+        let absolute = target.to_string_lossy();
+        assert_eq!(resolve_path(&dir.join("other"), &absolute).unwrap(), target);
+        assert_eq!(
+            resolve_path(&dir, &format!("\"{absolute}\"")).unwrap(),
+            target
+        );
+        for raw in ["", " \t ", "\"\"", "''", "a\0b"] {
+            assert_eq!(
+                resolve_path(&dir, raw).unwrap_err().code,
+                "invalid_argument"
+            );
+        }
+        #[cfg(unix)]
+        assert_eq!(
+            resolve_path(&dir, "./a'\"b.txt").unwrap(),
+            dir.join("./a'\"b.txt")
+        );
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn read_rejects_directory_and_binary_instead_of_returning_empty_content() {
+        let dir = temp_dir();
+        assert_eq!(read(&dir, 1, 1).unwrap_err().code, "not_a_file");
+        let path = dir.join("binary.bin");
+        fs::write(&path, b"header\0data").unwrap();
+        assert_eq!(read(&path, 1, 1).unwrap_err().code, "non_text");
+        fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]

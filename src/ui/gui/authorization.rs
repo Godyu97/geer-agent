@@ -52,6 +52,14 @@ impl AuthorizationGate {
         false
     }
 
+    pub(crate) fn pending_id(&self) -> Option<u64> {
+        self.pending
+            .lock()
+            .expect("授权锁损坏")
+            .as_ref()
+            .map(|(id, _)| *id)
+    }
+
     pub(crate) fn cancel(&self) {
         if let Some((_, reply)) = self.pending.lock().expect("授权锁损坏").take() {
             let _ = reply.send(false);
@@ -71,20 +79,25 @@ mod tests {
         let gate = Arc::new(AuthorizationGate::new(move |id, prompt| {
             sent.send((id, prompt.to_owned())).is_ok()
         }));
+        assert_eq!(gate.pending_id(), None);
         let pending = Arc::clone(&gate);
         let first = std::thread::spawn(move || pending.request("write /tmp/a"));
         let (id, prompt) = received.recv_timeout(Duration::from_secs(2)).unwrap();
         assert_eq!(prompt, "write /tmp/a");
+        assert_eq!(gate.pending_id(), Some(id));
         assert!(gate.respond(id, false));
         assert!(!first.join().unwrap());
+        assert_eq!(gate.pending_id(), None);
         assert!(!gate.respond(id, true));
 
         let pending = Arc::clone(&gate);
         let second = std::thread::spawn(move || pending.request("bash dangerous"));
         let (next_id, _) = received.recv_timeout(Duration::from_secs(2)).unwrap();
         assert!(next_id > id);
+        assert_eq!(gate.pending_id(), Some(next_id));
         gate.cancel();
         assert!(!second.join().unwrap());
+        assert_eq!(gate.pending_id(), None);
         assert!(!gate.respond(next_id, true));
     }
 

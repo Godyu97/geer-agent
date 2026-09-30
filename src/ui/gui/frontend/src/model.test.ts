@@ -142,6 +142,62 @@ describe("GUI message ordering", () => {
         .authorization,
     ).toBeNull();
   });
+  it("clears cancelled authorization on reconnect snapshot without losing a queued operation", () => {
+    const stale = {
+      ...initialState,
+      pending: { id: 2, line: "检查" },
+      live: "旧输出",
+      liveTools: ["read"],
+      liveUsage: 12,
+      authorization: { id: 7, prompt: "write" },
+    };
+    const connected = applyEvent(stale, {
+      type: "snapshot",
+      request_id: null,
+      snapshot: { ...snapshot, authorization_id: null },
+      notice: null,
+      error: null,
+    });
+    expect(connected.authorization).toBeNull();
+    expect(connected.pending).toEqual(stale.pending);
+    expect(connected.live).toBe(stale.live);
+    expect(connected.liveTools).toEqual(stale.liveTools);
+    expect(connected.liveUsage).toBe(stale.liveUsage);
+    const done = applyEvent(connected, {
+      type: "snapshot",
+      request_id: 2,
+      snapshot: { ...snapshot, authorization_id: null },
+      notice: null,
+      error: null,
+    });
+    expect(done.pending).toBeNull();
+    expect(done.live).toBe("");
+    expect(done.liveTools).toEqual([]);
+    expect(done.liveUsage).toBe(0);
+  });
+  it("clears old authorization on queue and keeps valid authorization across snapshots", () => {
+    const stale = { ...initialState, authorization: { id: 7, prompt: "old" } };
+    const queued = applyEvent(stale, {
+      type: "queued",
+      pending: { id: 2, line: "检查" },
+    });
+    expect(queued.authorization).toBeNull();
+    const authorized = applyEvent(queued, { type: "authorization", id: 8, prompt: "read" });
+    const completed = {
+      type: "snapshot" as const,
+      request_id: 2,
+      snapshot: { ...snapshot, authorization_id: null },
+      notice: null,
+      error: null,
+    };
+    expect(applyEvent(authorized, { ...completed, request_id: 1 })).toBe(authorized);
+    expect(applyEvent(authorized, {
+      ...completed,
+      request_id: null,
+      snapshot: { ...snapshot, authorization_id: 8 },
+    }).authorization).toEqual({ id: 8, prompt: "read" });
+    expect(applyEvent(authorized, completed).authorization).toBeNull();
+  });
   it("clears authorization on close and exposes failed saves", () => {
     const authorization = applyEvent(initialState, {
       type: "authorization",
