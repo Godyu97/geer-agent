@@ -295,7 +295,7 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("geer-guard-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).expect("测试目录");
         let path = dir.join("a.txt");
-        let mut tools = Tools::new(true, "bash".into()).expect("初始化工具");
+        let mut tools = Tools::new(true, crate::config::default_bash_bin()).expect("初始化工具");
         tools.allow_all_for_test();
         let write_args = serde_json::json!({"path":path,"content":"hello"}).to_string();
         let created = tools.execute_recorded("write", &write_args).await;

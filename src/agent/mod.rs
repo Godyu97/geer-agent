@@ -1510,7 +1510,7 @@ mod tests {
         let mut provider = fake(vec![Ok(first), Ok(second)]);
         let usage_count = Rc::new(Cell::new(0));
         provider.observed_usage_count = Some(Rc::clone(&usage_count));
-        let mut tools = Tools::new(true, "bash".into()).unwrap();
+        let mut tools = Tools::new(true, crate::config::default_bash_bin()).unwrap();
         let mut prompt = prompt();
         let mut reported = Vec::new();
         let workspace = Workspace::current().unwrap();
@@ -1553,7 +1553,7 @@ mod tests {
             Ok(text_step("## Goal\nold fact")),
             Ok(text_step("answer")),
         ]);
-        let mut tools = Tools::new(false, "bash".into()).unwrap();
+        let mut tools = Tools::new(false, crate::config::default_bash_bin()).unwrap();
         let config = CompactionConfig {
             context_window_tokens: 5_000,
             auto: true,
@@ -1603,7 +1603,7 @@ mod tests {
             Err("summary unavailable".into()),
             Ok(text_step("answer")),
         ]);
-        let mut tools = Tools::new(false, "bash".into()).unwrap();
+        let mut tools = Tools::new(false, crate::config::default_bash_bin()).unwrap();
         let mut printed = String::new();
         let metrics = run_tool_loop_with_context(
             &mut provider,
@@ -1650,7 +1650,7 @@ mod tests {
             Ok(text_step("## Goal\nFile inspected")),
             Ok(text_step("final answer")),
         ]);
-        let mut tools = Tools::new(true, "bash".into()).unwrap();
+        let mut tools = Tools::new(true, crate::config::default_bash_bin()).unwrap();
         tools.allow_all_for_test();
         let metrics = run_tool_loop_with_context(
             &mut provider,
@@ -1682,7 +1682,7 @@ mod tests {
         let mut prompt = Prompt::new(OpenAiApi::ChatCompletions, "system".into());
         prompt.begin_turn(&"large".repeat(1_000));
         let mut provider = fake(vec![]);
-        let mut tools = Tools::new(false, "bash".into()).unwrap();
+        let mut tools = Tools::new(false, crate::config::default_bash_bin()).unwrap();
         let result = run_tool_loop_with_context(
             &mut provider,
             &mut tools,
@@ -1741,13 +1741,13 @@ mod tests {
             base_url: "http://example.test/v1".into(),
             api: OpenAiApi::ChatCompletions,
             tools_enabled: true,
-            bash_bin: "bash".into(),
+            bash_bin: crate::config::default_bash_bin(),
             limits: ResourceLimits::default(),
             trace_database: None,
             session_database: None,
             compaction: CompactionConfig::default(),
         };
-        let mut tools = Tools::new(true, "bash".into()).unwrap();
+        let mut tools = Tools::new(true, crate::config::default_bash_bin()).unwrap();
         tools.grant_for_test("read");
         let mut agent = Agent {
             chat: Provider::new(&config),
@@ -1827,8 +1827,7 @@ mod tests {
         assert_ne!(agent.session_id(), same_id);
         assert_eq!(
             agent.status().workspace,
-            fs::canonicalize(&other_workspace_path)
-                .unwrap()
+            crate::config::plain_path(fs::canonicalize(&other_workspace_path).unwrap())
                 .display()
                 .to_string()
         );
@@ -1870,7 +1869,7 @@ mod tests {
         prompt: &mut Prompt,
         budget: AgentBudget,
     ) -> Result<(String, AgentMetrics), Box<dyn Error>> {
-        let mut tools = Tools::new(true, "bash".into()).expect("工作目录存在");
+        let mut tools = Tools::new(true, crate::config::default_bash_bin()).expect("工作目录存在");
         let mut printed = String::new();
         let metrics = run_tool_loop_with_budget(
             chat,
@@ -1953,7 +1952,7 @@ mod tests {
         let mut budget = DEFAULT_AGENT_BUDGET;
         budget.limits.max_duration = std::time::Duration::from_millis(10);
         let mut provider = SlowThenFinal { calls: 0 };
-        let mut tools = Tools::new(false, "bash".into()).unwrap();
+        let mut tools = Tools::new(false, crate::config::default_bash_bin()).unwrap();
         let mut prompt = prompt();
         let metrics = run_tool_loop_with_budget(
             &mut provider,
@@ -2100,7 +2099,7 @@ mod tests {
             usage: None,
         };
         let mut chat = fake(vec![Ok(step), Ok(text_step("done"))]);
-        let mut tools = Tools::new(true, "bash".into()).expect("工作目录存在");
+        let mut tools = Tools::new(true, crate::config::default_bash_bin()).expect("工作目录存在");
         tools.allow_all_for_test();
         let mut prompt = prompt();
         let metrics = run_tool_loop_with_budget(

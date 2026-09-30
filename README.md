@@ -46,7 +46,7 @@ REPL 向模型提供 `get_current_time`、`read`、`write`、`edit`、`bash`。�
 
 `read` 接受 `path`、可选的 1 起始行号 `offset` 和行数 `limit`，单次最多返回 2000 行、50 KiB 的 UTF-8 文本。`write` 接受 `path` 与 `content`，创建或覆盖文件。`edit` 接受 `path` 和 `edits` 数组，其中每项是 `oldText`、`newText`；旧文本必须在原文件中唯一匹配，各项不能重叠。`bash` 接受 `command`，在启动目录运行，10 秒超时，结果最多 2000 字符。
 
-`GEER_AGENT_BASH_BIN` 可指定 Bash 可执行文件的绝对路径；未设置或为空时从 `PATH` 查找 `bash`。启动时会验证所选 Bash 并读取版本，路径或版本无效时直接报错退出。每次模型请求都会带默认系统提示，其中 `<context_data>` 包含系统版本和所选 Bash 版本；`/reset` 后仍会提供这些环境信息。
+`GEER_AGENT_BASH_BIN` 可指定 Bash 可执行文件的绝对路径。未设置或为空时，Windows 优先使用 `C:\Program Files\Git\bin\bash.exe`，该文件不存在时再退回 `PATH` 中的 `bash`；Linux 等其它系统直接使用 `PATH` 中的 `bash`。这样可以避开 Windows System32 里的 WSL `bash.exe`。工具会自动把 Git 自带的 `usr\bin` 加入命令的 `PATH`，并把 workspace 以 `F:/repo` 形式传给 Bash。启动时会验证所选 Bash 并读取版本，路径或版本无效时直接报错退出。每次模型请求都会带默认系统提示，其中 `<context_data>` 包含系统版本和所选 Bash 版本；`/reset` 后仍会提供这些环境信息。
 
 本机工具各自在当前会话首次使用时请求 `y/N` 授权。每次切换会话（包括切回旧会话）都会清空授权；打开失败或打开当前会话则保持授权。非交互输入无法确认时默认拒绝执行。
 

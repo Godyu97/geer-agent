@@ -124,6 +124,24 @@ describe("GUI message ordering", () => {
     expect(done.pending).toBeNull();
     expect(done.live).toBe("");
   });
+  it("keeps the next authorization that arrives before the previous reply returns", () => {
+    const first = applyEvent(initialState, {
+      type: "authorization",
+      id: 1,
+      prompt: "ls",
+    });
+    const next = applyEvent(first, {
+      type: "authorization",
+      id: 2,
+      prompt: "glob",
+    });
+    const cleared = applyEvent(next, { type: "authorization_cleared", id: 1 });
+    expect(cleared.authorization).toEqual({ id: 2, prompt: "glob" });
+    expect(
+      applyEvent(cleared, { type: "authorization_cleared", id: 2 })
+        .authorization,
+    ).toBeNull();
+  });
   it("clears authorization on close and exposes failed saves", () => {
     const authorization = applyEvent(initialState, {
       type: "authorization",

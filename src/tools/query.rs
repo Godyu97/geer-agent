@@ -2,6 +2,8 @@ use std::{ffi::OsString, path::Path};
 
 use serde_json::{Value, json};
 
+use crate::config::bash_arg;
+
 use super::{
     ToolKind, ToolOutput, bash,
     feedback::{ToolError, bounded_result, fields, optional_string, string},
@@ -11,8 +13,8 @@ const LS_SCRIPT: &str = r#"cd -- "$1" || exit 125
 export LC_ALL=C
 exec ls -1Ap -- ."#;
 const GLOB_SCRIPT: &str = r#"cd -- "$1" || exit 125
-exec rg --no-config --files --color never --sort path --glob "$2" -- ."#;
-const RG_SCRIPT: &str = r#"args=(--no-config --line-number --with-filename --no-heading --color never --sort path)
+exec rg --no-config --files --color never --sort path --path-separator / --glob "$2" -- ."#;
+const RG_SCRIPT: &str = r#"args=(--no-config --line-number --with-filename --no-heading --color never --sort path --path-separator /)
 if [[ "$3" == yes ]]; then args+=(--glob "$4"); fi
 if [[ "$5" == files ]]; then args+=(--files-with-matches); fi
 if [[ "$6" == true ]]; then args+=(--fixed-strings); fi
@@ -72,7 +74,10 @@ impl Query {
     }
 
     fn command(&self, path: &Path) -> (&'static str, Vec<OsString>) {
-        let mut args = vec![path.as_os_str().to_owned()];
+        let mut args: Vec<OsString> = vec![
+            path.to_str()
+                .map_or_else(|| path.as_os_str().to_owned(), |raw| bash_arg(raw).into()),
+        ];
         let script = match self.kind {
             ToolKind::Ls => LS_SCRIPT,
             ToolKind::Glob => {
@@ -208,6 +213,7 @@ mod tests {
                 bash::CommandOutput {
                     exit_code,
                     timed_out: timeout,
+                    lingering: false,
                     stdout: bash::Capture {
                         bytes: Vec::new(),
                         truncated: false,
@@ -234,6 +240,7 @@ mod tests {
             bash::CommandOutput {
                 exit_code: Some(2),
                 timed_out: false,
+                lingering: false,
                 stdout: bash::Capture {
                     bytes: "中".repeat(8000).into_bytes(),
                     truncated: true,

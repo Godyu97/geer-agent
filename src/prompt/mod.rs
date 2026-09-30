@@ -31,6 +31,7 @@ impl PromptContext {
             &self.system_version,
             &self.bash_version,
             &workspace.display().to_string(),
+            cfg!(windows),
         )
     }
 
@@ -101,7 +102,8 @@ async fn system_version() -> String {
         "windows" => {
             let version = command_first_line("cmd", &["/C", "ver"])
                 .await
-                .unwrap_or_else(|| "未知".to_owned());
+                .and_then(|line| windows_version_number(&line))
+                .map_or_else(|| "未知".to_owned(), |number| format!("Windows {number}"));
             format_system_version("windows", &version, "")
         }
         "macos" => {
@@ -112,6 +114,13 @@ async fn system_version() -> String {
         }
         other => format!("{other} 版本未知"),
     }
+}
+
+/// `ver` 的其余文字随系统语言和代码页变化（中文系统为 GBK），只取稳定的版本号。
+fn windows_version_number(line: &str) -> Option<String> {
+    line.split(|c: char| !(c.is_ascii_digit() || c == '.'))
+        .find(|part| part.matches('.').count() >= 2)
+        .map(|part| part.trim_matches('.').to_owned())
 }
 
 fn parse_pretty_name(content: &str) -> Option<String> {
@@ -151,12 +160,31 @@ fn format_system_version(os: &str, release: &str, kernel: &str) -> String {
     }
 }
 
-fn compose(system: &str, bash: &str, current_dir: &str) -> String {
+fn compose(system: &str, bash: &str, current_dir: &str, windows: bool) -> String {
+    let bash_cwd = if windows {
+        crate::config::msys_style(current_dir)
+            .map(|path| format!("bash_cwd: {}\n", escape_xml(&path)))
+            .unwrap_or_default()
+    } else {
+        String::new()
+    };
     format!(
-        "你是本机运行的助手。回答和建议的命令应参考以下环境信息。\n<context_data>\nsystem_version: {}\nbash_version: {}\ncurrent_dir: {}\n</context_data>\n若提供文件工具：按线索直接选择目录 ls、路径 glob、正文 rg，不必依次调用。搜索结果先用 read 获取原文，再以 edit 局部修改；整体覆盖用 write。read 元信息与正文分开，续读用 next_offset（行号），勿把元信息或搜索行号复制进 oldText。各文件工具分别首次授权；查询限 10 秒/2000 字符，truncated 时缩小范围，changed=false 表示文件未变。拒绝授权后停止，不要换工具绕过。",
+        "你是本机运行的助手。回答和建议的命令应参考以下环境信息。\n<context_data>\nsystem_version: {}\nbash_version: {}\ncurrent_dir: {}\n{bash_cwd}</context_data>\n若提供文件工具：按线索直接选择目录 ls、路径 glob、正文 rg，不必依次调用。搜索结果先用 read 获取原文，再以 edit 局部修改；整体覆盖用 write。read 元信息与正文分开，续读用 next_offset（行号），勿把元信息或搜索行号复制进 oldText。各文件工具分别首次授权；查询限 10 秒/2000 字符，truncated 时缩小范围，changed=false 表示文件未变。拒绝授权后停止，不要换工具绕过。工具失败时先读 code/hint 与 stderr 判断原因，不要原样重试。\n{}",
         escape_xml(system),
         escape_xml(bash),
         escape_xml(current_dir),
+        shell_rules(windows),
+    )
+}
+
+fn shell_rules(windows: bool) -> String {
+    let platform = if windows {
+        "bash 工具由 Git Bash（MSYS2）执行，不是 cmd.exe 或 PowerShell。命令只写 Bash 语法；路径写 F:/repo/src 或 bash_cwd 那样的 /f/repo/src，不要用反斜杠或 \\\\?\\ 前缀，也不要用 dir、type、findstr、copy、del、set 等 cmd 命令。确需调用 Windows 程序时，以 / 开头的参数要写成 //（如 cmd //c ver），其输出可能是 GBK 编码。文件工具的 path 可写 F:/repo/a.txt、F:\\repo\\a.txt 或 /f/repo/a.txt。"
+    } else {
+        "bash 工具由本机 bash 执行，路径使用 POSIX 形式。"
+    };
+    format!(
+        "{platform}命令非交互（stdin 已关闭），10 秒后整个进程树会被结束：不要运行等待输入、分页器、编辑器或常驻服务的命令，git 加 --no-pager，安装类命令加 -y。优先写同时适用于 Linux bash 与 Git Bash 的命令：POSIX/Bash 语法加 GNU coreutils（ls、cat、grep、find、sed、head、wc），路径用 / 分隔，含空格的路径加引号；除非任务需要，不要依赖 apt/brew/choco、/proc、systemctl 等平台特有能力。"
     )
 }
 
@@ -171,7 +199,9 @@ fn escape_xml(value: &str) -> String {
 mod tests {
     use std::path::Path;
 
-    use super::{bash_version, compose, format_system_version, parse_pretty_name};
+    use super::{
+        bash_version, compose, format_system_version, parse_pretty_name, windows_version_number,
+    };
 
     #[test]
     fn formats_platform_versions_and_unknowns() {
@@ -188,17 +218,38 @@ mod tests {
             parse_pretty_name("NAME=Fedora\nPRETTY_NAME=\"Fedora Linux 44\"\n"),
             Some("Fedora Linux 44".to_owned())
         );
-        let prompt = compose("Linux <test>", "GNU bash, version 5.3", "/workspace/test");
+        let prompt = compose(
+            "Linux <test>",
+            "GNU bash, version 5.3",
+            "/workspace/test",
+            false,
+        );
         assert!(prompt.contains("<context_data>"));
         assert!(prompt.contains("Linux &lt;test&gt;"));
         assert!(prompt.contains("bash_version: GNU bash, version 5.3"));
         assert!(prompt.contains("current_dir: /workspace/test"));
+        assert!(!prompt.contains("bash_cwd"));
+        assert!(!prompt.contains("Git Bash（MSYS2）执行"));
+
+        let prompt = compose(
+            "Windows 10.0.26200",
+            "GNU bash, version 5.3",
+            r"F:\arzopa\calendar",
+            true,
+        );
+        assert!(prompt.contains("bash_cwd: /f/arzopa/calendar\n"));
+        assert!(prompt.contains("Git Bash（MSYS2）执行"));
+        assert_eq!(
+            windows_version_number("Microsoft Windows [\u{fffd}汾 10.0.26200.9457]").as_deref(),
+            Some("10.0.26200.9457")
+        );
+        assert_eq!(windows_version_number("no version"), None);
     }
 
     #[tokio::test]
     async fn probes_default_bash_and_rejects_invalid_path() {
         assert!(
-            bash_version(Path::new("bash"))
+            bash_version(&crate::config::default_bash_bin())
                 .await
                 .expect("Bash 可用")
                 .starts_with("GNU bash, version ")

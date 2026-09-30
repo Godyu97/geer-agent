@@ -83,7 +83,7 @@ export type Action =
   | Event
   | { type: "queued"; pending: Pending }
   | { type: "submit_failed"; request_id: number; message: string }
-  | { type: "authorization_cleared" }
+  | { type: "authorization_cleared"; id: number }
   | { type: "close_dismissed" }
   | { type: "delete_dismissed" };
 
@@ -149,7 +149,10 @@ export function applyEvent(state: ViewState, event: Action): ViewState {
           }
         : state;
     case "authorization_cleared":
-      return { ...state, authorization: null };
+      // 后端收到回复后可能立即发出下一项授权；只清除已回复的那一项，否则工作线程会一直等待。
+      return state.authorization?.id === event.id
+        ? { ...state, authorization: null }
+        : state;
     case "close_dismissed":
       return { ...state, closeFailed: null };
     case "delete_dismissed":
