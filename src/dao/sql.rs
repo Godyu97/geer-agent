@@ -2,12 +2,12 @@ use std::{str::FromStr, time::Duration};
 
 use sea_orm::{
     ActiveModelTrait, ActiveValue, ColumnTrait, ConnectOptions, Database, DatabaseConnection,
-    DbErr, EntityTrait, QueryFilter, QueryOrder, QuerySelect, sea_query::Condition,
-    sqlx::sqlite::SqliteConnectOptions,
+    DbErr, EntityTrait, QueryFilter, QueryOrder, QuerySelect, TransactionTrait,
+    sea_query::Condition, sqlx::sqlite::SqliteConnectOptions,
 };
 use sea_orm_migration::prelude::*;
 
-use crate::session::{SessionEvent, SessionRecord};
+use crate::session::{SessionEvent, SessionRecord, StoreDeletion};
 use crate::trace::{TraceCursor, TraceError, TracePage, TraceRecord, TraceStatus};
 
 mod entity {
@@ -465,6 +465,32 @@ impl SqlStore {
                 .map_err(|_| TraceError("SQL 会话检查点创建失败或 ID 冲突".into()))?;
         }
         Ok(())
+    }
+
+    pub(super) async fn delete_session(&self, id: &str) -> Result<StoreDeletion, TraceError> {
+        let transaction = self
+            .db
+            .begin()
+            .await
+            .map_err(|_| TraceError("SQL 会话删除事务启动失败".into()))?;
+        let deleted = session_entity::Entity::delete_many()
+            .filter(session_entity::Column::Id.eq(id))
+            .exec(&transaction)
+            .await
+            .map_err(|_| TraceError("SQL 会话删除失败".into()))?;
+        session_event_entity::Entity::delete_many()
+            .filter(session_event_entity::Column::SessionId.eq(id))
+            .exec(&transaction)
+            .await
+            .map_err(|_| TraceError("SQL 会话消息删除失败".into()))?;
+        transaction
+            .commit()
+            .await
+            .map_err(|_| TraceError("SQL 会话删除提交失败，重试可确认状态".into()))?;
+        Ok(StoreDeletion {
+            existed: deleted.rows_affected > 0,
+            cleanup_error: None,
+        })
     }
 
     pub(super) async fn load_session(&self, id: &str) -> Result<Option<SessionRecord>, TraceError> {

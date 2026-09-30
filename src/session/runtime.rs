@@ -1,4 +1,7 @@
-use std::collections::{HashMap, HashSet};
+use std::{
+    cell::RefCell,
+    collections::{HashMap, HashSet},
+};
 
 use serde::Serialize;
 use serde_json::Value;
@@ -9,7 +12,10 @@ use crate::{
     dao::{SESSION_REVISION_CONFLICT, SessionStore},
     interaction::emit_diagnostic,
     prompt::{Prompt, PromptContext, PromptSnapshot, RawEvent},
-    session::{SessionEvent, SessionRecord, Workspace},
+    session::{
+        DeleteItem, DeletePreview, DeleteReport, DeleteState, DeleteTarget, SessionEvent,
+        SessionRecord, StoreDeletion, Workspace, delete_ids, session_title, short_id,
+    },
     trace::{now_unix_ms, redact_json},
 };
 
@@ -207,7 +213,6 @@ impl SessionRuntime {
         validate_events(&events)?;
         let snapshot = serde_json::from_value(record.snapshot.clone())
             .map_err(|_| "会话快照格式无效。".to_owned())?;
-        #[cfg(any(feature = "gui", test))]
         let display_events = events
             .into_iter()
             .map(|event| RawEvent {
@@ -215,8 +220,6 @@ impl SessionRuntime {
                 payload: event.payload,
             })
             .collect();
-        #[cfg(not(any(feature = "gui", test)))]
-        let display_events = Vec::new();
         Ok((record, workspace, snapshot, display_events))
     }
 
@@ -311,11 +314,18 @@ pub(crate) struct SessionManager {
     runtime_template: Option<SessionRuntime>,
     api: OpenAiApi,
     prompt_context: PromptContext,
+    titles: RefCell<HashMap<String, CachedTitle>>,
+}
+
+struct CachedTitle {
+    head_event_id: Option<String>,
+    title: String,
 }
 
 #[derive(Clone, Debug, Serialize)]
 pub(crate) struct SessionEntry {
     pub(crate) id: String,
+    pub(crate) title: String,
     pub(crate) updated_at_ms: i64,
     pub(crate) model: String,
     pub(crate) status: String,
@@ -343,6 +353,7 @@ impl SessionManager {
             runtime_template: runtime,
             api,
             prompt_context,
+            titles: RefCell::new(HashMap::new()),
         }
     }
 
@@ -390,10 +401,7 @@ impl SessionManager {
             let mut prompt =
                 Prompt::new(self.api, self.prompt_context.compose(workspace.as_path()));
             prompt.restore(snapshot)?;
-            #[cfg(any(feature = "gui", test))]
             prompt.restore_display_events(display_events);
-            #[cfg(not(any(feature = "gui", test)))]
-            let _ = display_events;
             prompt.commit_turn();
             let mut runtime = runtime.fresh();
             runtime.adopt(&record);
@@ -441,6 +449,77 @@ impl SessionManager {
         results
     }
 
+    pub(crate) async fn preview_delete(&self, ids: &[String]) -> Result<DeletePreview, String> {
+        let mut targets = Vec::new();
+        for id in delete_ids(ids)? {
+            let state = if id == self.active.id {
+                Some(&self.active)
+            } else {
+                self.parked.get(&id)
+            };
+            let title = if let Some(state) = state {
+                session_title(state.prompt.first_user_input())
+            } else if let Some(runtime) = &self.runtime_template {
+                match runtime
+                    .store
+                    .load(&id)
+                    .await
+                    .map_err(|error| error.to_string())?
+                {
+                    Some(record) => self.record_title(&record).await,
+                    None => short_id(&id),
+                }
+            } else {
+                short_id(&id)
+            };
+            targets.push(DeleteTarget {
+                active: id == self.active.id,
+                id,
+                title,
+            });
+        }
+        Ok(DeletePreview { targets })
+    }
+
+    pub(crate) async fn delete(&mut self, ids: &[String]) -> Result<DeleteReport, String> {
+        let mut ids = delete_ids(ids)?;
+        ids.sort_by_key(|id| id == &self.active.id);
+        let mut report = DeleteReport::default();
+        for id in ids {
+            let in_memory = id == self.active.id || self.parked.contains_key(&id);
+            let result = match &self.runtime_template {
+                Some(runtime) => runtime.store.delete(&id).await,
+                None => Ok(StoreDeletion {
+                    existed: false,
+                    cleanup_error: None,
+                }),
+            };
+            let (state, error) = match result {
+                Err(error) => (DeleteState::Failed, Some(error.to_string())),
+                Ok(deleted) => {
+                    self.titles.borrow_mut().remove(&id);
+                    if id == self.active.id {
+                        // 不走 new_session：用户要丢弃旧状态，不能先保存或停放它。
+                        self.active = self.fresh(self.active.workspace.clone());
+                        report.new_session_id = Some(self.active.id.clone());
+                    } else {
+                        self.parked.remove(&id);
+                    }
+                    let state = if deleted.cleanup_error.is_some() {
+                        DeleteState::CleanupPending
+                    } else if deleted.existed || in_memory {
+                        DeleteState::Deleted
+                    } else {
+                        DeleteState::Absent
+                    };
+                    (state, deleted.cleanup_error)
+                }
+            };
+            report.items.push(DeleteItem { id, state, error });
+        }
+        Ok(report)
+    }
+
     pub(crate) fn unsaved_ids(&self) -> Vec<String> {
         let mut ids: Vec<_> = std::iter::once(&self.active)
             .chain(self.parked.values())
@@ -472,9 +551,10 @@ impl SessionManager {
                     chrono::DateTime::<chrono::Utc>::from_timestamp_millis(entry.updated_at_ms)
                         .map_or_else(|| entry.updated_at_ms.to_string(), |time| time.to_rfc3339());
                 format!(
-                    "{}{}  {}  {}  [{}{}]{}",
+                    "{}{}  {}  {}  {}  [{}{}]{}",
                     if entry.active { "* " } else { "  " },
                     entry.id,
+                    entry.title,
                     time,
                     entry.model,
                     entry.status,
@@ -500,10 +580,15 @@ impl SessionManager {
             match runtime.list(workspace).await {
                 Ok(records) => {
                     for record in records {
+                        if record.id == self.active.id || self.parked.contains_key(&record.id) {
+                            continue;
+                        }
+                        let title = self.record_title(&record).await;
                         entries.insert(
                             record.id.clone(),
                             SessionEntry {
                                 id: record.id,
+                                title,
                                 updated_at_ms: record.updated_at_ms,
                                 model: record.model,
                                 status: "已保存".to_owned(),
@@ -527,6 +612,7 @@ impl SessionManager {
                 state.id.clone(),
                 SessionEntry {
                     id: state.id.clone(),
+                    title: session_title(state.prompt.first_user_input()),
                     updated_at_ms: state.updated_at_ms,
                     model: self
                         .runtime_template
@@ -550,6 +636,38 @@ impl SessionManager {
                 .then_with(|| left.id.cmp(&right.id))
         });
         Ok(sorted)
+    }
+
+    async fn record_title(&self, record: &SessionRecord) -> String {
+        if let Some(cached) = self.titles.borrow().get(&record.id)
+            && cached.head_event_id == record.head_event_id
+        {
+            return cached.title.clone();
+        }
+        let Some(runtime) = &self.runtime_template else {
+            return short_id(&record.id);
+        };
+        match runtime.store.history(record).await {
+            Ok(events) => {
+                let input = events
+                    .iter()
+                    .find(|event| event.kind == "user")
+                    .and_then(|event| event.payload.get("text").and_then(Value::as_str));
+                let title = session_title(input);
+                self.titles.borrow_mut().insert(
+                    record.id.clone(),
+                    CachedTitle {
+                        head_event_id: record.head_event_id.clone(),
+                        title: title.clone(),
+                    },
+                );
+                title
+            }
+            Err(error) => {
+                emit_diagnostic(format!("会话 {} 标题读取失败：{error}", record.id));
+                short_id(&record.id)
+            }
+        }
     }
 }
 
@@ -673,6 +791,250 @@ mod tests {
             output: vec![],
             usage: None,
         }
+    }
+
+    async fn history_manager(
+        api: OpenAiApi,
+    ) -> (
+        std::path::PathBuf,
+        TraceDatabaseConfig,
+        SessionStore,
+        SessionManager,
+    ) {
+        let root = std::env::temp_dir().join(format!("geer-history-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let config = TraceDatabaseConfig {
+            kind: TraceDatabase::Sqlite,
+            url: format!("sqlite://{}/history.sqlite?mode=rwc", root.display()),
+        };
+        let store = SessionStore::connect(&config).await.unwrap();
+        let runtime = SessionRuntime::new(
+            store.clone(),
+            api.as_str().into(),
+            "test".into(),
+            "https://example.test/v1",
+            vec![],
+        );
+        let manager = SessionManager::new(
+            api,
+            context("system"),
+            Workspace::from_stored(root.to_str().unwrap()).unwrap(),
+            Some(runtime),
+        );
+        (root, config, store, manager)
+    }
+
+    #[tokio::test]
+    async fn title_survives_save_compaction_and_restore_without_snapshot_fields() {
+        for api in [OpenAiApi::ChatCompletions, OpenAiApi::Responses] {
+            let (root, _, store, mut manager) = history_manager(api).await;
+            let id = manager.active.id.clone();
+            let first = "第一条中文🙂输入 \n  从这里开始的历史".repeat(100);
+            let expected = session_title(Some(&first));
+            manager.active.prompt.begin_turn(&first);
+            manager
+                .active
+                .prompt
+                .finish_turn(reply(&"长回答".repeat(100)));
+            manager.active.save().await;
+            manager.active.prompt.begin_turn("第二条消息");
+            manager.active.prompt.finish_turn(reply("继续回答"));
+            let plan = manager.active.prompt.prepare_compaction(10, true).unwrap();
+            manager
+                .active
+                .prompt
+                .apply_compaction(plan, "早期事实".into())
+                .unwrap();
+            manager.active.changed();
+            manager.active.save().await;
+            assert_eq!(
+                manager.list_entries(false).await.unwrap()[0].title,
+                expected
+            );
+            let record = store.load(&id).await.unwrap().unwrap();
+            assert!(record.snapshot.get("title").is_none());
+            assert!(record.snapshot.get("first_user_input").is_none());
+            let mut restored = SessionManager::new(
+                api,
+                context("system"),
+                manager.active.workspace.clone(),
+                manager.runtime_template.as_ref().map(SessionRuntime::fresh),
+            );
+            let listed = restored.list_entries(false).await.unwrap();
+            assert_eq!(
+                listed.iter().find(|entry| entry.id == id).unwrap().title,
+                expected
+            );
+            restored.open(&id).await.unwrap();
+            assert_eq!(
+                session_title(restored.active.prompt.first_user_input()),
+                expected
+            );
+            restored.active.prompt.begin_turn("后续消息不能重命名会话");
+            assert_eq!(
+                session_title(restored.active.prompt.first_user_input()),
+                expected
+            );
+            drop((restored, manager, store));
+            std::fs::remove_dir_all(root).unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn deleting_memory_sessions_deduplicates_and_replaces_current_only_when_selected() {
+        let mut manager = SessionManager::new(
+            OpenAiApi::Responses,
+            context("system"),
+            Workspace::current().unwrap(),
+            None,
+        );
+        manager.active.prompt.begin_turn("同名消息");
+        let first = manager.active.id.clone();
+        let second = manager.new_session().await;
+        manager.active.prompt.begin_turn("同名消息");
+        let preview = manager
+            .preview_delete(&[first.clone(), second.clone(), first.clone()])
+            .await
+            .unwrap();
+        assert_eq!(preview.targets.len(), 2);
+        assert_eq!(preview.targets[0].title, preview.targets[1].title);
+        let report = manager
+            .delete(&[first.clone(), first.clone()])
+            .await
+            .unwrap();
+        assert_eq!(report.items.len(), 1);
+        assert!(report.new_session_id.is_none());
+        assert_eq!(manager.active.id, second);
+        assert_eq!(manager.active.prompt.first_user_input(), Some("同名消息"));
+        let workspace = manager.active.workspace.clone();
+        let report = manager.delete(std::slice::from_ref(&second)).await.unwrap();
+        assert_eq!(
+            report.new_session_id.as_deref(),
+            Some(manager.active.id.as_str())
+        );
+        assert_eq!(manager.active.workspace, workspace);
+        assert!(manager.active.prompt.pending_events().is_empty());
+        assert!(manager.parked.is_empty());
+        assert_eq!(
+            manager.delete(&[second]).await.unwrap().items[0].state,
+            DeleteState::Absent
+        );
+    }
+
+    #[tokio::test]
+    async fn deleting_dirty_current_and_parked_states_prevents_flush_resurrection() {
+        let (root, _, store, mut manager) = history_manager(OpenAiApi::ChatCompletions).await;
+        let failed_id = manager.active.id.clone();
+        manager.active.prompt.begin_turn("尚未保存的首条消息");
+        manager.active.runtime.as_mut().unwrap().fail_next_save = true;
+        let current = manager.new_session().await;
+        assert!(manager.unsaved_ids().contains(&failed_id));
+        manager.active.prompt.begin_turn("已保存的首句");
+        manager.active.prompt.finish_turn(reply("答复"));
+        manager.active.save().await;
+        manager.active.prompt.begin_turn("待保存的第二条消息");
+        manager.active.changed();
+        let report = manager
+            .delete(&[current.clone(), failed_id.clone()])
+            .await
+            .unwrap();
+        assert!(
+            report
+                .items
+                .iter()
+                .all(|item| item.state == DeleteState::Deleted)
+        );
+        manager.save_all().await;
+        assert!(store.load(&current).await.unwrap().is_none());
+        assert!(store.load(&failed_id).await.unwrap().is_none());
+        assert!(manager.open(&current).await.is_err());
+        assert!(!manager.unsaved_ids().contains(&failed_id));
+        assert_eq!(manager.list_entries(true).await.unwrap().len(), 1);
+        drop((store, manager));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn deletion_failure_rolls_back_database_and_keeps_current_while_other_items_succeed() {
+        use sea_orm::{ConnectionTrait, Database};
+        let (root, config, store, mut manager) = history_manager(OpenAiApi::Responses).await;
+        let previous = manager.active.id.clone();
+        let active = manager.new_session().await;
+        manager.active.prompt.begin_turn("保留我");
+        manager.active.prompt.finish_turn(reply("答复"));
+        manager.active.save().await;
+        let before = store.load(&active).await.unwrap().unwrap();
+        let database = Database::connect(&config.url).await.unwrap();
+        database.execute_unprepared(&format!("CREATE TRIGGER fail_delete BEFORE DELETE ON agent_session_events WHEN OLD.session_id = '{active}' BEGIN SELECT RAISE(FAIL, 'test failure'); END")).await.unwrap();
+        let report = manager
+            .delete(&[previous.clone(), active.clone()])
+            .await
+            .unwrap();
+        assert_eq!(report.items[0].state, DeleteState::Deleted);
+        assert_eq!(report.items[1].state, DeleteState::Failed);
+        assert_eq!(report.retry_ids(), vec![active.clone()]);
+        assert_eq!(manager.active.id, active);
+        assert_eq!(manager.active.prompt.first_user_input(), Some("保留我"));
+        assert_eq!(store.load(&active).await.unwrap(), Some(before.clone()));
+        assert_eq!(store.history(&before).await.unwrap().len(), 2);
+        assert!(store.load(&previous).await.unwrap().is_none());
+        database
+            .execute_unprepared("DROP TRIGGER fail_delete")
+            .await
+            .unwrap();
+        let report = manager.delete(&report.retry_ids()).await.unwrap();
+        assert!(report.new_session_id.is_some());
+        assert!(store.history(&before).await.is_err());
+        drop((database, store, manager));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn deleting_incompatible_archive_does_not_require_existing_workspace_or_valid_history() {
+        let (root, _, store, manager) = history_manager(OpenAiApi::Responses).await;
+        let id = Uuid::new_v4().to_string();
+        let record = SessionRecord {
+            id: id.clone(),
+            workspace: root.join("missing").display().to_string(),
+            api: "different-api".into(),
+            model: "old-model".into(),
+            endpoint: "different".into(),
+            snapshot: Value::Null,
+            head_event_id: Some(Uuid::new_v4().to_string()),
+            revision: 0,
+            updated_at_ms: 0,
+            uncertain_tools: false,
+        };
+        store.save(&record, &[], None).await.unwrap();
+        assert_eq!(
+            manager
+                .list_entries(true)
+                .await
+                .unwrap()
+                .iter()
+                .find(|entry| entry.id == id)
+                .unwrap()
+                .title,
+            short_id(&id)
+        );
+        let mut manager = manager;
+        let preview = manager
+            .preview_delete(std::slice::from_ref(&id))
+            .await
+            .unwrap();
+        assert_eq!(preview.targets[0].id, id);
+        assert_eq!(
+            manager
+                .delete(std::slice::from_ref(&id))
+                .await
+                .unwrap()
+                .items[0]
+                .state,
+            DeleteState::Deleted
+        );
+        assert!(store.load(&id).await.unwrap().is_none());
+        drop((store, manager));
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     fn workspace(path: &str) -> Workspace {

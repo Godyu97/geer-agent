@@ -30,11 +30,15 @@ cargo run --features gui
 
 Linux 需要 WebKitGTK 4.1 等 Tauri 开发依赖。Fedora 按 [Tauri 官方前置要求](https://tauri.app/start/prerequisites/) 安装 `webkit2gtk4.1-devel openssl-devel curl wget file libappindicator-gtk3-devel librsvg2-devel libxdo-devel` 及 C 开发工具；如编译提示找不到 `dbus-1.pc`，还需 `dbus-devel`。从 Wayland 会话中运行，可用 `GDK_BACKEND=wayland` 做原生 Wayland 验收。Windows 11 使用 MSVC Rust 工具链、Microsoft C++ Build Tools、WebView2 和 Node.js；本项目工具执行还需要 Git for Windows Bash。前端产物嵌入启用 GUI 的二进制，修改前端后需重新运行 `npm run build` 和 Cargo 构建。默认 `cargo build` 不需要 Node 或 GTK/WebKitGTK。
 
+侧栏的“管理会话”支持勾选、全选当前列表和批量删除；切换“当前 / 全部”范围会清空选择。确认弹窗显示标题、完整 UUID 和当前会话替换提示，默认取消。删除其他会话或取消操作会保留聊天草稿；删除当前会话成功后，消息区和草稿清空。失败项可点击“重试删除 / 清理”。
+
 ## 终端界面
 
 在交互终端运行 `cargo run` 会进入全屏 TUI：左侧是可滚动的消息区，底部输入，宽度至少 60 列时右侧显示模型、会话、上下文估算与 token 用量。终端变窄时会隐藏面板。方向键编辑输入，PageUp/PageDown 或上下方向键滚动消息；`/help`、`/new`、`/sessions`、`/open`、`/compact` 等命令沿用原语义。工具首次授权会在界面内要求 `[y/N]`，只有输入 `y` 或 `yes` 才会同意。
 
 面板的上下文 token 与占比是估算值；流式回答期间用 `~` 标记临时用量，完成后显示接口报告的真实 token 数。本轮统计包含该条输入触发的模型和自动压缩请求，累计统计涵盖本进程中的会话及手动压缩；若兼容接口未提供某次用量，面板显示“用量部分缺失”，估算值不会计作真实用量。`/exit`、Ctrl+C、Ctrl+D 会尝试保存会话并恢复原终端；全屏期间暂存的诊断记录在退出后写到 stderr。输入或输出接管道时继续使用原文本 REPL。
+
+F3 或 `/sessions [--all]` 打开会话管理面板并保留聊天草稿。上下方向键、PageUp/PageDown 移动，Space 勾选，`a` 全选/取消全选，Delete 请求删除，Enter 打开高亮会话，Tab 切换范围，Esc 返回聊天。删除确认时 Enter/Esc 取消，`y` 删除；结果页可滚动，`r` 重试失败项，Enter/Esc 返回列表。
 
 ## 工具调用
 
@@ -57,6 +61,10 @@ REPL 向模型提供 `get_current_time`、`read`、`write`、`edit`、`bash`。�
 | `GEER_AGENT_SESSION_PERSISTENCE` | `on` | 设为 `off` 时只保留进程内多会话，不写会话检查点 |
 
 `/new` 新建会话；`/open <session-id>` 打开进程内会话或当前目录存档；`/reset` 等同于 `/new`，`/resume <session-id>` 等同于 `/open`。`/sessions` 合并当前进程会话与最近 20 条存档，以 `*` 标记当前会话并显示保存状态。`/save` 重试所有待写会话。`/exit` 和 EOF 也会补写，并列出仍未保存的 UUID。启动时总是新建会话，历史会话需显式打开。`/help` 显示完整命令。
+
+会话标题从第一条用户输入生成：合并空白、移除控制字符，取前 20 个 Unicode 字符，超长追加省略号，空会话显示“新会话”。标题只用于展示，UUID 仍是唯一标识，数据库和快照不增加标题字段；压缩和重新打开会话后仍从原始消息取标题。
+
+`/delete <完整 UUID> [UUID ...]` 删除一个或多个会话，交互终端会先确认，默认取消。管道或脚本须使用 `/delete --yes <完整 UUID> [UUID ...]`；不接受标题、短 UUID 或通配符。删除会话快照及其全部消息事件，保留 Trace 日志，逐项报告成功或失败。删除当前会话成功后，在原 workspace 创建空会话并清空工具授权与本轮用量，累计用量保持。全选仅覆盖界面已列出的会话，未加载存档不会被删除。MongoDB 可能报告快照已删除而消息清理待重试，此时再次删除相同 UUID 即可继续清理。
 
 每条会话独立持有消息、摘要、上下文估算偏差及待写事件。数据库初始化失败时会告警并继续使用进程内多会话；写入失败时保留本地待写数据，切换会话也不会丢弃它。revision 冲突会显示在列表或保存结果中，程序不会自动覆盖数据库记录。跨进程只能恢复最后一次成功发布的检查点。同一工作目录中的文件仍由各会话共享。
 

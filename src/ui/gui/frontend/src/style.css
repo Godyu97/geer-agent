@@ -246,6 +246,48 @@ button:disabled {
   overflow-y: auto;
   min-height: 0;
 }
+.session-management {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+  padding: 0 4px 10px;
+  font-size: 11px;
+  color: var(--ctp-subtext0);
+}
+.session-management button, .retry-delete {
+  border: 1px solid var(--ctp-surface1);
+  border-radius: 6px;
+  padding: 5px 7px;
+  background: var(--ctp-surface0);
+  color: var(--ctp-text);
+  font-size: 11px;
+}
+.select-all-sessions { display: flex; align-items: center; gap: 4px; }
+.session-management .danger-text, .retry-delete { color: var(--ctp-red); }
+.retry-delete { margin-bottom: 8px; }
+.session-item input, .select-all-sessions input { accent-color: var(--ctp-mauve); }
+.session-item.selected { background: var(--ctp-accent-soft); }
+label.session-item { cursor: pointer; }
+.delete-targets {
+  max-height: min(40vh, 320px);
+  overflow: auto;
+  list-style: none;
+  padding: 0;
+}
+.delete-targets li { padding: 9px 0; border-bottom: 1px solid var(--ctp-surface1); }
+.delete-targets strong, .delete-targets code { display: block; overflow-wrap: anywhere; }
+.delete-targets strong { font-size: 13px; }
+.delete-targets code { margin-top: 4px; font-size: 11px; color: var(--ctp-subtext0); }
+.modal .delete-active-warning { color: var(--ctp-peach); }
+.danger {
+  border: 1px solid var(--ctp-red);
+  background: var(--ctp-red);
+  color: var(--ctp-base);
+  border-radius: 8px;
+  padding: 8px 13px;
+  font-size: 12px;
+}
 .session-item {
   display: flex;
   align-items: center;

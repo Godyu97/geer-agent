@@ -37,6 +37,7 @@ const snapshot: Snapshot = {
   status: {
     model: "test-model",
     session_id: "session-one",
+    session_title: "新会话",
     workspace: "/tmp/workspace-one",
     context_tokens: 2,
     context_window_tokens: 100,
@@ -278,6 +279,7 @@ it("edits workspace without losing the chat draft and switches session scope", a
   render(<App />);
   const currentSession = {
     id: "11111111-current",
+    title: "测试会话",
     updated_at_ms: 1,
     model: "test-model",
     status: "已保存",
@@ -353,7 +355,7 @@ it("edits workspace without losing the chat draft and switches session scope", a
   expect((path as HTMLInputElement).value).toBe("/missing workspace");
   expect(screen.getByText(/目录不存在/)).toBeTruthy();
   fireEvent.click(screen.getByRole("button", { name: "全部" }));
-  expect(screen.getByText("22222222")).toBeTruthy();
+  expect(screen.getByTitle("22222222-other")).toBeTruthy();
   expect(screen.getByText("/tmp/workspace-two")).toBeTruthy();
   fireEvent.click(screen.getByRole("button", { name: "取消" }));
   expect(screen.queryByRole("textbox", { name: "Workspace 路径" })).toBeNull();
@@ -402,4 +404,132 @@ it("does not offer a futile retry when persistence is unavailable", () => {
   });
   expect(screen.getByRole("dialog", { name: "保存失败" })).toBeTruthy();
   expect(screen.queryByRole("button", { name: "重试保存" })).toBeNull();
+});
+
+const historyA = {
+  id: "11111111-1111-4111-8111-111111111111",
+  title: "首条消息生成的标题",
+  updated_at_ms: 1,
+  model: "test-model",
+  status: "已保存",
+  active: true,
+  uncertain_tools: false,
+  workspace: "/tmp/workspace-one",
+};
+const historyB = { ...historyA, id: "22222222-2222-4222-8222-222222222222", active: false };
+const historyC = { ...historyB, id: "33333333-3333-4333-8333-333333333333", workspace: "/tmp/workspace-two" };
+const historySnapshot: Snapshot = {
+  ...snapshot,
+  status: { ...snapshot.status, session_id: historyA.id, session_title: historyA.title },
+  sessions: [historyA, historyB],
+  all_sessions: [historyA, historyB, historyC],
+};
+function showSessions(next = historySnapshot) {
+  send({ type: "snapshot", request_id: null, snapshot: next, notice: null, error: null });
+}
+function lastSubmit(): { requestId: number; line: string } {
+  return mock.invoke.mock.calls.filter(([command]) => command === "gui_submit").at(-1)![1];
+}
+function selected(id: string) {
+  return screen.getByRole("checkbox", { name: new RegExp(`选择 .*${id}`) }) as HTMLInputElement;
+}
+function completePreview(targets = [historyB]) {
+  send({ type: "snapshot", request_id: lastSubmit().requestId, snapshot: historySnapshot,
+    notice: null, error: null, delete_confirmation: { targets } });
+}
+
+it("selects sessions by UUID and clears selection on scope, management and open commands", async () => {
+  render(<App />);
+  showSessions();
+  expect(screen.getAllByText(historyA.title).length).toBeGreaterThan(1);
+  fireEvent.click(screen.getByRole("button", { name: "管理会话" }));
+  fireEvent.click(selected(historyB.id));
+  expect(selected(historyA.id).checked).toBe(false);
+  expect(selected(historyB.id).checked).toBe(true);
+  expect(mock.invoke.mock.calls.some(([command]) => command === "gui_submit")).toBe(false);
+  showSessions({ ...historySnapshot, sessions: [historyB, historyA] });
+  expect(selected(historyB.id).checked).toBe(true);
+  fireEvent.click(screen.getByRole("checkbox", { name: "全选当前列表" }));
+  expect(screen.getByText("已选 2")).toBeTruthy();
+  fireEvent.click(screen.getByRole("button", { name: "全部" }));
+  expect(screen.getByText("已选 0")).toBeTruthy();
+  fireEvent.click(screen.getByRole("checkbox", { name: "全选当前列表" }));
+  expect(screen.getByText("已选 3")).toBeTruthy();
+  fireEvent.click(screen.getByRole("button", { name: "完成管理" }));
+  fireEvent.click(screen.getByRole("button", { name: "管理会话" }));
+  expect(screen.getByText("已选 0")).toBeTruthy();
+  fireEvent.click(selected(historyB.id));
+  fireEvent.change(screen.getByRole("textbox", { name: "消息" }), {
+    target: { value: `/open ${historyA.id}` },
+  });
+  fireEvent.click(screen.getByRole("button", { name: "发送 ↗" }));
+  await waitFor(() => expect(lastSubmit().line).toBe(`/open ${historyA.id}`));
+  send({ type: "snapshot", request_id: lastSubmit().requestId,
+    snapshot: historySnapshot, notice: "当前会话未改变", error: null });
+  expect(screen.getByText("已选 0")).toBeTruthy();
+});
+
+it("previews deletion once, defaults to cancel, preserves drafts and blocks busy actions", async () => {
+  render(<App />);
+  showSessions();
+  const input = screen.getByRole("textbox", { name: "消息" }) as HTMLTextAreaElement;
+  fireEvent.change(input, { target: { value: "保留未发送的草稿" } });
+  fireEvent.click(screen.getByRole("button", { name: "管理会话" }));
+  fireEvent.click(selected(historyB.id));
+  fireEvent.click(screen.getByRole("button", { name: "删除所选" }));
+  await waitFor(() => expect(lastSubmit().line).toBe(`/delete ${historyB.id}`));
+  expect(selected(historyA.id).disabled).toBe(true);
+  expect((screen.getByRole("button", { name: "全部" }) as HTMLButtonElement).disabled).toBe(true);
+  completePreview();
+  const dialog = screen.getByRole("dialog", { name: "删除会话确认" });
+  expect(within(dialog).getByText(historyB.id)).toBeTruthy();
+  expect(within(dialog).getByText(/保留 Trace 日志/)).toBeTruthy();
+  expect(document.activeElement).toBe(within(dialog).getByRole("button", { name: "取消" }));
+  fireEvent.keyDown(dialog, { key: "Escape" });
+  expect(screen.queryByRole("dialog", { name: "删除会话确认" })).toBeNull();
+  expect(input.value).toBe("保留未发送的草稿");
+  expect(mock.invoke.mock.calls.filter(([command]) => command === "gui_submit")).toHaveLength(1);
+  fireEvent.click(screen.getByRole("button", { name: "删除所选" }));
+  await waitFor(() => expect(lastSubmit().requestId).toBe(2));
+  completePreview();
+  fireEvent.click(screen.getByRole("button", { name: "确认删除" }));
+  await waitFor(() => expect(lastSubmit().line).toBe(`/delete --yes ${historyB.id}`));
+  send({ type: "snapshot", request_id: lastSubmit().requestId,
+    snapshot: { ...historySnapshot, sessions: [historyA], all_sessions: [historyA, historyC] },
+    notice: "已删除，Trace 日志保留", error: null,
+    delete_report: { items: [{ id: historyB.id, state: "deleted", error: null }], new_session_id: null } });
+  expect(input.value).toBe("保留未发送的草稿");
+  expect(screen.queryByRole("checkbox", { name: new RegExp(historyB.id) })).toBeNull();
+  expect(screen.getByText("已选 0")).toBeTruthy();
+});
+
+it("replaces a deleted current session, retains failed selections and retries residual cleanup", async () => {
+  render(<App />);
+  showSessions();
+  const input = screen.getByRole("textbox", { name: "消息" }) as HTMLTextAreaElement;
+  fireEvent.change(input, { target: { value: "当前会话草稿" } });
+  fireEvent.click(screen.getByRole("button", { name: "管理会话" }));
+  fireEvent.click(screen.getByRole("checkbox", { name: "全选当前列表" }));
+  fireEvent.click(screen.getByRole("button", { name: "删除所选" }));
+  await waitFor(() => expect(lastSubmit().line).toBe(`/delete ${historyA.id} ${historyB.id}`));
+  completePreview([historyA, historyB]);
+  expect(screen.getByText(/包含当前会话/)).toBeTruthy();
+  fireEvent.click(screen.getByRole("button", { name: "确认删除" }));
+  await waitFor(() => expect(lastSubmit().line).toBe(`/delete --yes ${historyA.id} ${historyB.id}`));
+  const replacement = { ...historyA, id: "44444444-4444-4444-8444-444444444444", title: "新会话" };
+  const next = { ...historySnapshot,
+    status: { ...historySnapshot.status, session_id: replacement.id, session_title: "新会话" },
+    sessions: [replacement, historyB], all_sessions: [replacement, historyB, historyC] };
+  send({ type: "snapshot", request_id: lastSubmit().requestId, snapshot: next,
+    notice: "部分删除失败：存储故障；旧会话已删除，消息清理待重试。", error: null,
+    delete_report: { items: [
+      { id: historyA.id, state: "cleanup_pending", error: "清理失败" },
+      { id: historyB.id, state: "failed", error: "存储故障" },
+    ], new_session_id: replacement.id } });
+  expect(input.value).toBe("");
+  expect(selected(historyB.id).checked).toBe(true);
+  expect(selected(replacement.id).checked).toBe(false);
+  expect(screen.getByText(/部分删除失败/)).toBeTruthy();
+  fireEvent.click(screen.getByRole("button", { name: /重试删除 \/ 清理/ }));
+  await waitFor(() => expect(lastSubmit().line).toBe(`/delete ${historyA.id} ${historyB.id}`));
 });

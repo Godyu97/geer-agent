@@ -1,4 +1,4 @@
-use std::{error::Error, io, io::BufRead, io::Write};
+use std::{error::Error, io, io::BufRead, io::IsTerminal, io::Write};
 
 use super::color::Color;
 use crate::interaction::{Input, Session, help_text, parse_input};
@@ -37,6 +37,7 @@ pub(crate) async fn run(session: &mut impl Session) -> Result<(), Box<dyn Error>
 
         match parse_input(&line) {
             Input::Empty => {}
+            Input::Invalid(message) => eprintln!("{message}"),
             Input::Help => print_help(),
             Input::Reset => {
                 session.new_session().await;
@@ -72,6 +73,38 @@ pub(crate) async fn run(session: &mut impl Session) -> Result<(), Box<dyn Error>
                 }
                 Err(error) => eprintln!("会话列表读取失败：{error}"),
             },
+            Input::Delete { ids, confirmed } => {
+                let allowed = if confirmed {
+                    true
+                } else if !stdin.is_terminal() || !io::stdout().is_terminal() {
+                    eprintln!(
+                        "非交互输入删除会话需要 --yes。{}",
+                        crate::session::DELETE_USAGE
+                    );
+                    false
+                } else {
+                    match session.preview_delete(&ids).await {
+                        Ok(preview) => {
+                            println!("{}", preview.text());
+                            print!("确认删除？[y/N] ");
+                            io::stdout().flush()?;
+                            read_delete_confirmation(&mut stdin.lock())?
+                        }
+                        Err(error) => {
+                            eprintln!("删除预览失败：{error}");
+                            false
+                        }
+                    }
+                };
+                if allowed {
+                    match session.delete_sessions(&ids).await {
+                        Ok(report) => println!("{}", report.text()),
+                        Err(error) => eprintln!("会话删除失败：{error}"),
+                    }
+                } else {
+                    println!("已取消删除。");
+                }
+            }
             Input::Workspace(None) => println!("Workspace: {}", session.workspace()),
             Input::Workspace(Some(path)) => match session.set_workspace(&path).await {
                 Ok(message) => println!("{message}"),
@@ -128,6 +161,13 @@ fn print_help() {
     println!("{}", help_text());
 }
 
+fn read_delete_confirmation(reader: &mut impl BufRead) -> io::Result<bool> {
+    Ok(match read_input_line(reader)? {
+        InputLine::Line(line) => matches!(line.trim().to_ascii_lowercase().as_str(), "y" | "yes"),
+        InputLine::InvalidUtf8 | InputLine::Eof => false,
+    })
+}
+
 enum InputLine {
     Line(String),
     InvalidUtf8,
@@ -150,6 +190,35 @@ fn read_input_line(reader: &mut impl BufRead) -> io::Result<InputLine> {
 mod tests {
     use super::{InputLine, read_input_line};
     use crate::interaction::{Input, parse_input};
+
+    #[test]
+    fn delete_requires_exact_ids_and_explicit_confirmation() {
+        let id = "11111111-1111-4111-8111-111111111111";
+        assert!(
+            matches!(parse_input(&format!("/delete {id} {id}")), Input::Delete { ids, confirmed: false } if ids == vec![id])
+        );
+        assert!(matches!(
+            parse_input(&format!("/delete --yes {id}")),
+            Input::Delete {
+                confirmed: true,
+                ..
+            }
+        ));
+        for line in [
+            "/delete",
+            "/delete --yes",
+            "/delete 11111111",
+            "/delete *",
+            "/delete --all",
+            "/delete title",
+        ] {
+            assert!(matches!(parse_input(line), Input::Invalid(_)), "{line}");
+        }
+        for answer in ["\n", "n\n", "maybe\n", "y then delete\n", ""] {
+            assert!(!super::read_delete_confirmation(&mut answer.as_bytes()).unwrap());
+        }
+        assert!(super::read_delete_confirmation(&mut "YES\n".as_bytes()).unwrap());
+    }
 
     #[test]
     fn parses_supported_commands() {

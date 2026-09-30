@@ -1,6 +1,7 @@
 //! Ratatui 终端界面。只通过界面无关契约使用会话能力。
 
 mod input;
+mod sessions;
 
 use std::{cell::RefCell, error::Error, io, rc::Rc};
 
@@ -19,8 +20,11 @@ use ratatui::{
     widgets::{Block, Paragraph},
 };
 
-use crate::interaction::{self, DiagnosticBuffer, Input as Command, Session, SessionStatus, Usage};
+use crate::interaction::{
+    self, DiagnosticBuffer, Input as Command, Session, SessionScope, SessionStatus, Usage,
+};
 use input::Input;
+use sessions::{SessionAction, SessionPanel};
 
 const PANEL_WIDTH: u16 = 28;
 const MIN_PANEL_WIDTH: u16 = 60;
@@ -65,6 +69,7 @@ enum Mode {
     Chat,
     Confirm,
     Workspace,
+    Sessions,
 }
 
 struct State {
@@ -77,11 +82,13 @@ struct State {
     live_chars: u64,
     scroll_back: usize,
     exit_requested: bool,
+    sessions: SessionPanel,
 }
 
 enum Action {
     Submit(String),
     Exit,
+    Session(SessionAction),
 }
 
 impl Tui {
@@ -103,6 +110,7 @@ impl Tui {
                     status: SessionStatus {
                         model: String::new(),
                         session_id: String::new(),
+                        session_title: "新会话".to_owned(),
                         workspace: String::new(),
                         context_tokens: 0,
                         context_window_tokens: 1,
@@ -114,6 +122,7 @@ impl Tui {
                     live_chars: 0,
                     scroll_back: 0,
                     exit_requested: false,
+                    sessions: SessionPanel::new(SessionScope::Current),
                 },
             })),
             diagnostics,
@@ -142,6 +151,7 @@ impl Tui {
             let action = self.screen.borrow_mut().read_action()?;
             match action {
                 Action::Exit => break,
+                Action::Session(action) => self.session_action(session, action).await?,
                 Action::Submit(line) => {
                     if self.handle_line(session, &line).await? {
                         break;
@@ -183,6 +193,22 @@ impl Tui {
             Command::Empty => return Ok(false),
             Command::Exit => return Ok(true),
             Command::Help => Some(interaction::help_text().to_owned()),
+            Command::Invalid(message) => Some(message),
+            Command::Delete { ids, confirmed } => {
+                if self.screen.borrow().state.mode != Mode::Sessions {
+                    self.show_sessions(session, SessionScope::Current).await?;
+                }
+                self.session_action(
+                    session,
+                    if confirmed {
+                        SessionAction::Delete(ids)
+                    } else {
+                        SessionAction::Preview(ids)
+                    },
+                )
+                .await?;
+                return Ok(false);
+            }
             Command::Reset | Command::New => {
                 session.new_session().await;
                 Some(format!(
@@ -195,13 +221,10 @@ impl Tui {
                 Ok(result) => Some(result),
                 Err(error) => Some(format!("上下文压缩失败：{error}")),
             },
-            Command::Sessions(scope) => match session.sessions(scope).await {
-                Ok(items) if items.is_empty() => {
-                    Some("没有可列出的会话（或未配置会话数据库）。".to_owned())
-                }
-                Ok(items) => Some(items.join("\n")),
-                Err(error) => Some(format!("会话列表读取失败：{error}")),
-            },
+            Command::Sessions(scope) => {
+                self.show_sessions(session, scope).await?;
+                return Ok(false);
+            }
             Command::Open(id) => match session.open(&id).await {
                 Ok(message) => Some(format!("{message}\nSession ID: {}", session.session_id())),
                 Err(error) => Some(format!("会话恢复失败：{error}")),
@@ -268,6 +291,86 @@ impl Tui {
         self.diagnostics.finish();
         paste.and(terminal)
     }
+
+    async fn show_sessions(
+        &mut self,
+        session: &impl Session,
+        scope: SessionScope,
+    ) -> io::Result<()> {
+        let entries = session.session_entries(scope).await;
+        let mut screen = self.screen.borrow_mut();
+        screen.state.sessions = SessionPanel::new(scope);
+        screen.state.mode = Mode::Sessions;
+        match entries {
+            Ok(entries) => screen.state.sessions.refresh(entries),
+            Err(error) => screen.state.sessions.message = format!("会话列表读取失败：{error}"),
+        }
+        screen.draw()
+    }
+
+    async fn session_action(
+        &mut self,
+        session: &mut impl Session,
+        action: SessionAction,
+    ) -> io::Result<()> {
+        match action {
+            SessionAction::Reload(scope) => return self.show_sessions(session, scope).await,
+            SessionAction::Close => {
+                let mut screen = self.screen.borrow_mut();
+                screen.state.mode = Mode::Chat;
+                screen.state.sessions = SessionPanel::new(SessionScope::Current);
+            }
+            SessionAction::Preview(ids) => {
+                let preview = session.preview_delete(&ids).await;
+                let mut screen = self.screen.borrow_mut();
+                match preview {
+                    Ok(preview) => screen.state.sessions.confirm(preview),
+                    Err(error) => screen.state.sessions.message = format!("删除预览失败：{error}"),
+                }
+            }
+            SessionAction::Delete(ids) => match session.delete_sessions(&ids).await {
+                Ok(report) => {
+                    let scope = self.screen.borrow().state.sessions.scope;
+                    let entries = session.session_entries(scope).await;
+                    let mut screen = self.screen.borrow_mut();
+                    if report.new_session_id.is_some() {
+                        screen.state.entries.clear();
+                        screen.state.input.clear();
+                        screen.state.scroll_back = 0;
+                    }
+                    screen.state.append(Kind::System, report.text());
+                    screen.state.sessions.report(&report);
+                    match entries {
+                        Ok(entries) => screen.state.sessions.refresh(entries),
+                        Err(error) => screen
+                            .state
+                            .sessions
+                            .message
+                            .push_str(&format!("\n列表刷新失败：{error}")),
+                    }
+                }
+                Err(error) => {
+                    self.screen.borrow_mut().state.sessions.message =
+                        format!("会话删除失败：{error}")
+                }
+            },
+            SessionAction::Open(id) => match session.open(&id).await {
+                Ok(message) => {
+                    let mut screen = self.screen.borrow_mut();
+                    screen.state.sessions = SessionPanel::new(SessionScope::Current);
+                    screen.state.mode = Mode::Chat;
+                    screen.state.append(Kind::System, message);
+                }
+                Err(error) => {
+                    self.screen.borrow_mut().state.sessions.message =
+                        format!("会话恢复失败：{error}")
+                }
+            },
+        }
+        let mut screen = self.screen.borrow_mut();
+        screen.state.status = session.status();
+        screen.draw()
+    }
 }
 
 impl Drop for Tui {
@@ -306,6 +409,7 @@ impl Screen {
                 self.state.exit_requested = true;
                 String::new()
             }
+            Action::Session(_) => String::new(),
         };
         let allowed = authorization_allowed(&answer);
         self.state.append(
@@ -373,7 +477,15 @@ impl State {
                 {
                     return Some(Action::Exit);
                 }
+                if self.mode == Mode::Sessions {
+                    return self.sessions.key(key).map(Action::Session);
+                }
                 match key.code {
+                    KeyCode::F(3) if self.mode == Mode::Chat => {
+                        return Some(Action::Session(SessionAction::Reload(
+                            SessionScope::Current,
+                        )));
+                    }
                     KeyCode::F(2) if self.mode == Mode::Chat => {
                         self.workspace_input.set(&self.status.workspace);
                         self.mode = Mode::Workspace;
@@ -414,7 +526,9 @@ impl State {
                     _ => {}
                 }
             }
-            Event::Paste(value) => self.active_input_mut().paste(&value),
+            Event::Paste(value) if self.mode != Mode::Sessions => {
+                self.active_input_mut().paste(&value)
+            }
             _ => {}
         }
         None
@@ -459,6 +573,10 @@ fn authorization_allowed(answer: &str) -> bool {
 fn render(frame: &mut Frame, state: &State) {
     let area = frame.area();
     if area.width == 0 || area.height == 0 {
+        return;
+    }
+    if state.mode == Mode::Sessions {
+        sessions::render(frame, &state.sessions);
         return;
     }
     let input_height = if area.height >= 4 { 3 } else { 1 };
@@ -560,6 +678,7 @@ fn render_panel(frame: &mut Frame, state: &State, area: Rect) {
     let lines = vec![
         Line::raw(format!("模型  {}", status.model)),
         Line::raw(format!("会话  {}", status.session_id)),
+        Line::raw(format!("标题  {}", status.session_title)),
         Line::raw(format!("目录  {}（F2）", status.workspace)),
         Line::raw(""),
         Line::raw("── 上下文（估算）──"),
@@ -591,7 +710,8 @@ fn render_input(frame: &mut Frame, state: &State, area: Rect) {
     let title = match state.mode {
         Mode::Confirm => "授权确认",
         Mode::Workspace => "Workspace · Enter 切换 · Esc 取消",
-        Mode::Chat => "输入 · F2 Workspace",
+        Mode::Chat => "输入 · F2 Workspace · F3 会话",
+        Mode::Sessions => "会话管理",
     };
     let block = Block::bordered().title(title);
     let inner = if area.height >= 3 {
@@ -609,6 +729,7 @@ fn render_input(frame: &mut Frame, state: &State, area: Rect) {
         Mode::Confirm => "[y/N] ",
         Mode::Workspace => "路径 › ",
         Mode::Chat => "你 › ",
+        Mode::Sessions => "",
     };
     let prompt = if Line::raw(full_prompt).width() < inner.width as usize {
         full_prompt
@@ -647,6 +768,7 @@ mod tests {
             status: SessionStatus {
                 model: "test-model".into(),
                 session_id: "test-session".into(),
+                session_title: "新会话".into(),
                 workspace: "/tmp/test-workspace".into(),
                 context_tokens: 50,
                 context_window_tokens: 100,
@@ -658,6 +780,7 @@ mod tests {
             live_chars: 0,
             scroll_back: 0,
             exit_requested: false,
+            sessions: super::SessionPanel::new(crate::interaction::SessionScope::Current),
         }
     }
 
@@ -745,6 +868,36 @@ mod tests {
             KeyModifiers::CONTROL,
         )));
         assert!(matches!(exit, Some(Action::Exit)));
+    }
+
+    #[test]
+    fn session_shortcut_preserves_draft_and_does_not_interrupt_tool_confirmation() {
+        let mut state = state();
+        state.input.set("未发送草稿");
+        let f3 = || Event::Key(KeyEvent::new(KeyCode::F(3), KeyModifiers::NONE));
+        assert!(matches!(
+            state.handle_event(f3()),
+            Some(Action::Session(super::SessionAction::Reload(
+                crate::interaction::SessionScope::Current
+            )))
+        ));
+        state.mode = Mode::Sessions;
+        state.handle_event(Event::Paste("管理面板不接收聊天粘贴".to_owned()));
+        state.handle_event(Event::Key(KeyEvent::new(
+            KeyCode::Char('a'),
+            KeyModifiers::NONE,
+        )));
+        assert_eq!(state.input.text(), "未发送草稿");
+        assert!(matches!(
+            state.handle_event(Event::Key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))),
+            Some(Action::Session(super::SessionAction::Close))
+        ));
+        state.mode = Mode::Confirm;
+        assert!(state.handle_event(f3()).is_none());
+        assert_eq!(state.mode, Mode::Confirm);
+        state.mode = Mode::Workspace;
+        assert!(state.handle_event(f3()).is_none());
+        assert_eq!(state.mode, Mode::Workspace);
     }
 
     #[test]

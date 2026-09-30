@@ -158,6 +158,8 @@ export default function App() {
   const [sessionScope, setSessionScope] = useState<"current" | "all">(
     "current",
   );
+  const [managingSessions, setManagingSessions] = useState(false);
+  const [selectedSessions, setSelectedSessions] = useState<Set<string>>(new Set());
   const nextRequest = useRef(1);
   const current = useRef(state);
   current.current = state;
@@ -177,6 +179,24 @@ export default function App() {
 
   const sessionId = state.snapshot?.status.session_id ?? null;
   const workspace = state.snapshot?.status.workspace ?? null;
+  const displayedSessions = useMemo(
+    () => sessionScope === "all"
+      ? (state.snapshot?.all_sessions ?? [])
+      : (state.snapshot?.sessions ?? []),
+    [sessionScope, state.snapshot],
+  );
+  useEffect(() => {
+    setSelectedSessions(new Set());
+  }, [sessionScope, workspace, managingSessions]);
+  useEffect(() => {
+    setSelectedSessions((selected) => new Set(
+      [...selected].filter((id) => displayedSessions.some((entry) => entry.id === id)),
+    ));
+  }, [displayedSessions]);
+  useEffect(() => {
+    if (state.deleteReport?.new_session_id === sessionId) setInput("");
+    else setSelectedSessions(new Set());
+  }, [sessionId]);
   useEffect(() => {
     if (sessionId !== lastSession.current) {
       followBottom.current = true;
@@ -234,6 +254,9 @@ export default function App() {
       liveUsage: 0,
     };
     dispatch({ type: "queued", pending });
+    if (/^\/(?:open|resume)\s/.test(pending.line)) {
+      setSelectedSessions(new Set());
+    }
     setLocalError(null);
     try {
       await invoke("gui_submit", { requestId: pending.id, line: pending.line });
@@ -287,12 +310,13 @@ export default function App() {
   const turns = useMemo(() => groupTranscript(transcript), [transcript]);
   const visible = turns.slice(-visibleCount);
   const status = state.snapshot?.status;
-  const disabled =
+  const operationBusy =
     !state.snapshot ||
     !!state.pending ||
     state.closing ||
     !!state.startupError ||
     !!state.authorization;
+  const disabled = operationBusy || !!state.deleteConfirmation;
   const contextPercent = status
     ? Math.min(
         100,
@@ -303,10 +327,17 @@ export default function App() {
       )
     : 0;
   const isChat = state.pending && !state.pending.line.startsWith("/");
-  const displayedSessions =
-    sessionScope === "all"
-      ? (state.snapshot?.all_sessions ?? [])
-      : (state.snapshot?.sessions ?? []);
+  const retryDeleteIds = state.deleteReport?.items
+    .filter((item) => item.state === "failed" || item.state === "cleanup_pending")
+    .map((item) => item.id) ?? [];
+  function toggleSession(id: string) {
+    setSelectedSessions((selected) => {
+      const next = new Set(selected);
+      if (next.has(id)) next.delete(id);
+      else next.add(id);
+      return next;
+    });
+  }
 
   return (
     <div className="app-shell">
@@ -392,12 +423,14 @@ export default function App() {
           <span>会话 {displayedSessions.length}</span>
           <span className="scope-toggle" role="group" aria-label="会话范围">
             <button
+              disabled={disabled}
               className={sessionScope === "current" ? "active" : ""}
               onClick={() => setSessionScope("current")}
             >
               当前
             </button>
             <button
+              disabled={disabled}
               className={sessionScope === "all" ? "active" : ""}
               onClick={() => setSessionScope("all")}
             >
@@ -405,20 +438,63 @@ export default function App() {
             </button>
           </span>
         </div>
-        <div className="session-list">
-          {displayedSessions.map((session) => (
+        <div className="session-management">
+          <button
+            disabled={disabled}
+            onClick={() => setManagingSessions(!managingSessions)}
+          >
+            {managingSessions ? "完成管理" : "管理会话"}
+          </button>
+          {managingSessions && <>
+            <label className="select-all-sessions">
+              <input
+                type="checkbox"
+                aria-label="全选当前列表"
+                disabled={disabled || displayedSessions.length === 0}
+                checked={displayedSessions.length > 0 && selectedSessions.size === displayedSessions.length}
+                ref={(node) => {
+                  if (node) node.indeterminate = selectedSessions.size > 0
+                    && selectedSessions.size < displayedSessions.length;
+                }}
+                onChange={() => setSelectedSessions(
+                  selectedSessions.size === displayedSessions.length
+                    ? new Set()
+                    : new Set(displayedSessions.map((entry) => entry.id)),
+                )}
+              />
+              全选
+            </label>
+            <span>已选 {selectedSessions.size}</span>
             <button
-              key={session.id}
-              disabled={disabled}
-              className={`session-item ${session.active ? "active" : ""}`}
-              title={session.id}
-              onClick={() => void submit(`/open ${session.id}`)}
+              className="danger-text"
+              disabled={disabled || selectedSessions.size === 0}
+              onClick={() => {
+                const ids = displayedSessions
+                  .filter((entry) => selectedSessions.has(entry.id))
+                  .map((entry) => entry.id);
+                void submit(`/delete ${ids.join(" ")}`, false);
+              }}
             >
-              <span className="session-dot" />
+              删除所选
+            </button>
+          </>}
+        </div>
+        {retryDeleteIds.length > 0 && (
+          <button
+            className="retry-delete"
+            disabled={disabled}
+            onClick={() => void submit(`/delete ${retryDeleteIds.join(" ")}`, false)}
+          >
+            重试删除 / 清理（{retryDeleteIds.length}）
+          </button>
+        )}
+        <div className="session-list">
+          {displayedSessions.map((session) => {
+            const details = <>
               <span className="session-detail">
-                <strong>{shortId(session.id)}</strong>
+                <strong>{session.title}</strong>
                 <small>
-                  {new Date(session.updated_at_ms).toLocaleString()} ·{" "}
+                  {shortId(session.id)} · {new Date(session.updated_at_ms).toLocaleString()} ·{" "}
                   {session.status}
                 </small>
                 {sessionScope === "all" && (
@@ -426,8 +502,31 @@ export default function App() {
                 )}
               </span>
               {session.uncertain_tools && <span title="工具状态未确认">!</span>}
-            </button>
-          ))}
+            </>;
+            const className = `session-item ${session.active ? "active" : ""} ${selectedSessions.has(session.id) ? "selected" : ""}`;
+            return managingSessions ? (
+              <label key={session.id} className={className} title={session.id}>
+                <input
+                  type="checkbox"
+                  aria-label={`选择 ${session.title} ${session.id}`}
+                  checked={selectedSessions.has(session.id)}
+                  disabled={disabled}
+                  onChange={() => toggleSession(session.id)}
+                />
+                {details}
+              </label>
+            ) : (
+              <button
+                key={session.id}
+                disabled={disabled}
+                className={className}
+                title={session.id}
+                onClick={() => void submit(`/open ${session.id}`)}
+              >
+                <span className="session-dot" />{details}
+              </button>
+            );
+          })}
         </div>
         <div className="sidebar-footer">
           <span className="connection-dot" />
@@ -442,8 +541,8 @@ export default function App() {
       <main className="main-panel">
         <header className="topbar">
           <div>
-            <strong>对话</strong>
-            <span className="session-id">
+            <strong title={status?.session_id}>{status?.session_title ?? "对话"}</strong>
+            <span className="session-id" title={status?.session_id}>
               {status ? shortId(status.session_id) : "初始化中"}
             </span>
           </div>
@@ -653,6 +752,62 @@ export default function App() {
               </button>
               <button className="primary" onClick={() => void authorize(true)}>
                 本会话允许
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+      {state.deleteConfirmation && (
+        <div className="modal-backdrop">
+          <div
+            className="modal delete-modal"
+            role="dialog"
+            aria-modal="true"
+            aria-label="删除会话确认"
+            onKeyDown={(event) => {
+              if (event.key === "Escape") {
+                event.preventDefault();
+                dispatch({ type: "delete_dismissed" });
+              }
+              if (event.key === "Tab") {
+                event.preventDefault();
+                const buttons = Array.from(
+                  event.currentTarget.querySelectorAll<HTMLButtonElement>("button:not(:disabled)"),
+                );
+                const index = buttons.indexOf(document.activeElement as HTMLButtonElement);
+                buttons[(index + (event.shiftKey ? buttons.length - 1 : 1)) % buttons.length]?.focus();
+              }
+            }}
+          >
+            <h2>删除 {state.deleteConfirmation.targets.length} 个会话？</h2>
+            <p>会话和消息将被永久删除，无法恢复。保留 Trace 日志。</p>
+            {state.deleteConfirmation.targets.some((target) => target.active) &&
+              <p className="delete-active-warning">包含当前会话：删除成功后将在原 workspace 新建空会话。</p>}
+            <ul className="delete-targets">
+              {state.deleteConfirmation.targets.map((target) => <li key={target.id}>
+                <strong>{target.title}{target.active ? "（当前）" : ""}</strong>
+                <code>{target.id}</code>
+              </li>)}
+            </ul>
+            <div className="modal-actions">
+              <button
+                className="secondary"
+                autoFocus
+                onClick={() => dispatch({ type: "delete_dismissed" })}
+              >
+                取消
+              </button>
+              <button
+                className="danger"
+                disabled={operationBusy}
+                onClick={() => {
+                  const ids = current.current.deleteConfirmation?.targets.map((target) => target.id);
+                  if (!ids) return;
+                  dispatch({ type: "delete_dismissed" });
+                  void submit(`/delete --yes ${ids.join(" ")}`, false);
+                }}
+              >
+                确认删除
               </button>
             </div>
           </div>

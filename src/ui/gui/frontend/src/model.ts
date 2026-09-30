@@ -18,6 +18,7 @@ export type Usage = { input: number; output: number };
 export type Status = {
   model: string;
   session_id: string;
+  session_title: string;
   workspace: string;
   context_tokens: number;
   context_window_tokens: number;
@@ -27,12 +28,24 @@ export type Status = {
 };
 export type SessionEntry = {
   id: string;
+  title: string;
   updated_at_ms: number;
   model: string;
   status: string;
   active: boolean;
   uncertain_tools: boolean;
   workspace: string;
+};
+export type DeletePreview = {
+  targets: { id: string; title: string; active: boolean }[];
+};
+export type DeleteReport = {
+  items: {
+    id: string;
+    state: "deleted" | "absent" | "failed" | "cleanup_pending";
+    error: string | null;
+  }[];
+  new_session_id: string | null;
 };
 export type Snapshot = {
   status: Status;
@@ -48,6 +61,8 @@ export type Event =
       snapshot: Snapshot;
       notice: string | null;
       error: string | null;
+      delete_confirmation?: DeletePreview | null;
+      delete_report?: DeleteReport | null;
     }
   | { type: "started"; request_id: number }
   | { type: "delta"; request_id: number; text: string }
@@ -69,7 +84,8 @@ export type Action =
   | { type: "queued"; pending: Pending }
   | { type: "submit_failed"; request_id: number; message: string }
   | { type: "authorization_cleared" }
-  | { type: "close_dismissed" };
+  | { type: "close_dismissed" }
+  | { type: "delete_dismissed" };
 
 export type Pending = { id: number; line: string };
 export type ViewState = {
@@ -89,6 +105,8 @@ export type ViewState = {
     unsaved_ids: string[];
     can_retry: boolean;
   } | null;
+  deleteConfirmation: DeletePreview | null;
+  deleteReport: DeleteReport | null;
 };
 
 export const initialState: ViewState = {
@@ -104,6 +122,8 @@ export const initialState: ViewState = {
   startupError: null,
   closing: false,
   closeFailed: null,
+  deleteConfirmation: null,
+  deleteReport: null,
 };
 
 export function applyEvent(state: ViewState, event: Action): ViewState {
@@ -132,6 +152,8 @@ export function applyEvent(state: ViewState, event: Action): ViewState {
       return { ...state, authorization: null };
     case "close_dismissed":
       return { ...state, closeFailed: null };
+    case "delete_dismissed":
+      return { ...state, deleteConfirmation: null };
     case "snapshot":
       if (event.request_id !== null && state.pending?.id !== event.request_id)
         return state;
@@ -144,6 +166,8 @@ export function applyEvent(state: ViewState, event: Action): ViewState {
         liveUsage: event.request_id === null ? state.liveUsage : 0,
         notice: event.notice,
         error: event.error,
+        deleteConfirmation: event.delete_confirmation ?? null,
+        deleteReport: event.delete_report ?? null,
       };
     case "started":
       return state;
@@ -182,7 +206,7 @@ export function applyEvent(state: ViewState, event: Action): ViewState {
     case "startup_error":
       return { ...state, startupError: event.message, pending: null };
     case "closing":
-      return { ...state, closing: true, authorization: null };
+      return { ...state, closing: true, authorization: null, deleteConfirmation: null };
     case "close_failed":
       return {
         ...state,

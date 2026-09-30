@@ -5,7 +5,7 @@ use mongodb::{Client, Collection, IndexModel, bson::doc, options::ClientOptions}
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    session::{SessionEvent, SessionRecord},
+    session::{SessionEvent, SessionRecord, StoreDeletion},
     trace::{TraceCursor, TraceError, TracePage, TraceRecord},
 };
 
@@ -152,6 +152,25 @@ impl MongoStore {
             .await
             .map(|doc| doc.map(|doc| doc.record))
             .map_err(|_| TraceError("MongoDB 会话读取失败".into()))
+    }
+
+    pub(super) async fn delete_session(&self, id: &str) -> Result<StoreDeletion, TraceError> {
+        let deleted = self
+            .sessions
+            .delete_one(doc! {"_id": id})
+            .await
+            .map_err(|_| TraceError("MongoDB 会话删除失败，重试可确认状态".into()))?;
+        // 单节点也能删除；检查点移除后即不可恢复，事件清理独立报告，不能再保存旧内存状态。
+        let cleanup_error = self
+            .session_events
+            .delete_many(doc! {"event.session_id": id})
+            .await
+            .err()
+            .map(|_| "MongoDB 残留消息清理失败，请重试删除该 UUID。".to_owned());
+        Ok(StoreDeletion {
+            existed: deleted.deleted_count > 0,
+            cleanup_error,
+        })
     }
 
     pub(super) async fn load_session_event(

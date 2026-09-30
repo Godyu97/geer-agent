@@ -9,7 +9,7 @@ use std::collections::{HashMap, HashSet};
 
 use crate::{
     config::{TraceDatabase, TraceDatabaseConfig},
-    session::{SessionEvent, SessionRecord},
+    session::{SessionEvent, SessionRecord, StoreDeletion},
     trace::{
         BatchWriteItem, TraceCursor, TraceError, TracePage, TraceReader, TraceRecord, TraceWriter,
     },
@@ -22,6 +22,13 @@ pub(crate) enum SessionStore {
 }
 
 impl SessionStore {
+    pub(crate) async fn delete(&self, id: &str) -> Result<StoreDeletion, TraceError> {
+        match self {
+            Self::Sql(store) => store.delete_session(id).await,
+            Self::Mongo(store) => store.delete_session(id).await,
+        }
+    }
+
     pub(crate) fn trace_store(&self) -> TraceStore {
         match self {
             Self::Sql(store) => TraceStore::Sql(store.clone()),
@@ -455,7 +462,26 @@ mod tests {
         stale.head_event_id = Some(orphan.id.clone());
         assert!(store.save(&stale, &[orphan], Some(0)).await.is_err());
         assert_eq!(store.history(&newer).await.unwrap(), vec![event]);
-        assert_eq!(store.load(&id).await.unwrap(), Some(newer));
+        assert_eq!(store.load(&id).await.unwrap(), Some(newer.clone()));
+        let trace = record(&Uuid::new_v4().to_string(), &id, 102);
+        let traces = store.trace_store();
+        traces.write_one(&trace).await.unwrap();
+        let deleted = store.delete(&id).await.unwrap();
+        assert!(deleted.existed);
+        assert!(deleted.cleanup_error.is_none());
+        assert!(store.load(&id).await.unwrap().is_none());
+        assert!(store.history(&newer).await.is_err());
+        assert!(store.history(&stale).await.is_err());
+        assert!(store.load(&other.id).await.unwrap().is_some());
+        assert_eq!(
+            traces.get_one(&trace.request_id).await.unwrap(),
+            Some(trace)
+        );
+        assert!(store.save(&stale, &[], Some(1)).await.is_err());
+        assert!(store.load(&id).await.unwrap().is_none());
+        let repeated = store.delete(&id).await.unwrap();
+        assert!(!repeated.existed);
+        assert!(repeated.cleanup_error.is_none());
     }
 
     #[tokio::test]

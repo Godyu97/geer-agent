@@ -12,6 +12,7 @@ const snapshot: Snapshot = {
   status: {
     model: "test",
     session_id: "one",
+    session_title: "新会话",
     workspace: "/tmp/one",
     context_tokens: 2,
     context_window_tokens: 10,

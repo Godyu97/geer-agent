@@ -9,12 +9,13 @@ use tauri::{AppHandle, State, ipc::Channel};
 
 use crate::{
     agent::{self, Agent, SessionEntry},
-    interaction::{self, DiagnosticBuffer, Input, Session, SessionStatus, Usage},
+    interaction::{self, DiagnosticBuffer, Input, Session, SessionScope, SessionStatus, Usage},
     prompt::TranscriptEntry,
+    session::{DeletePreview, DeleteReport},
     ui::{
         gui_authorization::AuthorizationGate,
         gui_close::close_failure,
-        gui_commands::{handle_line, tool_progress},
+        gui_commands::{CommandResult, handle_line, tool_progress},
     },
 };
 
@@ -26,6 +27,8 @@ pub(super) enum GuiEvent {
         snapshot: Box<GuiSnapshot>,
         notice: Option<String>,
         error: Option<String>,
+        delete_confirmation: Option<DeletePreview>,
+        delete_report: Option<DeleteReport>,
     },
     Started {
         request_id: u64,
@@ -258,14 +261,14 @@ fn worker(
     for command in incoming {
         match command {
             Work::Connect => {
-                send_snapshot(&runtime, &agent, &bus, None, None, None);
+                send_snapshot(&runtime, &agent, &bus, None, CommandResult::default());
                 for message in diagnostics.drain() {
                     bus.send(GuiEvent::Diagnostic { message });
                 }
             }
             Work::Submit { request_id, line } => {
                 bus.send(GuiEvent::Started { request_id });
-                let (notice, error) = runtime.block_on(handle_line(
+                let result = runtime.block_on(handle_line(
                     &mut agent,
                     &line,
                     |delta| {
@@ -294,7 +297,7 @@ fn worker(
                     bus.send(GuiEvent::Closing);
                 }
                 busy.store(false, Ordering::Release);
-                send_snapshot(&runtime, &agent, &bus, Some(request_id), notice, error);
+                send_snapshot(&runtime, &agent, &bus, Some(request_id), result);
                 for message in diagnostics.drain() {
                     bus.send(GuiEvent::Diagnostic { message });
                 }
@@ -338,10 +341,9 @@ fn send_snapshot(
     agent: &Agent,
     bus: &EventBus,
     request_id: Option<u64>,
-    notice: Option<String>,
-    error: Option<String>,
+    result: CommandResult,
 ) {
-    let sessions = match runtime.block_on(agent.session_entries(false)) {
+    let sessions = match runtime.block_on(agent.session_entries(SessionScope::Current)) {
         Ok(sessions) => sessions,
         Err(error) => {
             bus.send(GuiEvent::Diagnostic {
@@ -350,7 +352,7 @@ fn send_snapshot(
             Vec::new()
         }
     };
-    let all_sessions = match runtime.block_on(agent.session_entries(true)) {
+    let all_sessions = match runtime.block_on(agent.session_entries(SessionScope::All)) {
         Ok(sessions) => sessions,
         Err(error) => {
             bus.send(GuiEvent::Diagnostic {
@@ -368,8 +370,10 @@ fn send_snapshot(
             transcript: agent.transcript(),
             unsaved_ids: agent.unsaved_ids(),
         }),
-        notice,
-        error,
+        notice: result.notice,
+        error: result.error,
+        delete_confirmation: result.delete_confirmation,
+        delete_report: result.delete_report,
     });
 }
 

@@ -3,6 +3,15 @@
 use std::io;
 
 use crate::interaction::{self, Input, Session, Usage};
+use crate::session::{DeletePreview, DeleteReport};
+
+#[derive(Debug, Default)]
+pub(crate) struct CommandResult {
+    pub(crate) notice: Option<String>,
+    pub(crate) error: Option<String>,
+    pub(crate) delete_confirmation: Option<DeletePreview>,
+    pub(crate) delete_report: Option<DeleteReport>,
+}
 
 pub(crate) fn tool_progress(delta: &str) -> Option<&str> {
     // 核心一次回调发送完整进度标记；不从模型正文内部查找或删去相似文字。
@@ -19,15 +28,39 @@ pub(crate) async fn handle_line<S, F, U>(
     line: &str,
     on_delta: F,
     on_usage: U,
-) -> (Option<String>, Option<String>)
+) -> CommandResult
 where
     S: Session,
     F: FnMut(&str) -> io::Result<()>,
     U: FnMut(Option<Usage>) -> io::Result<()>,
 {
+    let mut result = CommandResult::default();
     let mut error = None;
     let notice = match interaction::parse_input(line) {
         Input::Empty => None,
+        Input::Invalid(message) => {
+            error = Some(message);
+            None
+        }
+        Input::Delete { ids, confirmed } => {
+            if confirmed {
+                match session.delete_sessions(&ids).await {
+                    Ok(report) => {
+                        let notice = report.text();
+                        result.delete_report = Some(report);
+                        result.notice = Some(notice);
+                        return result;
+                    }
+                    Err(failure) => error = Some(format!("会话删除失败：{failure}")),
+                }
+            } else {
+                match session.preview_delete(&ids).await {
+                    Ok(preview) => result.delete_confirmation = Some(preview),
+                    Err(failure) => error = Some(format!("删除预览失败：{failure}")),
+                }
+            }
+            None
+        }
         Input::Help => Some(interaction::help_text().to_owned()),
         Input::New | Input::Reset => Some(format!(
             "已开始新会话。Session ID: {}",
@@ -73,7 +106,9 @@ where
             None
         }
     };
-    (notice, error)
+    result.notice = notice;
+    result.error = error;
+    result
 }
 
 #[cfg(test)]
@@ -119,6 +154,7 @@ mod tests {
             SessionStatus {
                 model: "mock".into(),
                 session_id: self.session_id().into(),
+                session_title: "新会话".into(),
                 workspace: self.workspace(),
                 context_tokens: 0,
                 context_window_tokens: 100,
@@ -177,6 +213,44 @@ mod tests {
         async fn open(&mut self, id: &str) -> Result<String, Box<dyn Error>> {
             Ok(format!("已打开 {id}"))
         }
+
+        async fn session_entries(
+            &self,
+            _: crate::interaction::SessionScope,
+        ) -> Result<Vec<crate::session::SessionEntry>, Box<dyn Error>> {
+            Ok(Vec::new())
+        }
+
+        async fn preview_delete(&self, ids: &[String]) -> Result<DeletePreview, Box<dyn Error>> {
+            Ok(DeletePreview {
+                targets: ids
+                    .iter()
+                    .map(|id| crate::session::DeleteTarget {
+                        id: id.clone(),
+                        title: "测试会话".into(),
+                        active: false,
+                    })
+                    .collect(),
+            })
+        }
+
+        async fn delete_sessions(
+            &mut self,
+            ids: &[String],
+        ) -> Result<DeleteReport, Box<dyn Error>> {
+            self.seen.extend(ids.iter().cloned());
+            Ok(DeleteReport {
+                items: ids
+                    .iter()
+                    .map(|id| crate::session::DeleteItem {
+                        id: id.clone(),
+                        state: crate::session::DeleteState::Deleted,
+                        error: None,
+                    })
+                    .collect(),
+                new_session_id: None,
+            })
+        }
     }
 
     #[tokio::test]
@@ -185,53 +259,40 @@ mod tests {
         let events = Rc::new(RefCell::new(Vec::new()));
         let delta_events = Rc::clone(&events);
         let usage_events = Rc::clone(&events);
-        assert_eq!(
-            handle_line(
-                &mut session,
-                "你好",
-                move |text| {
-                    delta_events.borrow_mut().push(format!("delta:{text}"));
-                    Ok(())
-                },
-                move |usage| {
-                    usage_events
-                        .borrow_mut()
-                        .push(format!("usage:{}", usage.unwrap().output));
-                    Ok(())
-                },
-            )
-            .await,
-            (None, None)
-        );
+        let result = handle_line(
+            &mut session,
+            "你好",
+            move |text| {
+                delta_events.borrow_mut().push(format!("delta:{text}"));
+                Ok(())
+            },
+            move |usage| {
+                usage_events
+                    .borrow_mut()
+                    .push(format!("usage:{}", usage.unwrap().output));
+                Ok(())
+            },
+        )
+        .await;
+        assert!(result.notice.is_none() && result.error.is_none());
         assert_eq!(session.seen, ["你好"]);
         assert_eq!(*events.borrow(), ["delta:你", "usage:4", "delta:好"]);
 
-        assert_eq!(
-            handle_line(&mut session, "/open saved", |_| Ok(()), |_| Ok(())).await,
-            (Some("已打开 saved".into()), None)
-        );
-        assert_eq!(
-            handle_line(&mut session, "/save", |_| Ok(()), |_| Ok(())).await,
-            (Some("已保存".into()), None)
-        );
-        assert_eq!(
-            handle_line(&mut session, "/workspace", |_| Ok(()), |_| Ok(())).await,
-            (Some("Workspace: /tmp/mock-workspace".into()), None)
-        );
-        assert_eq!(
-            handle_line(
-                &mut session,
+        for (command, notice) in [
+            ("/open saved", "已打开 saved"),
+            ("/save", "已保存"),
+            ("/workspace", "Workspace: /tmp/mock-workspace"),
+            (
                 "/workspace /tmp/other space",
-                |_| Ok(()),
-                |_| Ok(()),
-            )
-            .await,
-            (Some("已切换 Workspace: /tmp/other space".into()), None)
-        );
-        assert_eq!(
-            handle_line(&mut session, "/sessions --all", |_| Ok(()), |_| Ok(())).await,
-            (Some("mock-session".into()), None)
-        );
+                "已切换 Workspace: /tmp/other space",
+            ),
+            ("/sessions --all", "mock-session"),
+        ] {
+            let result = handle_line(&mut session, command, |_| Ok(()), |_| Ok(())).await;
+            assert_eq!(result.notice.as_deref(), Some(notice));
+            assert!(result.error.is_none());
+            assert!(result.delete_confirmation.is_none() && result.delete_report.is_none());
+        }
         assert_eq!(session.seen, ["你好"]);
     }
 
@@ -253,7 +314,37 @@ mod tests {
             |_| Ok(()),
         )
         .await;
-        assert_eq!(result, (None, Some("模型请求失败：mock failure".into())));
+        assert!(result.notice.is_none());
+        assert_eq!(result.error.as_deref(), Some("模型请求失败：mock failure"));
         assert_eq!(*events.borrow(), ["你", "好"]);
+    }
+
+    #[tokio::test]
+    async fn delete_preview_never_mutates_and_confirmation_deletes_exact_unique_ids() {
+        let id = "11111111-1111-4111-8111-111111111111";
+        let mut session = MockSession::default();
+        let result = handle_line(
+            &mut session,
+            &format!("/delete {id} {id}"),
+            |_| Ok(()),
+            |_| Ok(()),
+        )
+        .await;
+        assert!(session.seen.is_empty());
+        assert_eq!(result.delete_confirmation.unwrap().ids(), vec![id]);
+        assert!(result.delete_report.is_none());
+        let result = handle_line(
+            &mut session,
+            &format!("/delete --yes {id} {id}"),
+            |_| Ok(()),
+            |_| Ok(()),
+        )
+        .await;
+        assert_eq!(session.seen, vec![id]);
+        assert!(result.delete_confirmation.is_none());
+        assert_eq!(result.delete_report.unwrap().items[0].id, id);
+        let result = handle_line(&mut session, "/delete --yes wrong", |_| Ok(()), |_| Ok(())).await;
+        assert!(result.error.unwrap().contains("完整 UUID"));
+        assert_eq!(session.seen, vec![id]);
     }
 }

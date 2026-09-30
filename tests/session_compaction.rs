@@ -74,6 +74,8 @@ fn run_with_model(api: &str, base_url: &str, db_url: &str, model: &str, input: &
         .env("GEER_AGENT_TOOLS", "off")
         .env("GEER_AGENT_AUTO_COMPACT", "off")
         .env("GEER_AGENT_TRACE", "off")
+        .env("GEER_AGENT_UI", "repl")
+        .env("GEER_AGENT_SESSION_PERSISTENCE", "on")
         .env("GEER_AGENT_DATABASE", "sqlite")
         .env("GEER_AGENT_DATABASE_URL", db_url)
         .stdin(Stdio::piped())
@@ -108,6 +110,7 @@ fn run_default(api: &str, base_url: &str, workspace: &std::path::Path, input: &s
         .env("OPENAI_API", api)
         .env("GEER_AGENT_TOOLS", "off")
         .env("GEER_AGENT_AUTO_COMPACT", "off")
+        .env("GEER_AGENT_UI", "repl")
         .env_remove("GEER_AGENT_DATABASE")
         .env_remove("GEER_AGENT_DATABASE_URL")
         .env_remove("GEER_AGENT_TRACE")
@@ -536,4 +539,208 @@ async fn chat_session_compacts_exits_resumes_and_continues() {
 #[tokio::test]
 async fn responses_session_compacts_exits_resumes_and_continues() {
     cross_process("responses").await;
+}
+
+async fn delete_history_across_restarts(api: &str) {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let base_url = format!("http://{}/v1", listener.local_addr().unwrap());
+    let api_owned = api.to_owned();
+    let server = thread::spawn(move || {
+        let deadline = Instant::now() + Duration::from_secs(20);
+        for (index, answer) in ["首轮回答", "后续回答", "压缩摘要不是标题", "另一会话回答"]
+            .iter()
+            .enumerate()
+        {
+            let (mut stream, _) = loop {
+                match listener.accept() {
+                    Ok(value) => break value,
+                    Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                        assert!(Instant::now() < deadline, "等待模型请求超时");
+                        thread::sleep(Duration::from_millis(10));
+                    }
+                    Err(error) => panic!("模拟服务连接失败：{error}"),
+                }
+            };
+            stream
+                .set_read_timeout(Some(Duration::from_secs(3)))
+                .unwrap();
+            let _ = body(&mut stream);
+            reply(&mut stream, &api_owned, answer, index);
+        }
+    });
+    let workspace = std::env::temp_dir().join(format!("geer-delete-history-{}", Uuid::new_v4()));
+    std::fs::create_dir_all(&workspace).unwrap();
+    let first = run_default(
+        api,
+        &base_url,
+        &workspace,
+        "第一条   问题😀\n后续内容\n/compact\n/new\n第二个会话\n/exit\n",
+    );
+    assert!(
+        first.status.success(),
+        "{}",
+        String::from_utf8_lossy(&first.stderr)
+    );
+    let first_stdout = String::from_utf8(first.stdout).unwrap();
+    assert!(first_stdout.contains("已压缩"), "{first_stdout}");
+    let ids: Vec<_> = first_stdout
+        .lines()
+        .filter_map(|line| line.strip_prefix("Session ID: "))
+        .collect();
+    assert_eq!(ids.len(), 2, "{first_stdout}");
+    let (a, b) = (ids[0], ids[1]);
+    server.join().unwrap();
+
+    let database_url = format!(
+        "sqlite://{}?mode=rw",
+        workspace.join(".geer-agent/.db/geer.sqlite").display()
+    );
+    let db = Database::connect(&database_url).await.unwrap();
+    let traces_before = db
+        .query_all_raw(Statement::from_string(
+            DbBackend::Sqlite,
+            "SELECT request_id, session_id, request FROM llm_traces ORDER BY request_id".to_owned(),
+        ))
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|row| {
+            (
+                row.try_get::<String>("", "request_id").unwrap(),
+                row.try_get::<String>("", "session_id").unwrap(),
+                row.try_get::<Value>("", "request").unwrap(),
+            )
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(traces_before.len(), 4);
+
+    // 管道拒绝未确认的删除，但后面的 /sessions 必须仍作为命令执行。
+    let cancelled = run_default(
+        api,
+        &base_url,
+        &workspace,
+        &format!("/delete {a} {b}\n/sessions\n/exit\n"),
+    );
+    assert!(cancelled.status.success());
+    assert!(String::from_utf8_lossy(&cancelled.stderr).contains("需要 --yes"));
+    let cancelled_stdout = String::from_utf8(cancelled.stdout).unwrap();
+    assert!(
+        cancelled_stdout.contains(&format!("{a}  第一条 问题😀  ")),
+        "{cancelled_stdout}"
+    );
+    assert!(
+        cancelled_stdout.contains(&format!("{b}  第二个会话  ")),
+        "{cancelled_stdout}"
+    );
+    assert!(
+        !cancelled_stdout.contains("压缩摘要不是标题"),
+        "{cancelled_stdout}"
+    );
+
+    let missing = Uuid::new_v4().to_string();
+    let deleted = run_default(
+        api,
+        &base_url,
+        &workspace,
+        &format!(
+            "/open {a}\n/delete --yes {a} {b} {a} {missing}\n/save\n/sessions\n/workspace\n/exit\n"
+        ),
+    );
+    assert!(
+        deleted.status.success(),
+        "{}",
+        String::from_utf8_lossy(&deleted.stderr)
+    );
+    let deleted_stdout = String::from_utf8(deleted.stdout).unwrap();
+    assert_eq!(
+        deleted_stdout.matches(&format!("{a} [已删除]")).count(),
+        1,
+        "{deleted_stdout}"
+    );
+    assert_eq!(
+        deleted_stdout.matches(&format!("{b} [已删除]")).count(),
+        1,
+        "{deleted_stdout}"
+    );
+    assert!(
+        deleted_stdout.contains(&format!("{missing} [已不存在]")),
+        "{deleted_stdout}"
+    );
+    let fresh = deleted_stdout
+        .lines()
+        .find_map(|line| line.strip_prefix("已开始新会话。Session ID: "))
+        .unwrap();
+    assert!(Uuid::parse_str(fresh).is_ok());
+    assert_ne!(fresh, a);
+    assert_ne!(fresh, b);
+    assert!(
+        deleted_stdout.contains(&format!("{fresh}  新会话  ")),
+        "{deleted_stdout}"
+    );
+    assert!(
+        deleted_stdout.contains(&format!("Workspace: {}", workspace.display())),
+        "{deleted_stdout}"
+    );
+
+    let repeated = run_default(
+        api,
+        &base_url,
+        &workspace,
+        &format!("/open {a}\n/delete --yes {a} {b}\n/sessions\n/exit\n"),
+    );
+    assert!(repeated.status.success());
+    assert!(String::from_utf8_lossy(&repeated.stderr).contains("没有找到该 Session ID"));
+    let repeated_stdout = String::from_utf8(repeated.stdout).unwrap();
+    assert!(
+        repeated_stdout.contains(&format!("{a} [已不存在]")),
+        "{repeated_stdout}"
+    );
+    assert!(
+        repeated_stdout.contains(&format!("{b} [已不存在]")),
+        "{repeated_stdout}"
+    );
+    assert!(!repeated_stdout.contains("第一条 问题😀"));
+    for (table, column) in [
+        ("agent_sessions", "id"),
+        ("agent_session_events", "session_id"),
+    ] {
+        let rows = db
+            .query_all_raw(Statement::from_string(
+                DbBackend::Sqlite,
+                format!("SELECT {column} FROM {table} WHERE {column} IN ('{a}', '{b}')"),
+            ))
+            .await
+            .unwrap();
+        assert!(rows.is_empty(), "{table} 仍然包含被删会话");
+    }
+    let traces_after = db
+        .query_all_raw(Statement::from_string(
+            DbBackend::Sqlite,
+            "SELECT request_id, session_id, request FROM llm_traces ORDER BY request_id".to_owned(),
+        ))
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|row| {
+            (
+                row.try_get::<String>("", "request_id").unwrap(),
+                row.try_get::<String>("", "session_id").unwrap(),
+                row.try_get::<Value>("", "request").unwrap(),
+            )
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(traces_before, traces_after);
+    drop(db);
+    std::fs::remove_dir_all(workspace).unwrap();
+}
+
+#[tokio::test]
+async fn chat_history_titles_and_batch_delete_survive_restart() {
+    delete_history_across_restarts("chat-completions").await;
+}
+
+#[tokio::test]
+async fn responses_history_titles_and_batch_delete_survive_restart() {
+    delete_history_across_restarts("responses").await;
 }

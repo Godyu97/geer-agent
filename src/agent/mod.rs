@@ -20,7 +20,9 @@ use crate::{
     interaction::{Session, SessionScope, SessionStatus, Usage, emit_diagnostic},
     prompt::{self, Prompt},
     provider::{ChatProvider, TokenUsage, ToolSpec, openai::Provider},
-    session::{SessionManager, SessionRuntime, Workspace},
+    session::{
+        DeletePreview, DeleteReport, SessionManager, SessionRuntime, Workspace, session_title,
+    },
     tools::Tools,
     trace::{
         TraceCapture, TraceRecord, TraceStatus, TraceWriter, now_unix_ms, redact_json, redact_text,
@@ -434,17 +436,6 @@ impl Agent {
     }
 
     #[cfg(feature = "gui")]
-    pub(crate) async fn session_entries(
-        &self,
-        all: bool,
-    ) -> Result<Vec<SessionEntry>, Box<dyn Error>> {
-        self.sessions
-            .list_entries(all)
-            .await
-            .map_err(|error| io::Error::other(error).into())
-    }
-
-    #[cfg(feature = "gui")]
     pub(crate) fn unsaved_ids(&self) -> Vec<String> {
         self.sessions.unsaved_ids()
     }
@@ -487,6 +478,7 @@ impl Session for Agent {
         SessionStatus {
             model: self.model.clone(),
             session_id: state.id.clone(),
+            session_title: session_title(state.prompt.first_user_input()),
             workspace: state.workspace.as_str(),
             context_tokens: state
                 .prompt
@@ -670,6 +662,32 @@ impl Session for Agent {
             .list(scope == SessionScope::All)
             .await
             .map_err(|error| io::Error::other(error).into())
+    }
+
+    async fn session_entries(
+        &self,
+        scope: SessionScope,
+    ) -> Result<Vec<crate::session::SessionEntry>, Box<dyn Error>> {
+        self.sessions
+            .list_entries(scope == SessionScope::All)
+            .await
+            .map_err(|error| io::Error::other(error).into())
+    }
+
+    async fn preview_delete(&self, ids: &[String]) -> Result<DeletePreview, Box<dyn Error>> {
+        self.sessions
+            .preview_delete(ids)
+            .await
+            .map_err(|error| io::Error::other(error).into())
+    }
+
+    async fn delete_sessions(&mut self, ids: &[String]) -> Result<DeleteReport, Box<dyn Error>> {
+        let report = self.sessions.delete(ids).await.map_err(io::Error::other)?;
+        if report.new_session_id.is_some() {
+            self.tools.reset();
+            self.turn_tokens = 0;
+        }
+        Ok(report)
     }
 
     async fn open(&mut self, id: &str) -> Result<String, Box<dyn Error>> {
@@ -1820,6 +1838,22 @@ mod tests {
         let switched_workspace = agent.status().workspace;
         agent.new_session().await;
         assert_eq!(agent.status().workspace, switched_workspace);
+        agent.tools.grant_for_test("read");
+        agent.turn_tokens = 9;
+        let active_id = agent.session_id().to_owned();
+        agent.delete_sessions(&[saved_id]).await.unwrap();
+        assert!(agent.tools.granted_for_test("read"));
+        assert_eq!(agent.status().turn_tokens, 9);
+        let report = agent
+            .delete_sessions(std::slice::from_ref(&active_id))
+            .await
+            .unwrap();
+        assert_ne!(agent.session_id(), active_id);
+        assert_eq!(report.new_session_id.as_deref(), Some(agent.session_id()));
+        assert!(!agent.tools.granted_for_test("read"));
+        assert_eq!(agent.status().turn_tokens, 0);
+        assert_eq!(agent.status().total_tokens, 32);
+        assert_eq!(agent.status().session_title, "新会话");
         let _ = fs::remove_file(path);
         let _ = fs::remove_dir_all(workspace_path);
         let _ = fs::remove_dir_all(other_workspace_path);

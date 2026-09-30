@@ -7,9 +7,15 @@ use std::{
     path::{Path, PathBuf},
 };
 
+mod deletion;
+mod display;
 mod runtime;
 
-#[cfg(feature = "gui")]
+pub(crate) use deletion::{
+    DELETE_USAGE, DeleteItem, DeletePreview, DeleteReport, DeleteState, DeleteTarget,
+    StoreDeletion, delete_ids,
+};
+pub(crate) use display::{session_title, short_id};
 pub(crate) use runtime::SessionEntry;
 pub(crate) use runtime::{SessionManager, SessionRuntime};
 

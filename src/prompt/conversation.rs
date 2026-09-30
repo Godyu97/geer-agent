@@ -29,6 +29,8 @@ pub(crate) struct Prompt {
     current_user: Option<String>,
     message_serial: usize,
     events: Vec<RawEvent>,
+    // 展示用首句独立于待保存队列和可压缩的模型上下文，不进入快照。
+    first_user_input: Option<String>,
     #[cfg(any(feature = "gui", test))]
     display_events: Vec<RawEvent>,
 }
@@ -124,12 +126,16 @@ impl Prompt {
             current_user: None,
             message_serial: 0,
             events: Vec::new(),
+            first_user_input: None,
             #[cfg(any(feature = "gui", test))]
             display_events: Vec::new(),
         }
     }
 
     pub(crate) fn begin_turn(&mut self, input: &str) {
+        if self.first_user_input.is_none() {
+            self.first_user_input = Some(input.to_owned());
+        }
         self.turn_start = Some(self.len());
         self.current_user = Some(input.to_owned());
         self.record_event(RawEvent {
@@ -350,6 +356,7 @@ impl Prompt {
         self.current_user = None;
         self.message_serial = 0;
         self.events.clear();
+        self.first_user_input = None;
         #[cfg(any(feature = "gui", test))]
         self.display_events.clear();
         match &mut self.state {
@@ -408,6 +415,7 @@ impl Prompt {
         self.current_user = snapshot.current_user;
         self.message_serial = snapshot.message_serial;
         self.events.clear();
+        self.first_user_input = None;
         #[cfg(any(feature = "gui", test))]
         self.display_events.clear();
         Ok(())
@@ -419,9 +427,20 @@ impl Prompt {
         self.events.push(event);
     }
 
-    #[cfg(any(feature = "gui", test))]
     pub(crate) fn restore_display_events(&mut self, events: Vec<RawEvent>) {
-        self.display_events = events;
+        self.first_user_input = events
+            .iter()
+            .find(|event| event.kind == "user")
+            .and_then(|event| event.payload.get("text").and_then(Value::as_str))
+            .map(str::to_owned);
+        #[cfg(any(feature = "gui", test))]
+        {
+            self.display_events = events;
+        }
+    }
+
+    pub(crate) fn first_user_input(&self) -> Option<&str> {
+        self.first_user_input.as_deref()
     }
 
     #[cfg(any(feature = "gui", test))]
