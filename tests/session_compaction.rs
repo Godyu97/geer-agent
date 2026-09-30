@@ -97,6 +97,10 @@ fn run_default(api: &str, base_url: &str, workspace: &std::path::Path, input: &s
     let executable = workspace.join("bin").join(source.file_name().unwrap());
     if !executable.exists() {
         std::fs::create_dir_all(executable.parent().unwrap()).unwrap();
+        // /tmp 在本机是 tmpfs：复制 300MB+ 调试二进制会直接占用 RAM，OOM 后也无法清理。
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(source, &executable).unwrap();
+        #[cfg(not(unix))]
         std::fs::copy(source, &executable).unwrap();
     }
     let mut command = Command::new(executable);

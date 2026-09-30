@@ -19,6 +19,10 @@ fn layout() -> (PathBuf, PathBuf, PathBuf, PathBuf) {
     fs::create_dir_all(&cwd).unwrap();
     let source = Path::new(env!("CARGO_BIN_EXE_geer-agent"));
     let executable = bin.join(source.file_name().unwrap());
+    // /tmp 在本机是 tmpfs：复制调试二进制会直接占用 RAM。
+    #[cfg(unix)]
+    std::os::unix::fs::symlink(source, &executable).unwrap();
+    #[cfg(not(unix))]
     fs::copy(source, &executable).unwrap();
     (root, executable, home, cwd)
 }

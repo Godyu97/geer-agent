@@ -32,6 +32,10 @@ fn executable_env_selects_gui_and_process_override_keeps_repl_available() {
     fs::create_dir_all(&dir).unwrap();
     let source = std::path::Path::new(env!("CARGO_BIN_EXE_geer-agent"));
     let executable = dir.join(source.file_name().unwrap());
+    // /tmp 在本机是 tmpfs：复制调试二进制会直接占用 RAM。
+    #[cfg(unix)]
+    std::os::unix::fs::symlink(source, &executable).unwrap();
+    #[cfg(not(unix))]
     fs::copy(source, &executable).unwrap();
     fs::write(
         dir.join(".env"),
