@@ -117,7 +117,7 @@ cargo build --release --features embed-env
 
 ```sh
 make help      # 列出目标
-make check     # fmt -> test -> clippy
+make check     # fmt -> test-safety -> test -> clippy
 make run       # 终端 TUI / REPL
 make gui       # 构建前端并以 GUI feature 运行
 ```
@@ -130,6 +130,7 @@ make gui       # 构建前端并以 GUI feature 运行
 
 ```sh
 # 修复 Shell/进程代码后，先跑受影响的单项和清理回归，再跑完整质量门。
+make test-safety
 make test TEST_ARGS='--bin geer-agent' TEST=query_dependencies_are_resolved_by_configured_bash_only
 make test TEST_ARGS='--test process_safety'
 make check
@@ -140,7 +141,13 @@ make test FEATURES=gui
 make gui-test
 ```
 
-`make test`、`make gui-test`、`make clippy` 和 `make clippy-all` 通过 `scripts/test-safe.sh` 启动独立的 systemd 用户服务。Cargo 编译、测试程序与后代进程都归入本次服务的 cgroup；前端测试安装依赖和 GUI clippy 准备前端的阶段也先进入受限服务。入口检查内核实际的内存、swap 与任务限制，缺少 systemd 用户服务、cgroup v2 或有效限制时直接失败，不自动执行无约束测试。`make check` 按 fmt → test → clippy 顺序执行，即使传入 `make -j` 也保持这个顺序。
+`make test`、`make gui-test`、`make clippy` 和 `make clippy-all` 通过 `scripts/test-safe.sh` 启动独立的 systemd 用户服务。Cargo 编译、测试程序与后代进程都归入本次服务的 cgroup；前端测试安装依赖和 GUI clippy 准备前端的阶段也先进入受限服务。入口检查内核实际的内存、swap、任务限制和临时目录挂载，缺少 systemd 用户服务、cgroup v2、有效限制或临时目录隔离时直接失败，不自动执行无约束测试。`make check` 按 fmt → test-safety → test → clippy 顺序执行，即使传入 `make -j` 也保持这个顺序。
+
+每个服务设置 `PrivateTmp=disconnected`，使用独立 tmpfs 中的 `/tmp` 和 `/var/tmp`，并固定 `TMPDIR`、`TMP`、`TEMP` 为 `/tmp`。标准库临时文件和直接写入 `/tmp` 的测试都使用本轮私有目录，不向宿主 `/tmp` 累积文件。入口比较宿主与服务内目录的设备号，并确认文件系统为 tmpfs，实际隔离不成立就拒绝启动测试。主机需要支持此选项的 systemd 和可用的用户/挂载命名空间。
+
+正常退出、断言失败、panic、超时、SIGKILL 或组内 OOM 后，systemd 停止整组进程并回收私有临时文件与 tmpfs；异常清理不依赖测试的 `Drop` 或 Shell 的 `trap`。若连外层启动脚本也被 SIGKILL，服务仍由运行时限兜底，最迟在运行时限加 5 秒停止等待后回收。测试过程中 tmpfs 仍占用内存，计入本轮 cgroup 内存额度，服务结束后释放；正常路径仍应及时删除不再使用的夹具，降低同轮峰值。[systemd 的 `PrivateTmp` 定义](https://github.com/systemd/systemd/blob/v259/man/systemd.exec.xml) 说明了私有临时目录的生命周期。
+
+`make test-safety` 使用 Python 3 标准库验证正常退出、失败、SIGKILL、超时、组内 OOM、启动脚本 TERM/KILL，以及隔离预检失败。控制服务限额为 256 MiB / 64 任务 / 90 秒，各探针顺序进入 64 MiB / 32 任务 / 2 秒的独立服务；OOM 探针最多申请 96 MiB，不执行无界分配。回归检查临时文件不跨命名空间可见、调用者临时目录变量被覆盖、服务进程与 cgroup 被回收，且上一层文件不被改动。
 
 | 限制 | 默认值 | 调整方式 |
 | --- | --- | --- |
@@ -167,5 +174,6 @@ GEER_TEST_MEMORY_MAX=6G GEER_TEST_RUNTIME_MAX=15min make test FEATURES=gui
 - 集成测试启动进程使用 `tests/support/mod.rs` 的 `command` / `run`。默认 20 秒超时，stdout/stderr 各最多捕获 4 MiB；输入在限时范围内写入并关闭，无输入时接 `/dev/null`。错误、超时及正常退出都清理 Unix 进程组并回收主进程，Windows 尝试 `taskkill /T`；整组资源限制与最终清理由外层隔离环境保证。
 - 所有直接 Bash 探针显式使用 `--noprofile --norc`，删除 `BASH_ENV`、`ENV`、`SSH_CLIENT`、`SSH_CONNECTION`、`SSH_TTY`。模拟缺失命令只修改子进程的 `PATH`，清理命令使用可靠的绝对路径；包装脚本仍须保留 `GEER_AGENT_SCRIPT` / `GEER_AGENT_ARG_*` 等内部参数，不能用 `env -i` 盲目删除。
 - 测试不继承宿主网络标准输入、不读取宿主 Shell 启动脚本、不修改测试进程的全局环境。启动钩子回归使用临时目录中的无递归哨兵脚本；网络模拟仅监听本机临时端口，并设置连接/读写时限。
+- 临时夹具使用 `std::env::temp_dir()`、`tempfile` 或本轮私有 `/tmp`、`/var/tmp`，不得把临时目录变量改到宿主路径来绕过隔离。异常退出由服务生命周期兜底；不要用 `rm -rf /tmp/geer-*` 等通配清理删除其他运行留下的文件。验证安全入口用 `make test-safety`，不要裸跑该回归脚本。
 - `timeout`、`kill_on_drop(true)`、只杀直接子进程和单用户 `ulimit -u` 都不能单独保证系统安全。不要用 fork bomb、无限递归、持续无界输出等方式测试保护；用数量有限的后代、有限输出与临时文件验证退出和清理。进程组无法兜住主动脱离组的后代，因此仍需外层 cgroup 或等效隔离。
 - 出现 Bash 数量持续增长、测试超时或内存异常时立即停止本次 `geer-agent-test-*.service`，检查其状态和遗留进程后再试。不要使用 `pkill bash` 等同用户全局清理，也不要靠禁用限额、增加 swap 或反复重跑来继续验收。

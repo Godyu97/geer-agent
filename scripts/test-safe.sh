@@ -23,6 +23,25 @@ if [ "${1-}" = "--inside-cgroup" ]; then
         echo "测试 cgroup 必须禁用 swap，拒绝运行测试。" >&2
         exit 1
     fi
+    # 不依赖测试的析构或 trap：独立 tmpfs 在服务结束时由 systemd 回收。
+    # 命名空间功能可能不可用，必须核对实际挂载，不能只相信 PrivateTmp 参数。
+    for test_tmp in /tmp /var/tmp; do
+        case "$test_tmp" in
+            /tmp) test_host_tmp=${GEER_TEST_HOST_TMP_ID-} ;;
+            /var/tmp) test_host_tmp=${GEER_TEST_HOST_VAR_TMP_ID-} ;;
+        esac
+        test_tmp_id=$(/usr/bin/stat -Lc '%d:%i' "$test_tmp")
+        test_tmp_type=$(/usr/bin/stat -fLc '%T' "$test_tmp")
+        if [ -z "$test_host_tmp" ] || [ "$test_tmp_type" != tmpfs ] || \
+            [ "${test_tmp_id%%:*}" = "${test_host_tmp%%:*}" ]; then
+            echo "$test_tmp 未使用独立 tmpfs，拒绝运行测试。" >&2
+            exit 1
+        fi
+    done
+    if [ "${TMPDIR-}" != /tmp ] || [ "${TMP-}" != /tmp ] || [ "${TEMP-}" != /tmp ]; then
+        echo "测试临时目录环境未隔离，拒绝运行测试。" >&2
+        exit 1
+    fi
     exec "$@" </dev/null
 fi
 
@@ -61,6 +80,8 @@ case "$0" in
     *) test_script=$(pwd -P)/$0 ;;
 esac
 test_unit=geer-agent-test-$$.service
+test_host_tmp=$(/usr/bin/stat -Lc '%d:%i' /tmp)
+test_host_var_tmp=$(/usr/bin/stat -Lc '%d:%i' /var/tmp)
 
 # 只停止本次测试服务；不要降低整个用户 slice 的限制或杀同用户的其它进程。
 cleanup() {
@@ -78,8 +99,12 @@ systemd-run --user --wait --pipe --collect --service-type=exec \
     --property="RuntimeMaxSec=$test_runtime" \
     --property=TimeoutStopSec=5s --property=KillMode=control-group \
     --property=OOMPolicy=kill --property=StandardInput=null \
+    --property=PrivateTmp=disconnected \
     --property='UnsetEnvironment=BASH_ENV ENV SSH_CLIENT SSH_CONNECTION SSH_TTY' \
     --setenv="PATH=$PATH" \
+    --setenv=TMPDIR=/tmp --setenv=TMP=/tmp --setenv=TEMP=/tmp \
+    --setenv="GEER_TEST_HOST_TMP_ID=$test_host_tmp" \
+    --setenv="GEER_TEST_HOST_VAR_TMP_ID=$test_host_var_tmp" \
     --setenv="CARGO_BUILD_JOBS=${CARGO_BUILD_JOBS:-2}" \
     --setenv="RUST_TEST_THREADS=${RUST_TEST_THREADS:-1}" \
     --setenv=FUNCNEST=32 \

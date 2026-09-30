@@ -5,6 +5,7 @@
 
 CARGO ?= cargo
 NPM ?= npm
+PYTHON ?= python3
 FRONTEND := src/ui/gui/frontend
 SAFE_RUN := $(abspath scripts/test-safe.sh)
 # 服务中的 make 不继承 jobserver；间接引用也避免 make -n 执行受限服务的准备命令。
@@ -23,7 +24,7 @@ TEST ?=
 # 选择集成测试目标：make test TEST_ARGS='--test tool_loop'
 TEST_ARGS ?=
 
-.PHONY: help build run test fmt fmt-check clippy clippy-all check \
+.PHONY: help build run test test-safety fmt fmt-check clippy clippy-all check \
 	release embed gui-deps gui-frontend gui-check gui-test gui doc clean
 
 help:
@@ -32,11 +33,12 @@ help:
 	@echo "  make build          cargo build"
 	@echo "  make run            cargo run"
 	@echo "  make test           在独立 cgroup 中运行 cargo test（需要 Linux/systemd）"
+	@echo "  make test-safety    验证临时目录隔离与异常清理（需要 Python 3）"
 	@echo "  make fmt            cargo fmt --all"
 	@echo "  make fmt-check      仅检查格式，不改文件"
 	@echo "  make clippy         cargo clippy --all-targets"
 	@echo "  make clippy-all     先构建 GUI 前端，再 clippy --features gui"
-	@echo "  make check          收工质量门：fmt -> test -> clippy"
+	@echo "  make check          收工质量门：fmt -> test-safety -> test -> clippy"
 	@echo "  make release        cargo build --release"
 	@echo "  make embed          cargo build --release --features embed-env"
 	@echo "  make gui-deps       前端 npm ci"
@@ -63,6 +65,9 @@ run:
 test:
 	"$(SAFE_RUN)" $(CARGO) test $(CARGO_FEATURES) $(TEST_ARGS) $(TEST)
 
+test-safety:
+	GEER_TEST_MEMORY_MAX=256M GEER_TEST_TASKS_MAX=64 GEER_TEST_RUNTIME_MAX=90s "$(SAFE_RUN)" $(PYTHON) "$(abspath scripts/test-safe-check.py)"
+
 fmt:
 	$(CARGO) fmt --all
 
@@ -77,9 +82,10 @@ clippy-all:
 	"$(SAFE_RUN)" $(MAKE_IN_SERVICE) gui-frontend NPM="$(NPM)"
 	"$(SAFE_RUN)" $(CARGO) clippy --all-targets --features gui
 
-# 对齐 AGENTS.md：改完代码先 fmt，再 test，再 clippy。不加 -D warnings。
+# 安全入口回归先于项目测试；不加 -D warnings。
 check:
 	$(MAKE) fmt
+	$(MAKE) test-safety
 	$(MAKE) test
 	$(MAKE) clippy
 
