@@ -1,7 +1,7 @@
 use std::{
     io::{Read, Write},
     net::{TcpListener, TcpStream},
-    process::{Command, Output, Stdio},
+    process::Output,
     thread,
     time::{Duration, Instant},
 };
@@ -9,6 +9,8 @@ use std::{
 use sea_orm::{ConnectionTrait, Database, DbBackend, Statement};
 use serde_json::{Value, json};
 use uuid::Uuid;
+
+mod support;
 
 #[derive(Clone)]
 enum Reply {
@@ -64,13 +66,16 @@ fn run_repl_with_env(
             stream
                 .set_read_timeout(Some(Duration::from_secs(2)))
                 .expect("请求读取限时");
+            stream
+                .set_write_timeout(Some(Duration::from_secs(2)))
+                .expect("响应写入限时");
             bodies.push(read_body(&mut stream));
             write_reply(&mut stream, reply);
         }
         bodies
     });
 
-    let mut command = Command::new(env!("CARGO_BIN_EXE_geer-agent"));
+    let mut command = support::command(env!("CARGO_BIN_EXE_geer-agent"));
     command
         .env("OPENAI_API_KEY", "test-key")
         .env("OPENAI_MODEL", "test-model")
@@ -91,19 +96,7 @@ fn run_repl_with_env(
     for (name, value) in env {
         command.env(name, value);
     }
-    let mut child = command
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .expect("启动 REPL");
-    child
-        .stdin
-        .take()
-        .expect("输入管道")
-        .write_all(input.as_bytes())
-        .expect("写入测试对话");
-    let output = child.wait_with_output().expect("等待 REPL");
+    let output = support::run(&mut command, input.as_bytes()).expect("限时运行 REPL");
     let bodies = server.join().expect("等待模拟服务");
     (output, bodies)
 }
@@ -707,12 +700,12 @@ fn chat_failure_before_tools_discards_failed_user_message() {
 
 #[test]
 fn invalid_bash_path_fails_before_repl() {
-    let output = Command::new(env!("CARGO_BIN_EXE_geer-agent"))
+    let mut command = support::command(env!("CARGO_BIN_EXE_geer-agent"));
+    command
         .env("OPENAI_API_KEY", "test-key")
         .env("OPENAI_MODEL", "test-model")
-        .env("GEER_AGENT_BASH_BIN", "/definitely/missing/geer-agent-bash")
-        .output()
-        .expect("启动程序");
+        .env("GEER_AGENT_BASH_BIN", "/definitely/missing/geer-agent-bash");
+    let output = support::run(&mut command, &[]).expect("限时启动程序");
     assert!(!output.status.success());
     assert!(String::from_utf8_lossy(&output.stderr).contains("无法运行 Bash"));
 }
@@ -1271,13 +1264,13 @@ fn trace_write_failure_warns_and_preserves_model_answer() {
 
 #[test]
 fn invalid_database_selection_fails_before_repl() {
-    let output = Command::new(env!("CARGO_BIN_EXE_geer-agent"))
+    let mut command = support::command(env!("CARGO_BIN_EXE_geer-agent"));
+    command
         .env("OPENAI_API_KEY", "test-key")
         .env("OPENAI_MODEL", "test-model")
         .env("GEER_AGENT_DATABASE", "unknown")
-        .env("GEER_AGENT_DATABASE_URL", "sqlite://trace.sqlite?mode=rwc")
-        .output()
-        .unwrap();
+        .env("GEER_AGENT_DATABASE_URL", "sqlite://trace.sqlite?mode=rwc");
+    let output = support::run(&mut command, &[]).unwrap();
     assert!(!output.status.success());
     assert!(String::from_utf8_lossy(&output.stderr).contains("GEER_AGENT_DATABASE 只能是"));
 }

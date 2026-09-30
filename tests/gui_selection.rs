@@ -2,28 +2,15 @@
 
 use std::{
     fs,
-    io::{self, Write},
-    process::{Command, Output, Stdio},
-    thread,
-    time::Duration,
+    process::{Command, Output},
 };
 
 use uuid::Uuid;
 
+mod support;
+
 fn run(command: &mut Command) -> Output {
-    let mut retries = 0;
-    let mut child = loop {
-        match command.spawn() {
-            Ok(child) => break child,
-            Err(error) if error.kind() == io::ErrorKind::ExecutableFileBusy && retries < 20 => {
-                retries += 1;
-                thread::sleep(Duration::from_millis(10));
-            }
-            Err(error) => panic!("启动临时可执行文件失败：{error}"),
-        }
-    };
-    let _ = child.stdin.take().unwrap().write_all(b"/exit\n");
-    child.wait_with_output().unwrap()
+    support::run(command, b"/exit\n").expect("限时运行临时可执行文件")
 }
 
 #[test]
@@ -41,22 +28,14 @@ fn executable_env_selects_gui_and_process_override_keeps_repl_available() {
     )
     .unwrap();
 
-    let mut gui = Command::new(&executable);
-    gui.env("HOME", &dir)
-        .env_remove("GEER_AGENT_UI")
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
+    let mut gui = support::command(&executable);
+    gui.env("HOME", &dir).env_remove("GEER_AGENT_UI");
     let output = run(&mut gui);
     assert!(!output.status.success());
     assert!(String::from_utf8_lossy(&output.stderr).contains("当前构建未包含 GUI"));
 
-    let mut repl = Command::new(&executable);
-    repl.env("HOME", &dir)
-        .env("GEER_AGENT_UI", "repl")
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
+    let mut repl = support::command(&executable);
+    repl.env("HOME", &dir).env("GEER_AGENT_UI", "repl");
     let output = run(&mut repl);
     assert!(
         output.status.success(),

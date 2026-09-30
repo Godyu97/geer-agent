@@ -113,7 +113,7 @@ cargo build --release --features embed-env
 
 ## 开发命令
 
-根目录 `Makefile` 包装了常用 Cargo / 前端命令（需要 GNU Make；Windows 可用 Git for Windows 自带的 `make`）：
+根目录 `Makefile` 包装了常用 Cargo / 前端命令（需要 GNU Make）：
 
 ```sh
 make help      # 列出目标
@@ -121,3 +121,51 @@ make check     # fmt -> test -> clippy
 make run       # 终端 TUI / REPL
 make gui       # 构建前端并以 GUI feature 运行
 ```
+
+## 测试与系统安全
+
+2026 年 9 月的 Fedora 诊断报告确认主机发生过全局 OOM，ChatGPT/Codex 服务被内核终止。项目的缺失命令测试存在可复现的触发机制：清空 `PATH` 后，Bash 在远程启动条件下读取宿主启动文件，Fedora 的缺失命令处理再次查找缺失的 `gettext`，递归派生进程并消耗内核内存。历史证据不足以把每次 OOM 都归因于同一测试。增加 swap 无法替代修复启动隔离和限制进程数量。
+
+在 Fedora/Linux 上，使用下面的入口运行测试：
+
+```sh
+# 修复 Shell/进程代码后，先跑受影响的单项和清理回归，再跑完整质量门。
+make test TEST_ARGS='--bin geer-agent' TEST=query_dependencies_are_resolved_by_configured_bash_only
+make test TEST_ARGS='--test process_safety'
+make check
+
+# GUI Rust 测试先准备前端产物；前端测试也走受限入口。
+./scripts/test-safe.sh make gui-frontend
+make test FEATURES=gui
+make gui-test
+```
+
+`make test`、`make gui-test`、`make clippy` 和 `make clippy-all` 通过 `scripts/test-safe.sh` 启动独立的 systemd 用户服务。Cargo 编译、测试程序与后代进程都归入本次服务的 cgroup；前端测试安装依赖和 GUI clippy 准备前端的阶段也先进入受限服务。入口检查内核实际的内存、swap 与任务限制，缺少 systemd 用户服务、cgroup v2 或有效限制时直接失败，不自动执行无约束测试。`make check` 按 fmt → test → clippy 顺序执行，即使传入 `make -j` 也保持这个顺序。
+
+| 限制 | 默认值 | 调整方式 |
+| --- | --- | --- |
+| 整个测试/编译组的内存 | 4 GiB | `GEER_TEST_MEMORY_MAX` |
+| swap | 0 | 固定禁用 |
+| 任务数（包括线程） | 256 | `GEER_TEST_TASKS_MAX` |
+| 整个服务的运行时间 | 10 分钟 | `GEER_TEST_RUNTIME_MAX` |
+| 停止后的强制清理等待 | 5 秒 | 固定；`KillMode=control-group` |
+| Cargo 编译并行数 | 2 | `CARGO_BUILD_JOBS` |
+| Rust 测试线程数 | 1 | `RUST_TEST_THREADS` |
+| Vitest worker / 文件并行 | 1 / 关闭 | 前端测试脚本固定设置 |
+| Bash 函数嵌套保护 | 32 | 固定；`FUNCNEST` 只作补充保护 |
+
+容量需要覆盖编译峰值，GUI 构建尤其如此。运行时限接受正整数秒、`s`、`min` 或 `h`，不接受无限或零时限。遇到服务内存或任务上限失败时，先看服务名、退出原因与峰值统计，检查递归/泄漏，再逐项调整有限额度，同时为桌面和远程连接服务留出内存。例如：
+
+```sh
+GEER_TEST_MEMORY_MAX=6G GEER_TEST_RUNTIME_MAX=15min make test FEATURES=gui
+```
+
+需要其他 Cargo 参数时，用 `TEST_ARGS`；需要直接验证其它命令时，用 `./scripts/test-safe.sh <命令> [参数...]`。不要直接在开发主机运行裸 `cargo test`、`npm test` 或测试二进制，也不要同时启动多组测试去叠加资源额度。Windows、macOS 和没有 systemd 用户服务的环境需要先提供带内存、进程数量、总时限和后代清理能力的独立测试环境；受限入口不会静默降级。不要对整个 `user.slice` 设置测试额度，否则会一起限制 ChatGPT、桌面等同用户服务。[cgroup v2 文档](https://docs.kernel.org/admin-guide/cgroup-v2.html) 说明了进程后代的资源归属与内存/任务控制。
+
+新增或修改测试时遵守以下约定：
+
+- 集成测试启动进程使用 `tests/support/mod.rs` 的 `command` / `run`。默认 20 秒超时，stdout/stderr 各最多捕获 4 MiB；输入在限时范围内写入并关闭，无输入时接 `/dev/null`。错误、超时及正常退出都清理 Unix 进程组并回收主进程，Windows 尝试 `taskkill /T`；整组资源限制与最终清理由外层隔离环境保证。
+- 所有直接 Bash 探针显式使用 `--noprofile --norc`，删除 `BASH_ENV`、`ENV`、`SSH_CLIENT`、`SSH_CONNECTION`、`SSH_TTY`。模拟缺失命令只修改子进程的 `PATH`，清理命令使用可靠的绝对路径；包装脚本仍须保留 `GEER_AGENT_SCRIPT` / `GEER_AGENT_ARG_*` 等内部参数，不能用 `env -i` 盲目删除。
+- 测试不继承宿主网络标准输入、不读取宿主 Shell 启动脚本、不修改测试进程的全局环境。启动钩子回归使用临时目录中的无递归哨兵脚本；网络模拟仅监听本机临时端口，并设置连接/读写时限。
+- `timeout`、`kill_on_drop(true)`、只杀直接子进程和单用户 `ulimit -u` 都不能单独保证系统安全。不要用 fork bomb、无限递归、持续无界输出等方式测试保护；用数量有限的后代、有限输出与临时文件验证退出和清理。进程组无法兜住主动脱离组的后代，因此仍需外层 cgroup 或等效隔离。
+- 出现 Bash 数量持续增长、测试超时或内存异常时立即停止本次 `geer-agent-test-*.service`，检查其状态和遗留进程后再试。不要使用 `pkill bash` 等同用户全局清理，也不要靠禁用限额、增加 swap 或反复重跑来继续验收。

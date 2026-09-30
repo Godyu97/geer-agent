@@ -6,6 +6,9 @@
 CARGO ?= cargo
 NPM ?= npm
 FRONTEND := src/ui/gui/frontend
+SAFE_RUN := $(abspath scripts/test-safe.sh)
+# 服务中的 make 不继承 jobserver；间接引用也避免 make -n 执行受限服务的准备命令。
+MAKE_IN_SERVICE := $(MAKE)
 
 # 可选 Cargo feature，例如：make run FEATURES=gui
 FEATURES ?=
@@ -15,8 +18,10 @@ CARGO_FEATURES := $(if $(FEATURES),--features $(FEATURES),)
 ARGS ?=
 RUN_ARGS := $(if $(ARGS),-- $(ARGS),)
 
-# 只跑部分测试：make test TEST=tool_loop
+# 按名称过滤：make test TEST=query_dependencies_are_resolved_by_configured_bash_only
 TEST ?=
+# 选择集成测试目标：make test TEST_ARGS='--test tool_loop'
+TEST_ARGS ?=
 
 .PHONY: help build run test fmt fmt-check clippy clippy-all check \
 	release embed gui-deps gui-frontend gui-check gui-test gui doc clean
@@ -26,7 +31,7 @@ help:
 	@echo
 	@echo "  make build          cargo build"
 	@echo "  make run            cargo run"
-	@echo "  make test           cargo test"
+	@echo "  make test           在独立 cgroup 中运行 cargo test（需要 Linux/systemd）"
 	@echo "  make fmt            cargo fmt --all"
 	@echo "  make fmt-check      仅检查格式，不改文件"
 	@echo "  make clippy         cargo clippy --all-targets"
@@ -45,7 +50,9 @@ help:
 	@echo "变量："
 	@echo "  FEATURES=gui        启用 Cargo feature（可逗号分隔）"
 	@echo "  ARGS=hello          传给二进制（run / gui）"
-	@echo "  TEST=tool_loop      只跑指定测试"
+	@echo "  TEST=name           按名称过滤测试"
+	@echo "  TEST_ARGS='--test tool_loop'  选择 Cargo 测试目标"
+	@echo "  GEER_TEST_MEMORY_MAX=4G / GEER_TEST_TASKS_MAX=256 / GEER_TEST_RUNTIME_MAX=10min"
 
 build:
 	$(CARGO) build $(CARGO_FEATURES)
@@ -54,7 +61,7 @@ run:
 	$(CARGO) run $(CARGO_FEATURES) $(RUN_ARGS)
 
 test:
-	$(CARGO) test $(CARGO_FEATURES) $(TEST)
+	"$(SAFE_RUN)" $(CARGO) test $(CARGO_FEATURES) $(TEST_ARGS) $(TEST)
 
 fmt:
 	$(CARGO) fmt --all
@@ -63,14 +70,18 @@ fmt-check:
 	$(CARGO) fmt --all -- --check
 
 clippy:
-	$(CARGO) clippy --all-targets $(CARGO_FEATURES)
+	"$(SAFE_RUN)" $(CARGO) clippy --all-targets $(CARGO_FEATURES)
 
 # --all-features 会同时打开 embed-env，缺 .env 时无法编译；这里只加 gui。
-clippy-all: gui-frontend
-	$(CARGO) clippy --all-targets --features gui
+clippy-all:
+	"$(SAFE_RUN)" $(MAKE_IN_SERVICE) gui-frontend NPM="$(NPM)"
+	"$(SAFE_RUN)" $(CARGO) clippy --all-targets --features gui
 
 # 对齐 AGENTS.md：改完代码先 fmt，再 test，再 clippy。不加 -D warnings。
-check: fmt test clippy
+check:
+	$(MAKE) fmt
+	$(MAKE) test
+	$(MAKE) clippy
 
 release:
 	$(CARGO) build --release $(CARGO_FEATURES)
@@ -90,8 +101,9 @@ gui-frontend: $(FRONTEND)/node_modules
 gui-check: $(FRONTEND)/node_modules
 	cd $(FRONTEND) && $(NPM) run check
 
-gui-test: $(FRONTEND)/node_modules
-	cd $(FRONTEND) && $(NPM) test
+gui-test:
+	"$(SAFE_RUN)" $(MAKE_IN_SERVICE) gui-deps NPM="$(NPM)"
+	cd $(FRONTEND) && "$(SAFE_RUN)" $(NPM) test
 
 gui: export GEER_AGENT_UI := gui
 gui: gui-frontend

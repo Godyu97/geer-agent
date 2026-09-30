@@ -661,17 +661,20 @@ async fn explicit_workspace_drives_bash_file_and_default_query_paths() {
 #[cfg(unix)]
 #[tokio::test]
 async fn query_dependencies_are_resolved_by_configured_bash_only() {
-    use std::{os::unix::fs::PermissionsExt, process::Command};
+    use crate::test_support;
+    use std::{os::unix::fs::PermissionsExt, time::Duration};
     let dir = query_dir();
-    let bash = Command::new("bash")
-        .args(["-c", "command -v bash"])
-        .output()
-        .expect("Bash 可用");
+    let mut bash = test_support::command("bash");
+    bash.args(["--noprofile", "--norc", "-c", "command -v bash"]);
+    let bash = test_support::run(&mut bash, &[]).expect("Bash 可用");
+    assert!(bash.status.success(), "Bash 路径探针应成功");
     let bash_path = String::from_utf8(bash.stdout).expect("路径编码");
+    assert!(std::path::Path::new(bash_path.trim()).is_absolute());
     let wrapper = dir.join(format!("bash-{}", uuid::Uuid::new_v4()));
     let empty_path = dir.join("empty-path");
     fs::create_dir(&empty_path).expect("创建空 PATH 目录");
-    // 隔离启动钩子和 PATH，同时保留工具通过环境传入的脚本与参数。
+    // Fedora 的缺失命令钩子可能递归 fork；空 PATH 必须配合禁用启动文件与远程检测。
+    // 仅删除启动变量，保留工具通过环境传入的脚本与参数。
     let quoted = format!("'{}'", bash_path.trim().replace('\'', "'\\''"));
     let quoted_path = format!(
         "'{}'",
@@ -680,22 +683,34 @@ async fn query_dependencies_are_resolved_by_configured_bash_only() {
     fs::write(
         &wrapper,
         format!(
-            "#!/bin/sh\nunset BASH_ENV ENV\nPATH={quoted_path}\nexport PATH\nexec {quoted} \"$@\"\n"
+            "#!/bin/sh\nunset BASH_ENV ENV SSH_CLIENT SSH_CONNECTION SSH_TTY\nPATH={quoted_path}\nexport PATH\nexec {quoted} --noprofile --norc \"$@\"\n"
         ),
     )
     .expect("隔离环境");
     fs::set_permissions(&wrapper, fs::Permissions::from_mode(0o700)).expect("执行权限");
-    let probe = tokio::time::timeout(
-        std::time::Duration::from_secs(2),
-        tokio::process::Command::new(&wrapper)
-            .args(["-c", "exec ls -1Ap -- ."])
-            .kill_on_drop(true)
-            .output(),
-    )
-    .await
-    .expect("隔离夹具应快速结束")
-    .expect("运行隔离夹具");
+    let startup = dir.join("startup-hook");
+    fs::write(&startup, "printf 'startup-hook-ran' >&2; exit 88\n").expect("启动钩子夹具");
+    fs::write(dir.join(".bashrc"), "printf 'bashrc-ran' >&2; exit 89\n").expect("远程启动夹具");
+    let mut probe = test_support::command(&wrapper);
+    probe
+        .env("HOME", &dir)
+        .env("BASH_ENV", &startup)
+        .env("ENV", &startup)
+        .env("SSH_CLIENT", "127.0.0.1 1234 22")
+        .env("SSH_CONNECTION", "127.0.0.1 1234 127.0.0.1 22")
+        .env("SSH_TTY", "/dev/pts/test")
+        .env("SHLVL", "0")
+        .env("GEER_AGENT_SCRIPT", "internal script")
+        .env("GEER_AGENT_ARG_1", "literal argument")
+        .args([
+            "-c",
+            r#"printf '%s\n' "$GEER_AGENT_SCRIPT" "$GEER_AGENT_ARG_1"; if read -r input; then exit 90; fi; exec ls -1Ap -- ."#,
+        ]);
+    let probe = test_support::run_with_timeout(&mut probe, &[], Duration::from_secs(2))
+        .expect("隔离夹具应快速结束");
     assert_eq!(probe.status.code(), Some(127), "缺少命令应返回 127");
+    assert_eq!(probe.stdout, b"internal script\nliteral argument\n");
+    assert!(!String::from_utf8_lossy(&probe.stderr).contains("-ran"));
     let mut tools = Tools::new(true, wrapper).expect("初始化");
     tools.cwd = dir.clone();
     tools.allow_all_for_test();

@@ -1,7 +1,7 @@
 use std::{
     io::{self, Read, Write},
     net::{TcpListener, TcpStream},
-    process::{Command, Output, Stdio},
+    process::Output,
     thread,
     time::{Duration, Instant},
 };
@@ -9,6 +9,8 @@ use std::{
 use sea_orm::{ConnectionTrait, Database, DbBackend, Statement};
 use serde_json::{Value, json};
 use uuid::Uuid;
+
+mod support;
 
 fn body(stream: &mut TcpStream) -> Value {
     let mut bytes = Vec::new();
@@ -66,7 +68,8 @@ fn run(api: &str, base_url: &str, db_url: &str, input: &str) -> Output {
 }
 
 fn run_with_model(api: &str, base_url: &str, db_url: &str, model: &str, input: &str) -> Output {
-    let mut child = Command::new(env!("CARGO_BIN_EXE_geer-agent"))
+    let mut command = support::command(env!("CARGO_BIN_EXE_geer-agent"));
+    command
         .env("OPENAI_API_KEY", "mock-key")
         .env("OPENAI_MODEL", model)
         .env("OPENAI_BASE_URL", base_url)
@@ -77,19 +80,8 @@ fn run_with_model(api: &str, base_url: &str, db_url: &str, model: &str, input: &
         .env("GEER_AGENT_UI", "repl")
         .env("GEER_AGENT_SESSION_PERSISTENCE", "on")
         .env("GEER_AGENT_DATABASE", "sqlite")
-        .env("GEER_AGENT_DATABASE_URL", db_url)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .unwrap();
-    child
-        .stdin
-        .take()
-        .unwrap()
-        .write_all(input.as_bytes())
-        .unwrap();
-    child.wait_with_output().unwrap()
+        .env("GEER_AGENT_DATABASE_URL", db_url);
+    support::run(&mut command, input.as_bytes()).expect("限时运行 REPL")
 }
 
 fn run_default(api: &str, base_url: &str, workspace: &std::path::Path, input: &str) -> Output {
@@ -100,7 +92,7 @@ fn run_default(api: &str, base_url: &str, workspace: &std::path::Path, input: &s
         // 保持独立的可执行文件位置，避免符号链接触发开发模式并读取仓库 .env。
         std::fs::hard_link(source, &executable).unwrap();
     }
-    let mut command = Command::new(executable);
+    let mut command = support::command(executable);
     command
         .current_dir(workspace)
         .env("HOME", workspace)
@@ -115,28 +107,8 @@ fn run_default(api: &str, base_url: &str, workspace: &std::path::Path, input: &s
         .env_remove("GEER_AGENT_DATABASE")
         .env_remove("GEER_AGENT_DATABASE_URL")
         .env_remove("GEER_AGENT_TRACE")
-        .env_remove("GEER_AGENT_SESSION_PERSISTENCE")
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-    let mut retries = 0;
-    let mut child = loop {
-        match command.spawn() {
-            Ok(child) => break child,
-            Err(error) if error.kind() == io::ErrorKind::ExecutableFileBusy && retries < 20 => {
-                retries += 1;
-                thread::sleep(Duration::from_millis(10));
-            }
-            Err(error) => panic!("启动临时可执行文件失败：{error}"),
-        }
-    };
-    child
-        .stdin
-        .take()
-        .unwrap()
-        .write_all(input.as_bytes())
-        .unwrap();
-    child.wait_with_output().unwrap()
+        .env_remove("GEER_AGENT_SESSION_PERSISTENCE");
+    support::run(&mut command, input.as_bytes()).expect("限时运行临时可执行文件")
 }
 
 #[test]
@@ -216,6 +188,9 @@ async fn default_database_is_shared_across_sessions_and_restarts(api: &str) {
             };
             stream
                 .set_read_timeout(Some(Duration::from_secs(3)))
+                .unwrap();
+            stream
+                .set_write_timeout(Some(Duration::from_secs(3)))
                 .unwrap();
             requests.push(body(&mut stream));
             reply(&mut stream, &api_owned, text, index);
@@ -420,6 +395,9 @@ async fn cross_process(api: &str) {
             stream
                 .set_read_timeout(Some(Duration::from_secs(3)))
                 .unwrap();
+            stream
+                .set_write_timeout(Some(Duration::from_secs(3)))
+                .unwrap();
             requests.push(body(&mut stream));
             reply(&mut stream, &api_owned, text, index);
         }
@@ -567,6 +545,9 @@ async fn delete_history_across_restarts(api: &str) {
             };
             stream
                 .set_read_timeout(Some(Duration::from_secs(3)))
+                .unwrap();
+            stream
+                .set_write_timeout(Some(Duration::from_secs(3)))
                 .unwrap();
             let _ = body(&mut stream);
             reply(&mut stream, &api_owned, answer, index);

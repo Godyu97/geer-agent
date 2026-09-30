@@ -1,13 +1,12 @@
 use std::{
     fs,
-    io::{self, Write},
     path::{Path, PathBuf},
-    process::{Command, Output, Stdio},
-    thread,
-    time::Duration,
+    process::Output,
 };
 
 use uuid::Uuid;
+
+mod support;
 
 fn layout() -> (PathBuf, PathBuf, PathBuf, PathBuf) {
     let root = Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -26,7 +25,7 @@ fn layout() -> (PathBuf, PathBuf, PathBuf, PathBuf) {
 }
 
 fn run(executable: &Path, cwd: &Path, home: &Path, overrides: &[(&str, &str)]) -> Output {
-    let mut command = Command::new(executable);
+    let mut command = support::command(executable);
     for (name, _) in std::env::vars_os() {
         let name_text = name.to_string_lossy();
         if name_text.starts_with("OPENAI_") || name_text.starts_with("GEER_AGENT_") {
@@ -41,27 +40,11 @@ fn run(executable: &Path, cwd: &Path, home: &Path, overrides: &[(&str, &str)]) -
         .env("GEER_AGENT_TRACE", "on")
         .env("GEER_AGENT_SESSION_PERSISTENCE", "on")
         .env("GEER_AGENT_DATABASE", "sqlite")
-        .env("GEER_AGENT_DATABASE_URL", "")
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
+        .env("GEER_AGENT_DATABASE_URL", "");
     for &(name, value) in overrides {
         command.env(name, value);
     }
-    let mut retries = 0;
-    let mut child = loop {
-        match command.spawn() {
-            Ok(child) => break child,
-            Err(error) if error.kind() == io::ErrorKind::ExecutableFileBusy && retries < 20 => {
-                // 刚复制好的可执行文件在部分文件系统上会短暂拒绝执行。
-                retries += 1;
-                thread::sleep(Duration::from_millis(10));
-            }
-            Err(error) => panic!("启动临时可执行文件失败：{error}"),
-        }
-    };
-    child.stdin.take().unwrap().write_all(b"/exit\n").unwrap();
-    child.wait_with_output().unwrap()
+    support::run(&mut command, b"/exit\n").expect("限时运行临时可执行文件")
 }
 
 fn assert_started(output: &Output) {

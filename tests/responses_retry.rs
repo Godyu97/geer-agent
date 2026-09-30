@@ -3,11 +3,13 @@ use serde_json::Value;
 use std::{
     io::{Read, Write},
     net::{TcpListener, TcpStream},
-    process::{Command, Output, Stdio},
+    process::Output,
     thread,
     time::{Duration, Instant},
 };
 use uuid::Uuid;
+
+mod support;
 
 #[derive(Clone)]
 enum Reply {
@@ -45,13 +47,16 @@ fn run_repl_with_trace(
             stream
                 .set_read_timeout(Some(Duration::from_secs(2)))
                 .expect("设置读取超时");
+            stream
+                .set_write_timeout(Some(Duration::from_secs(2)))
+                .expect("设置写入超时");
             bodies.push(read_body(&mut stream));
             write_reply(&mut stream, reply);
         }
         bodies
     });
 
-    let mut command = Command::new(env!("CARGO_BIN_EXE_geer-agent"));
+    let mut command = support::command(env!("CARGO_BIN_EXE_geer-agent"));
     command
         .env("OPENAI_API_KEY", "test-key")
         .env("OPENAI_MODEL", "test-model")
@@ -64,23 +69,13 @@ fn run_repl_with_trace(
             if trace_url.is_some() { "on" } else { "off" },
         )
         .env_remove("GEER_AGENT_DATABASE")
-        .env_remove("GEER_AGENT_DATABASE_URL")
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
+        .env_remove("GEER_AGENT_DATABASE_URL");
     if let Some(trace_url) = trace_url {
         command
             .env("GEER_AGENT_DATABASE", "sqlite")
             .env("GEER_AGENT_DATABASE_URL", trace_url);
     }
-    let mut child = command.spawn().expect("启动 REPL");
-    child
-        .stdin
-        .take()
-        .expect("获取标准输入")
-        .write_all(input.as_bytes())
-        .expect("写入对话");
-    let output = child.wait_with_output().expect("等待 REPL 退出");
+    let output = support::run(&mut command, input.as_bytes()).expect("限时运行 REPL");
     let bodies = server.join().expect("等待模拟服务结束");
     (output, bodies)
 }
