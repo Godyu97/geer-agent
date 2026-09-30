@@ -1918,6 +1918,190 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn both_apis_pair_successful_search_and_web_access_in_the_tool_loop() {
+        use serde_json::json;
+        use std::{
+            io::{Read, Write},
+            net::TcpListener,
+            thread,
+            time::{Duration, Instant},
+        };
+        use uuid::Uuid;
+        for api in [OpenAiApi::Responses, OpenAiApi::ChatCompletions] {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            listener.set_nonblocking(true).unwrap();
+            let endpoint = format!("http://{}/", listener.local_addr().unwrap());
+            let page_url = format!("{endpoint}page?query=full");
+            let source_url = page_url.clone();
+            let server = thread::spawn(move || {
+                let deadline = Instant::now() + Duration::from_secs(8);
+                for index in 0..3 {
+                    let mut stream = loop {
+                        match listener.accept() {
+                            Ok((stream, _)) => break stream,
+                            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                                assert!(Instant::now() < deadline, "等待网页请求超时");
+                                thread::sleep(Duration::from_millis(5));
+                            }
+                            Err(error) => panic!("mock: {error}"),
+                        }
+                    };
+                    stream
+                        .set_read_timeout(Some(Duration::from_secs(2)))
+                        .unwrap();
+                    stream
+                        .set_write_timeout(Some(Duration::from_secs(2)))
+                        .unwrap();
+                    let mut bytes = Vec::new();
+                    loop {
+                        let mut block = [0; 4096];
+                        let count = stream.read(&mut block).unwrap();
+                        assert!(count > 0);
+                        bytes.extend_from_slice(&block[..count]);
+                        assert!(bytes.len() < 65536);
+                        if let Some(end) = bytes.windows(4).position(|chunk| chunk == b"\r\n\r\n") {
+                            let length = String::from_utf8_lossy(&bytes[..end])
+                                .lines()
+                                .find_map(|line| {
+                                    let (key, value) = line.split_once(':')?;
+                                    key.eq_ignore_ascii_case("content-length")
+                                        .then(|| value.trim().parse::<usize>().unwrap())
+                                })
+                                .unwrap_or(0);
+                            if bytes.len() >= end + 4 + length {
+                                break;
+                            }
+                        }
+                    }
+                    let body = if index == 0 {
+                        json!({"jsonrpc":"2.0","id":1,"result":{"content":[{"type":"text",
+                            "text":format!("Title: Mock source\nURL: {source_url}\nHighlights:\nuseful summary")}]}}).to_string()
+                    } else {
+                        "<p>Web fact</p>".into()
+                    };
+                    let mime = if index == 0 {
+                        "application/json"
+                    } else {
+                        "text/html"
+                    };
+                    write!(stream,"HTTP/1.1 200 OK\r\nContent-Type: {mime}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",body.len()).unwrap();
+                }
+            });
+            let workspace_path =
+                std::env::temp_dir().join(format!("geer-search-web-{}", Uuid::new_v4()));
+            fs::create_dir(&workspace_path).unwrap();
+            fs::write(
+                workspace_path.join("fact.txt"),
+                "before\n    local fact\nafter\n",
+            )
+            .unwrap();
+            let mut calls = vec![
+                ToolCall {
+                    id: "search_call".into(),
+                    name: "search".into(),
+                    args: json!({"pattern":"local fact"}).to_string(),
+                },
+                ToolCall {
+                    id: "web_search_call".into(),
+                    name: "web_search".into(),
+                    args: json!({"query":"facts"}).to_string(),
+                },
+            ];
+            calls.extend((1..=2).map(|index| ToolCall {
+                id: format!("fetch_{index}"),
+                name: "web_fetch".into(),
+                args: json!({"url":page_url}).to_string(),
+            }));
+            let output = if api == OpenAiApi::Responses {
+                calls.iter().map(|call|serde_json::from_value(json!({"type":"function_call","id":format!("fc_{}",call.id),"call_id":call.id,"name":call.name,"arguments":call.args,"status":"completed"})).unwrap()).collect()
+            } else {
+                vec![]
+            };
+            let mut provider = fake(vec![
+                Ok(ModelStep {
+                    text: String::new(),
+                    calls,
+                    output,
+                    usage: None,
+                }),
+                Ok(text_step("done")),
+            ]);
+            let mut tools = Tools::new(true, crate::config::default_bash_bin()).unwrap();
+            tools.set_web_endpoint_for_test(&endpoint);
+            let confirmations = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+            let seen = std::rc::Rc::clone(&confirmations);
+            tools.set_confirm(move |prompt| {
+                seen.borrow_mut().push(prompt.to_owned());
+                Ok(true)
+            });
+            let mut prompt = Prompt::new(api, "system".into());
+            prompt.begin_turn("inspect local and web facts");
+            let workspace = Workspace::from_stored(workspace_path.to_str().unwrap()).unwrap();
+            let metrics = run_tool_loop_with_session(
+                &mut provider,
+                &mut tools,
+                &mut prompt,
+                &mut |_| Ok(()),
+                &mut |_| Ok(()),
+                DEFAULT_AGENT_BUDGET,
+                "test-model",
+                None,
+                CompactionConfig::default(),
+                &mut 0,
+                &workspace,
+                None,
+                "",
+            )
+            .await
+            .unwrap();
+            assert_eq!(metrics.tool_calls, 4);
+            assert_eq!(provider.tool_counts[0], 11);
+            let messages = if api == OpenAiApi::Responses {
+                provider.snapshots[1]["input"].as_array().unwrap()
+            } else {
+                provider.snapshots[1].as_array().unwrap()
+            };
+            for (id, expected) in [
+                ("search_call", "fact.txt:2:     local fact"),
+                ("web_search_call", "useful summary"),
+                ("fetch_1", "Web fact"),
+                ("fetch_2", "Web fact"),
+            ] {
+                let message = messages
+                    .iter()
+                    .find(|item| {
+                        if api == OpenAiApi::Responses {
+                            item["call_id"] == id && item["type"] == "function_call_output"
+                        } else {
+                            item["tool_call_id"] == id && item["role"] == "tool"
+                        }
+                    })
+                    .unwrap();
+                let text = if api == OpenAiApi::Responses {
+                    message["output"].as_str().unwrap()
+                } else {
+                    message["content"].as_str().unwrap()
+                };
+                assert!(text.contains(expected), "{text}");
+                let meta: serde_json::Value =
+                    serde_json::from_str(text.split_once("\n\n").unwrap().0).unwrap();
+                assert_eq!(meta["status"], "ok");
+            }
+            assert_eq!(confirmations.borrow().len(), 4);
+            assert_eq!(
+                confirmations
+                    .borrow()
+                    .iter()
+                    .filter(|prompt| prompt.contains("访问 URL："))
+                    .count(),
+                2
+            );
+            server.join().unwrap();
+            fs::remove_dir_all(workspace_path).unwrap();
+        }
+    }
+
+    #[tokio::test]
     async fn budget_timeout_persists_partial_output_and_finalization() {
         struct SlowThenFinal {
             calls: usize,
@@ -2317,7 +2501,7 @@ mod tests {
         assert_eq!(metrics.turns, 3);
         assert_eq!(metrics.tool_calls, 99);
         assert_eq!(printed.matches("[调用工具 get_current_time]").count(), 99);
-        assert_eq!(chat.tool_counts, vec![8, 8, 0]);
+        assert_eq!(chat.tool_counts, vec![11, 11, 0]);
         assert!(
             chat.snapshots[2][0]["content"]
                 .as_str()
@@ -2340,7 +2524,7 @@ mod tests {
         assert_eq!(metrics.turns, 3);
         assert_eq!(metrics.tool_calls, 100);
         assert_eq!(printed.matches("[调用工具 get_current_time]").count(), 100);
-        assert_eq!(chat.tool_counts, vec![8, 8, 0]);
+        assert_eq!(chat.tool_counts, vec![11, 11, 0]);
     }
 
     #[tokio::test]
@@ -2376,7 +2560,7 @@ mod tests {
         assert_eq!(metrics.turns, 30);
         assert_eq!(metrics.tool_calls, 29);
         assert_eq!(chat.tool_counts.len(), 30);
-        assert!(chat.tool_counts[..29].iter().all(|count| *count == 8));
+        assert!(chat.tool_counts[..29].iter().all(|count| *count == 11));
         assert_eq!(chat.tool_counts[29], 0);
         assert!(
             chat.snapshots[29][0]["content"]
@@ -2410,7 +2594,7 @@ mod tests {
 
         assert_eq!(metrics.turns, 2);
         assert_eq!(metrics.tool_calls, 1);
-        assert_eq!(chat.tool_counts, vec![8, 0]);
+        assert_eq!(chat.tool_counts, vec![11, 0]);
         assert!(printed.contains(FINALIZATION_FALLBACK.trim()));
         let Messages::Chat(messages) = prompt.messages() else {
             panic!("Chat 消息")
@@ -2434,7 +2618,7 @@ mod tests {
 
         assert_eq!(metrics.turns, 1);
         assert_eq!(metrics.tool_calls, 1);
-        assert_eq!(chat.tool_counts, vec![8, 0]);
+        assert_eq!(chat.tool_counts, vec![11, 0]);
         assert!(printed.contains(FINALIZATION_FALLBACK.trim()));
         let Messages::Chat(messages) = prompt.messages() else {
             panic!("Chat 消息")
@@ -2480,7 +2664,7 @@ mod tests {
             metrics.termination_reason,
             Some(TerminationReason::RepeatedToolLoop)
         );
-        assert_eq!(chat.tool_counts, vec![8, 8, 8, 8, 0]);
+        assert_eq!(chat.tool_counts, vec![11, 11, 11, 11, 0]);
         assert!(
             chat.snapshots[3][0]["content"]
                 .as_str()
@@ -2563,7 +2747,7 @@ mod tests {
                 .expect("应收敛");
             assert_eq!(metrics.termination_reason, Some(reason));
             assert_eq!(metrics.tool_calls, 0);
-            assert_eq!(chat.tool_counts, vec![8, 0]);
+            assert_eq!(chat.tool_counts, vec![11, 0]);
         }
     }
 

@@ -93,12 +93,33 @@ pub(super) async fn run_fixed(
     run_command(bash_bin, cwd, script, args, COMMAND_TIMEOUT).await
 }
 
+pub(super) async fn run_fixed_captured(
+    bash_bin: &Path,
+    cwd: &Path,
+    script: &str,
+    args: &[OsString],
+    capture_limit: usize,
+) -> io::Result<CommandOutput> {
+    run_command_captured(bash_bin, cwd, script, args, COMMAND_TIMEOUT, capture_limit).await
+}
+
 async fn run_command(
     bash_bin: &Path,
     cwd: &Path,
     script: &str,
     args: &[OsString],
     limit: Duration,
+) -> io::Result<CommandOutput> {
+    run_command_captured(bash_bin, cwd, script, args, limit, MAX_CAPTURE_BYTES).await
+}
+
+async fn run_command_captured(
+    bash_bin: &Path,
+    cwd: &Path,
+    script: &str,
+    args: &[OsString],
+    limit: Duration,
+    capture_limit: usize,
 ) -> io::Result<CommandOutput> {
     let mut command = Command::new(bash_bin);
     // Windows 命令行由 Git 启动器和 MSYS 运行时重新解析：未加引号的 `*.txt` 会被展开成文件名，
@@ -165,8 +186,16 @@ async fn run_command(
         .ok_or_else(|| io::Error::other("无法捕获标准错误"))?;
     let stdout_capture = SharedCapture::default();
     let stderr_capture = SharedCapture::default();
-    let mut stdout_task = tokio::spawn(read_bounded(stdout, Arc::clone(&stdout_capture)));
-    let mut stderr_task = tokio::spawn(read_bounded(stderr, Arc::clone(&stderr_capture)));
+    let mut stdout_task = tokio::spawn(read_bounded(
+        stdout,
+        Arc::clone(&stdout_capture),
+        capture_limit,
+    ));
+    let mut stderr_task = tokio::spawn(read_bounded(
+        stderr,
+        Arc::clone(&stderr_capture),
+        MAX_CAPTURE_BYTES,
+    ));
     let status = match timeout(limit, child.wait()).await {
         Ok(result) => Some(result),
         Err(_) => {
@@ -276,6 +305,7 @@ type SharedCapture = Arc<Mutex<Capture>>;
 async fn read_bounded(
     mut reader: impl AsyncRead + Unpin,
     capture: SharedCapture,
+    capture_limit: usize,
 ) -> io::Result<()> {
     let mut block = [0_u8; 4096];
     loop {
@@ -286,9 +316,7 @@ async fn read_bounded(
         let mut capture = capture
             .lock()
             .map_err(|_| io::Error::other("输出缓冲锁损坏"))?;
-        let keep = MAX_CAPTURE_BYTES
-            .saturating_sub(capture.bytes.len())
-            .min(count);
+        let keep = capture_limit.saturating_sub(capture.bytes.len()).min(count);
         capture.bytes.extend_from_slice(&block[..keep]);
         capture.truncated |= keep < count;
     }

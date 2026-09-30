@@ -740,7 +740,7 @@ export default function App() {
           >
             <div className="modal-icon">!</div>
             <h2>允许工具操作？</h2>
-            <p>请确认以下操作范围。允许后，本会话中同类工具将不再重复询问。</p>
+            <p>请确认以下操作与授权范围，是否再次询问以工具说明为准。</p>
             <pre>{state.authorization.prompt}</pre>
             <div className="modal-actions">
               <button

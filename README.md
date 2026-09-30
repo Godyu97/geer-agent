@@ -42,13 +42,19 @@ F3 或 `/sessions [--all]` 打开会话管理面板并保留聊天草稿。上�
 
 ## 工具调用
 
-REPL 向模型提供 `get_current_time`、`read`、`write`、`edit`、`bash`。模型选择工具后，程序执行并把结果交回模型继续回答。`GEER_AGENT_TOOLS=off` 可在启动时关闭所有工具；默认开启。服务端模型需要支持所选 API 的函数工具调用协议。
+三种界面向模型提供 11 个工具：`get_current_time`、`bash`、`ls`、`glob`、`rg`、`read`、`write`、`edit`、`search`、`web_search`、`web_fetch`。模型选择工具后，程序执行并把结果交回模型继续回答。`GEER_AGENT_TOOLS=off` 可在启动时关闭所有工具；默认开启。服务端模型需要支持所选 API 的函数工具调用协议。
 
-`read` 接受 `path`、可选的 1 起始行号 `offset` 和行数 `limit`，单次最多返回 2000 行、50 KiB 的 UTF-8 文本。`write` 接受 `path` 与 `content`，创建或覆盖文件。`edit` 接受 `path` 和 `edits` 数组，其中每项是 `oldText`、`newText`；旧文本必须在原文件中唯一匹配，各项不能重叠。`bash` 接受 `command`，在启动目录运行，10 秒超时，结果最多 2000 字符。
+`read` 接受 `path`、可选的 1 起始行号 `offset` 和行数 `limit`，单次最多返回 2000 行、50 KiB 的 UTF-8 文本。`write` 接受 `path` 与 `content`，创建或覆盖文件。`edit` 接受 `path` 和 `edits` 数组，其中每项是 `oldText`、`newText`；旧文本必须在原文件中唯一匹配，各项不能重叠。`bash` 接受 `command`，在当前 workspace 运行，10 秒超时，结果最多 2000 字符。
 
 `GEER_AGENT_BASH_BIN` 可指定 Bash 可执行文件的绝对路径。未设置或为空时，Windows 优先使用 `C:\Program Files\Git\bin\bash.exe`，该文件不存在时再退回 `PATH` 中的 `bash`；Linux 等其它系统直接使用 `PATH` 中的 `bash`。这样可以避开 Windows System32 里的 WSL `bash.exe`。工具会自动把 Git 自带的 `usr\bin` 加入命令的 `PATH`，并把 workspace 以 `F:/repo` 形式传给 Bash。启动时会验证所选 Bash 并读取版本，路径或版本无效时直接报错退出。每次模型请求都会带默认系统提示，其中 `<context_data>` 包含系统版本和所选 Bash 版本；`/reset` 后仍会提供这些环境信息。
 
-本机工具各自在当前会话首次使用时请求 `y/N` 授权。每次切换会话（包括切回旧会话）都会清空授权；打开失败或打开当前会话则保持授权。非交互输入无法确认时默认拒绝执行。
+Bash、目录查询、文件工具和 `search` 各自在当前会话首次使用时请求 `y/N` 授权。每次切换会话（包括切回旧会话）都会清空授权；打开失败或打开当前会话则保持授权。非交互输入无法确认时默认拒绝执行。
+
+`ls` 列目录，`glob` 找路径，`rg` 搜正文，固定查询都通过配置的 Bash 执行，需要其 `PATH` 中有 `ls` / `rg`。这些已有工具保留任意路径授权范围。新增 `search` 只搜索当前 workspace：默认 `path="."`、`output="content"`、区分大小写的正则，可选 `glob`、`fixed_strings`、`ignore_case`；`output="files"` 只返回命中文件。结果为 `相对 workspace 路径:行号: 原文`，保留缩进，子目录结果也能直接交给 `read`。规范化后越界的路径与链接会被拒绝，不跟随目录链接；沿用 rg 忽略规则，显式路径或 glob 可覆盖默认过滤，跳过二进制及超过 1 MiB 的文件。最多 50 项、总输出 2000 字符，截断时只保留完整命中行并提示缩小范围。
+
+`web_search` 接受 `query` 和可选 `num_results`（默认 5，范围 1–20），通过 [Exa 免 Key MCP](https://exa.ai/docs/get-started/exa-mcp) 返回标题、完整 URL、摘要和后端名称。首次会话授权会明确说明查询将发送给 Exa；服务的 HTTP、RPC 或超时错误会如实报告。`web_fetch` 接受完整 HTTP(S) `url`，直接抓取 HTML、Markdown、JSON 等文本，返回来源与最终 URL、响应信息及可读正文；HTML 清除脚本、样式和标签，保留段落、列表与代码缩进。支持公网、本机和内网地址，每次访问都显示完整 URL 并确认，跨来源重定向再次确认，最多跟随 5 次。拒绝后停止访问目标。
+
+网页搜索网络超时 25 秒，抓取网络总耗时 15 秒（用户确认等待不计入），响应体上限 1 MiB，单次结果上限 12000 字符。客户端复用 HTTP/TLS 与环境代理配置，不携带模型 API key、Cookie 或用户认证头。网页摘要和正文作为不可信数据交给模型。首版只提供静态文本访问；PDF、JavaScript 渲染、缓存及抓取回退暂未实现。
 
 ## 上下文压缩与会话恢复
 

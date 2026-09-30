@@ -937,6 +937,39 @@ mod tests {
     }
 
     #[test]
+    fn web_authorization_wraps_full_urls_and_retains_the_current_scope() {
+        let mut state = state();
+        state.mode = Mode::Confirm;
+        let url = format!("http://127.0.0.1:8123/{}?query=full", "path/".repeat(20));
+        state.append(
+            Kind::Tool,
+            format!(
+                "工具 web_fetch 请求本次访问授权：\n访问 URL：{url}\n跨来源重定向再次确认。[y/N]"
+            ),
+        );
+        for width in [40, 80] {
+            let mut terminal = Terminal::new(TestBackend::new(width, 30)).unwrap();
+            terminal.draw(|frame| render(frame, &state)).unwrap();
+            let text = rendered_text(terminal.backend().buffer());
+            let buffer = terminal.backend().buffer();
+            let mut chat = String::new();
+            for y in 1..26 {
+                for x in 1..width {
+                    let symbol = buffer[(x, y)].symbol();
+                    if symbol == "│" {
+                        break;
+                    }
+                    chat.push_str(symbol);
+                }
+            }
+            let compact: String = chat.chars().filter(|ch| !ch.is_whitespace()).collect();
+            assert!(compact.contains(&url), "{text}");
+            assert!(compact.contains("本次访问授权"));
+            assert!(compact.contains("跨来源重定向再次确认"));
+        }
+    }
+
+    #[test]
     fn confirmation_defaults_to_denial_and_control_d_exits() {
         assert!(authorization_allowed(" y "));
         assert!(authorization_allowed("YES"));

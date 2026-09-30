@@ -402,7 +402,7 @@ fn responses_api_returns_two_tool_results_before_final_answer() {
         assert!(prompt.contains("system_version:"));
         assert!(prompt.contains("bash_version: GNU bash, version "));
     }
-    assert_eq!(bodies[0]["tools"].as_array().expect("工具清单").len(), 8);
+    assert_eq!(bodies[0]["tools"].as_array().expect("工具清单").len(), 11);
     let input = bodies[1]["input"].as_array().expect("下一请求历史");
     assert_eq!(
         input
@@ -430,7 +430,7 @@ fn chat_api_reassembles_fragments_and_pairs_tool_result() {
         "{}",
         String::from_utf8_lossy(&output.stderr)
     );
-    assert_eq!(bodies[0]["tools"].as_array().expect("工具清单").len(), 8);
+    assert_eq!(bodies[0]["tools"].as_array().expect("工具清单").len(), 11);
     for body in &bodies {
         let messages = body["messages"].as_array().expect("消息");
         assert_eq!(messages[0]["role"], "system");
@@ -478,7 +478,7 @@ fn both_apis_expose_same_file_contract_and_pair_parameter_errors() {
             String::from_utf8_lossy(&output.stderr)
         );
         let tools = bodies[0]["tools"].as_array().expect("工具清单");
-        assert_eq!(tools.len(), 8);
+        assert_eq!(tools.len(), 11);
         let normalized: Vec<_> = tools
             .iter()
             .map(|tool| {
@@ -508,7 +508,10 @@ fn both_apis_expose_same_file_contract_and_pair_parameter_errors() {
                 "rg",
                 "read",
                 "write",
-                "edit"
+                "edit",
+                "search",
+                "web_search",
+                "web_fetch"
             ]
         );
         for tool in normalized.iter().skip(2) {
@@ -567,6 +570,70 @@ fn both_apis_expose_same_file_contract_and_pair_parameter_errors() {
         declarations[0], declarations[1],
         "两种协议的参数语义必须一致"
     );
+}
+
+#[test]
+fn both_apis_pair_new_tool_denials_and_disable_all_new_declarations() {
+    for api in ["responses", "chat-completions"] {
+        for (name, args) in [
+            ("search", r#"{"pattern":"fn main"}"#),
+            ("web_search", r#"{"query":"Rust documentation"}"#),
+            (
+                "web_fetch",
+                r#"{"url":"http://127.0.0.1:1/full/path?query=kept"}"#,
+            ),
+        ] {
+            let final_reply = if api == "responses" {
+                Reply::ResponsesFinal
+            } else {
+                Reply::ChatFinal
+            };
+            let (output, bodies) = run_repl(
+                api,
+                vec![named(api, name, args, 1, false), final_reply.clone()],
+                "use tools\n/exit\n",
+            );
+            assert!(output.status.success());
+            let items = if api == "responses" {
+                bodies[1]["input"].as_array().unwrap()
+            } else {
+                bodies[1]["messages"].as_array().unwrap()
+            };
+            let item = items
+                .iter()
+                .find(|item| {
+                    if api == "responses" {
+                        item["type"] == "function_call_output" && item["call_id"] == "call_1"
+                    } else {
+                        item["role"] == "tool" && item["tool_call_id"] == "call_1"
+                    }
+                })
+                .unwrap();
+            let text = if api == "responses" {
+                item["output"].as_str().unwrap()
+            } else {
+                item["content"].as_str().unwrap()
+            };
+            let meta: Value = serde_json::from_str(text.split_once("\n\n").unwrap().0).unwrap();
+            assert_eq!(meta["tool"], name);
+            assert_eq!(meta["code"], "authorization_denied");
+            if name == "web_fetch" {
+                assert_eq!(meta["url"], "http://127.0.0.1:1/full/path?query=kept");
+            }
+            let (output, bodies) = run_repl_with_env(
+                api,
+                vec![named(api, name, args, 1, false), final_reply],
+                "use tools\n/exit\n",
+                &[("GEER_AGENT_TOOLS", "off")],
+            );
+            assert!(output.status.success());
+            assert!(
+                bodies[0]["tools"].is_null()
+                    || bodies[0]["tools"].as_array().is_some_and(Vec::is_empty)
+            );
+            assert!(bodies[1].to_string().contains("工具已关闭"));
+        }
+    }
 }
 
 #[test]
@@ -840,7 +907,7 @@ fn both_apis_finalize_without_tools_and_keep_final_text() {
         );
         assert_eq!(
             next_turn["tools"].as_array().expect("下一轮恢复工具").len(),
-            8,
+            11,
             "{api}"
         );
 

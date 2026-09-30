@@ -24,7 +24,8 @@ fn registry_rejects_duplicates_and_resolves_all_definitions() {
         .expect("序列化工具定义")
         .len();
     eprintln!("tool definition bytes: {bytes}");
-    assert!(bytes < 5_500, "工具定义过长：{bytes} 字节");
+    assert!(bytes < 8_000, "工具定义过长：{bytes} 字节");
+    assert_eq!(definitions.len(), 11);
     for spec in definitions {
         assert!(
             spec.description.chars().count() <= 160,
@@ -39,10 +40,245 @@ fn registry_rejects_duplicates_and_resolves_all_definitions() {
 static NEXT: AtomicUsize = AtomicUsize::new(0);
 
 #[tokio::test]
+async fn search_options_preserve_workspace_paths_original_lines_and_read_context() {
+    use serde_json::json;
+    let dir = query_dir();
+    fs::create_dir(dir.join("src")).unwrap();
+    fs::write(
+        dir.join("src/a.rs"),
+        "before\n    Foo.bar\nfooXbar\nafter\n",
+    )
+    .unwrap();
+    fs::write(dir.join("other.txt"), "Foo.bar\n").unwrap();
+    let mut tools = Tools::new(true, crate::config::default_bash_bin()).unwrap();
+    tools.allow_all_for_test();
+    for (args, expected) in [
+        (
+            json!({"pattern":"Foo.bar", "path":"src"}),
+            "src/a.rs:2:     Foo.bar\n",
+        ),
+        (
+            json!({"pattern":"foo.bar", "path":"src", "fixed_strings":true}),
+            "",
+        ),
+        (
+            json!({"pattern":"foo.bar", "path":"src", "ignore_case":true}),
+            "src/a.rs:2:     Foo.bar\nsrc/a.rs:3: fooXbar\n",
+        ),
+        (
+            json!({"pattern":"foo.bar", "path":"src", "ignore_case":true, "fixed_strings":true}),
+            "src/a.rs:2:     Foo.bar\n",
+        ),
+        (
+            json!({"pattern":"Foo", "glob":"**/*.rs", "output":"files"}),
+            "src/a.rs\n",
+        ),
+    ] {
+        let result = tools
+            .execute_recorded_in(&dir, "search", &args.to_string())
+            .await;
+        assert!(result.success, "{}", result.text);
+        assert_eq!(body(&result), expected, "{}", result.text);
+        assert_eq!(
+            metadata(&result)["path_base"],
+            dir.canonicalize().unwrap().to_string_lossy().as_ref()
+        );
+    }
+    let read = tools
+        .execute_recorded_in(&dir, "read", r#"{"path":"src/a.rs","offset":1,"limit":4}"#)
+        .await;
+    assert!(read.success);
+    assert_eq!(body(&read), "before\n    Foo.bar\nfooXbar\nafter\n");
+    let invalid = tools
+        .execute_recorded_in(&dir, "search", r#"{"pattern":"["}"#)
+        .await;
+    assert!(!invalid.success);
+    assert_eq!(metadata(&invalid)["code"], "command_failed");
+    fs::remove_dir_all(dir).unwrap();
+}
+
+#[tokio::test]
+async fn search_rejects_escapes_and_uses_the_current_workspace() {
+    use serde_json::json;
+    let outer = query_dir();
+    let dir = outer.join("repo");
+    let sibling = outer.join("repo-extra");
+    fs::create_dir(&dir).unwrap();
+    fs::create_dir(&sibling).unwrap();
+    fs::write(dir.join("marker"), "inside\n").unwrap();
+    fs::write(sibling.join("marker"), "outside\n").unwrap();
+    let mut tools = Tools::new(true, crate::config::default_bash_bin()).unwrap();
+    let prompts = Rc::new(Cell::new(0));
+    let seen = Rc::clone(&prompts);
+    tools.set_confirm(move |prompt| {
+        assert!(prompt.contains("workspace"));
+        seen.set(seen.get() + 1);
+        Ok(true)
+    });
+    for path in [
+        "../repo-extra".to_owned(),
+        sibling.to_string_lossy().into_owned(),
+    ] {
+        let result = tools
+            .execute_recorded_in(
+                &dir,
+                "search",
+                &json!({"pattern":"outside", "path":path}).to_string(),
+            )
+            .await;
+        assert!(!result.success);
+        assert_eq!(metadata(&result)["code"], "outside_workspace");
+    }
+    assert_eq!(prompts.get(), 0, "越界参数在授权前拒绝");
+    let first = tools
+        .execute_recorded_in(&dir, "search", r#"{"pattern":"inside"}"#)
+        .await;
+    assert_eq!(body(&first), "marker:1: inside\n");
+    let absolute_inside = tools
+        .execute_recorded_in(
+            &dir,
+            "search",
+            &json!({"pattern":"inside", "path":dir.join("marker")}).to_string(),
+        )
+        .await;
+    assert!(absolute_inside.success);
+    tools.reset();
+    let second = tools
+        .execute_recorded_in(&sibling, "search", r#"{"pattern":"outside"}"#)
+        .await;
+    assert_eq!(body(&second), "marker:1: outside\n");
+    assert_eq!(prompts.get(), 2);
+    #[cfg(unix)]
+    {
+        std::os::unix::fs::symlink(&sibling, dir.join("escape")).unwrap();
+        std::os::unix::fs::symlink(sibling.join("marker"), dir.join("escape-file")).unwrap();
+        std::os::unix::fs::symlink(&dir, dir.join("loop")).unwrap();
+        use std::os::unix::ffi::OsStringExt;
+        let byte_path = dir.join(std::ffi::OsString::from_vec(b"byte-\xff".to_vec()));
+        fs::write(&byte_path, "inside\n").unwrap();
+        std::os::unix::fs::symlink(&byte_path, dir.join("byte-alias")).unwrap();
+        let invalid_path = tools
+            .execute_recorded_in(
+                &dir,
+                "search",
+                r#"{"pattern":"inside","path":"byte-alias"}"#,
+            )
+            .await;
+        assert_eq!(metadata(&invalid_path)["code"], "invalid_path_encoding");
+        for path in ["escape", "escape-file"] {
+            let result = tools
+                .execute_recorded_in(
+                    &dir,
+                    "search",
+                    &json!({"pattern":"outside", "path":path}).to_string(),
+                )
+                .await;
+            assert_eq!(metadata(&result)["code"], "outside_workspace");
+        }
+        let result = tools
+            .execute_recorded_in(&dir, "search", r#"{"pattern":"outside"}"#)
+            .await;
+        assert!(result.success, "{}", result.text);
+        assert_eq!(metadata(&result)["matches"], 0);
+        assert!(body(&result).is_empty());
+    }
+    fs::remove_dir_all(outer).unwrap();
+}
+
+#[tokio::test]
+async fn search_respects_ignore_rules_binary_size_limits_and_complete_result_budget() {
+    use serde_json::json;
+    let dir = query_dir();
+    fs::write(dir.join(".ignore"), "ignored.txt\n").unwrap();
+    fs::write(dir.join("ignored.txt"), "needle\n").unwrap();
+    fs::write(dir.join("binary"), b"needle\n\0needle\n").unwrap();
+    let mut binary_invalid = b"needle\xff\n".to_vec();
+    binary_invalid.extend(vec![b'x'; 200_000]);
+    binary_invalid.push(0);
+    fs::write(dir.join("binary-invalid"), binary_invalid).unwrap();
+    fs::write(
+        dir.join("binary-late"),
+        format!("{}{}\0", "needle\n".repeat(60), "x".repeat(200_000)),
+    )
+    .unwrap();
+    fs::write(
+        dir.join("large"),
+        format!("needle\n{}", "x".repeat(1024 * 1024)),
+    )
+    .unwrap();
+    let special = "space ' $ file.txt";
+    fs::write(
+        dir.join(special),
+        "  $(touch should-not-exist); needle [x]\n",
+    )
+    .unwrap();
+    let mut tools = Tools::new(true, crate::config::default_bash_bin()).unwrap();
+    tools.allow_all_for_test();
+    let result = tools
+        .execute_recorded_in(&dir, "search", r#"{"pattern":"needle"}"#)
+        .await;
+    assert!(result.success, "{}", result.text);
+    assert_eq!(
+        body(&result),
+        format!("{special}:1:   $(touch should-not-exist); needle [x]\n")
+    );
+    let literal = tools
+        .execute_recorded_in(
+            &dir,
+            "search",
+            &json!({"pattern":"$(touch should-not-exist);", "fixed_strings":true,"path":special})
+                .to_string(),
+        )
+        .await;
+    assert!(literal.success);
+    assert!(!dir.join("should-not-exist").exists());
+    for args in [
+        json!({"pattern":"needle", "path":"ignored.txt"}),
+        json!({"pattern":"needle", "glob":"ignored.txt"}),
+    ] {
+        let result = tools
+            .execute_recorded_in(&dir, "search", &args.to_string())
+            .await;
+        assert_eq!(body(&result), "ignored.txt:1: needle\n");
+    }
+    fs::write(dir.join("many"), "needle\n".repeat(80)).unwrap();
+    let result = tools
+        .execute_recorded_in(&dir, "search", r#"{"pattern":"needle","path":"many"}"#)
+        .await;
+    assert!(result.success);
+    assert!(result.text.chars().count() <= 2000);
+    assert_eq!(metadata(&result)["matches"], 50);
+    assert_eq!(metadata(&result)["truncated"], true);
+    assert_eq!(
+        body(&result)
+            .lines()
+            .filter(|line| line.starts_with("many:"))
+            .count(),
+        50
+    );
+    fs::write(dir.join("long"), format!("needle {}\n", "中".repeat(3000))).unwrap();
+    let result = tools
+        .execute_recorded_in(&dir, "search", r#"{"pattern":"needle","path":"long"}"#)
+        .await;
+    assert_eq!(metadata(&result)["truncated"], true);
+    assert!(!body(&result).contains("long:"), "不得返回半个命中行");
+    fs::remove_dir_all(dir).unwrap();
+}
+
+#[tokio::test]
 async fn disabled_and_invalid_arguments() {
     assert_eq!(Tools::execution_mode("read"), ExecutionMode::Parallel);
     assert_eq!(Tools::execution_mode("write"), ExecutionMode::Sequential);
     assert_eq!(Tools::execution_mode("bash"), ExecutionMode::Sequential);
+    assert_eq!(Tools::execution_mode("search"), ExecutionMode::Parallel);
+    assert_eq!(
+        Tools::execution_mode("web_search"),
+        ExecutionMode::Sequential
+    );
+    assert_eq!(
+        Tools::execution_mode("web_fetch"),
+        ExecutionMode::Sequential
+    );
     let mut tools = Tools::new(false, crate::config::default_bash_bin()).expect("工作目录存在");
     assert!(tools.specs().is_empty());
     assert_eq!(
@@ -50,7 +286,7 @@ async fn disabled_and_invalid_arguments() {
             .expect("工作目录存在")
             .specs()
             .len(),
-        8
+        11
     );
     assert_eq!(
         tools.execute("get_current_time", "{}").await,
@@ -718,6 +954,7 @@ async fn query_dependencies_are_resolved_by_configured_bash_only() {
         ("ls", "{}"),
         ("glob", r#"{"pattern":"*"}"#),
         ("rg", r#"{"pattern":"x"}"#),
+        ("search", r#"{"pattern":"x"}"#),
     ] {
         let result = tools.execute_recorded(name, args).await;
         assert!(!result.success);

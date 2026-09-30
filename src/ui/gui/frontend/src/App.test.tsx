@@ -236,7 +236,12 @@ it("uses explicit denial and reveals older messages on demand", async () => {
   expect(screen.queryByText("message-0")).toBeNull();
   fireEvent.click(screen.getByRole("button", { name: /显示更早记录/ }));
   expect(screen.getByText("message-0")).toBeTruthy();
-  send({ type: "authorization", id: 7, prompt: "write /tmp/a" });
+  const fullUrl = `http://127.0.0.1:8123/${"long-path/".repeat(30)}?query=full`;
+  const fetchPrompt = `工具 web_fetch 请求本次访问授权：\n访问 URL：${fullUrl}\n每次确认完整 URL。`;
+  send({ type: "authorization", id: 7, prompt: fetchPrompt });
+  const dialog = screen.getByRole("dialog", { name: "工具授权" });
+  expect(dialog.querySelector("pre")?.textContent).toBe(fetchPrompt);
+  expect(dialog.textContent).not.toContain("将不再重复询问");
   fireEvent.click(screen.getByRole("button", { name: "拒绝" }));
   await waitFor(() =>
     expect(mock.invoke).toHaveBeenCalledWith("gui_authorize", {

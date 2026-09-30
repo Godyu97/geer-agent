@@ -63,11 +63,16 @@ impl ToolError {
         if tool == "read" {
             metadata["empty"] = Value::Null;
         }
-        if matches!(tool, "ls" | "glob" | "rg") {
+        if matches!(tool, "ls" | "glob" | "rg" | "search") {
             metadata["exit_code"] = Value::Null;
             metadata["truncated"] = json!(false);
         }
-        ToolOutput::error(bounded_result(metadata, "", MAX_RESULT_CHARS))
+        let max = if matches!(tool, "web_search" | "web_fetch") {
+            12000
+        } else {
+            MAX_RESULT_CHARS
+        };
+        ToolOutput::error(bounded_result(metadata, "", max))
     }
 }
 
@@ -109,10 +114,22 @@ pub(super) fn optional_string<'a>(
 }
 
 // 元信息单独序列化，截断正文时不会留下损坏的 JSON；超长参数也不能挤掉诊断。
-pub(super) fn bounded_result(mut metadata: Value, body: &str, max: usize) -> String {
+pub(super) fn bounded_result(metadata: Value, body: &str, max: usize) -> String {
+    render_result(metadata, body, max, false)
+}
+
+pub(super) fn bounded_lines_result(metadata: Value, body: &str, max: usize) -> String {
+    render_result(metadata, body, max, true)
+}
+
+fn render_result(mut metadata: Value, body: &str, max: usize, complete_lines: bool) -> String {
+    let web = matches!(metadata["tool"].as_str(), Some("web_search" | "web_fetch"));
     let mut shortened = false;
     if let Some(object) = metadata.as_object_mut() {
-        for value in object.values_mut() {
+        for (key, value) in object.iter_mut() {
+            if web && matches!(key.as_str(), "url" | "final_url") {
+                continue;
+            }
             if let Some(text) = value.as_str()
                 && value.to_string().chars().count() > 160
             {
@@ -132,7 +149,13 @@ pub(super) fn bounded_result(mut metadata: Value, body: &str, max: usize) -> Str
     let truncated =
         metadata["truncated"] == true || header.chars().count() + 2 + body.chars().count() > max;
     let marker = if truncated {
-        "\n[输出已截断；请缩小 path/pattern/glob 后重试，或用 read 读取已定位文件。]"
+        match metadata["tool"].as_str() {
+            Some("web_search") => {
+                "\n[输出已截断；请收窄 query 或减少 num_results，再用 web_fetch 读取来源。]"
+            }
+            Some("web_fetch") => "\n[输出已截断；尚未获得完整网页正文，请选择更具体的页面。]",
+            _ => "\n[输出已截断；请缩小 path/pattern/glob 后重试，或用 read 读取已定位文件。]",
+        }
     } else {
         ""
     };
@@ -141,8 +164,9 @@ pub(super) fn bounded_result(mut metadata: Value, body: &str, max: usize) -> Str
         header = metadata.to_string();
     }
     let keep = max.saturating_sub(header.chars().count() + 2 + marker.chars().count());
-    format!(
-        "{header}\n\n{}{marker}",
-        body.chars().take(keep).collect::<String>()
-    )
+    let mut content: String = body.chars().take(keep).collect();
+    if complete_lines && content.len() < body.len() {
+        content.truncate(content.rfind('\n').map_or(0, |index| index + 1));
+    }
+    format!("{header}\n\n{}{marker}", content)
 }

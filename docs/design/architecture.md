@@ -150,6 +150,12 @@ sequenceDiagram
 
 当前工具批次把连续的只读操作分组并发，Bash、write、edit 等操作作为顺序边界；授权在派发前完成，结果保留调用顺序。Agent 在两种模型协议之间共用这套编排。
 
+Day12 的 `search-fetch` 沿用这条调用链，当前注册表共 11 个工具。Tools 管工具声明、参数校验、确认和调度；query 管 `ls/glob/rg/search`，file 管 `read/write/edit`，bash 管受限子进程及清理，feedback 管错误和输出预算；新增 [web_access](/home/lihongyu/projects/geer-agent/src/tools/web_access.rs) 管独立 HTTP 客户端、Exa JSON-RPC/SSE、有限响应读取和 HTML 转文本。
+
+`search` 加入只读并行段，在调用时规范化 workspace 和目标，按路径组件检查包含关系；rg 在规范化根目录运行，不跟随目录符号链接，限制文件大小并输出 JSON。解析结果始终返回相对 workspace 的路径，保留完整命中行，可接 `read`。候选命中等 end 事件确认非二进制后才返回，捕获和最终输出都有固定上限。这个范围检查只约束 `search`；已有查询和文件工具的路径行为保持。
+
+`web_search` 和 `web_fetch` 串行执行。前者首次会话确认查询发送给 Exa，后者每次确认完整 HTTP(S) URL（含本机和内网），跨来源重定向再次确认，最多 5 次。确认回调继续由界面注入，网页模块不导入 UI；确认等待不消耗抓取的网络总耗时。HTTP 客户端按需创建并复用，保留证书验证和环境代理，不带模型 API key、Cookie 或认证头。网页结果保留完整来源 URL，标记不可信，文本截断使用网页提示。依赖 `reqwest 0.13`、`encoding_rs 0.8` 与 `html2text 0.17`，标准库不提供 HTTPS、字符集解码或 HTML 解析；选型与边界见 [变更设计](/home/lihongyu/projects/geer-agent/openspec/changes/add-search-web-access/design.md)。
+
 Agent 的运行预算检查轮次数、工具调用数、时间与配置的真实用量额度；已有 guard 对重复调用、连续错误和缺少进展给出提示或触发收尾。UI 的临时 token 估算只用于展示，不代替服务端用量判断硬额度。历史压缩以完整轮次和工具调用/结果边界为单位，Provider 的流式超时与 Bash 的执行超时则各自限制单次操作。
 
 ### 所有权与线程
@@ -354,7 +360,7 @@ Provider 的协议事件另定义在 `provider`，例如正文增量和重试次
 
 文本路径由 `ui::run` 在调用 REPL 前通过 `Agent::set_confirm` 安装文本界面的确认回调。REPL 循环继续只借用 Session，不因迁移授权而导入 Agent 或 Tools。
 
-本次保留现有 `FnMut(&str) -> io::Result<bool>`，只移动终端 I/O。授权范围、工具开关、缓存和撤销规则保持。若后续需要丰富的 GUI 授权展示，再由 Tools 定义包含工具名、操作详情和授权范围的请求类型，UI 生成 `[y/N]` 等文案。授权决定不能由“事件已显示”或模型文字代替。
+现有 `FnMut(&str) -> io::Result<bool>` 同时支持会话授权和逐次网页确认。Tools 的提示说明实际授权范围，GUI 的通用文案不承诺授权一定会缓存。若后续需要更丰富的 GUI 展示，再由 Tools 定义包含工具名、操作详情和授权范围的请求类型，UI 生成 `[y/N]` 等文案。授权决定不能由“事件已显示”或模型文字代替。
 
 ### 会话结果与展示投影
 
@@ -431,6 +437,8 @@ make check
 - 原生 GUI 窗口与真实 TUI 终端的键盘/鼠标手工验收尚未执行；无 GUI 构建下的 `gui_selection` 回归不等同于原生窗口验收。
 
 涉及 Shell、PATH、超时或清理代码时，按项目约束先 `make test-safety`，再受限运行缺失命令单项与 `process_safety` 回归，最后完整检查。必须确认实际资源和临时目录隔离有效；安全入口失败时先解决隔离问题。
+
+Day12 `search-fetch` 增量通过最终 `make check`（231 项 Rust 测试，1 项真实联网测试默认忽略）、23 项 GUI 前端测试、类型检查和带 GUI feature 的 clippy。真实 Rust 客户端访问 Exa 与 Rust 官方文档成功；REPL/TUI 通过本机 mock 和伪终端验证逐次与重定向授权。原生 GUI 人工检查步骤及详细结果见 [search-fetch 验收记录](/home/lihongyu/projects/geer-agent/openspec/changes/add-search-web-access/verification.md)。
 
 ## 保留的设计与后续文档维护
 
