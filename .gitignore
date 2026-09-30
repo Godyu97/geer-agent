@@ -4,6 +4,8 @@
 /trace.sqlite
 /trace.sqlite-*
 /.db/
+/node_modules/
+/.vitest/
 /src/ui/gui/frontend/node_modules/
 /src/ui/gui/frontend/dist/
 /gen/
