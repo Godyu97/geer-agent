@@ -6,6 +6,7 @@ edition = "2024"
 [features]
 embed-env = []
 gui = ["dep:tauri", "dep:tauri-build", "dep:tauri-plugin-clipboard-manager", "dep:tauri-plugin-dialog"]
+desktop-gui = ["gui"]
 
 [dependencies]
 async-openai = { version = "0.42.0", features = ["chat-completion", "responses", "middleware"] }

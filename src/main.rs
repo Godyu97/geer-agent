@@ -1,3 +1,6 @@
+// 子系统必须在链接时选择；桌面构建从启动起就不创建控制台，普通构建保留终端能力。
+#![cfg_attr(all(windows, feature = "desktop-gui"), windows_subsystem = "windows")]
+
 mod agent;
 mod config;
 mod dao;

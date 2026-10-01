@@ -79,6 +79,19 @@ function showHistory(transcript: Entry[], sessionId = "session-one") {
   });
 }
 
+it("shows startup failures before a session connects and prevents sending", () => {
+  render(<App />);
+  send({
+    type: "startup_error",
+    message: "桌面构建只支持 GUI；请将 GEER_AGENT_UI 设为 auto 或 gui。",
+  });
+  expect(screen.getByText("启动失败")).toBeTruthy();
+  expect(screen.getByText(/桌面构建只支持 GUI/)).toBeTruthy();
+  expect(screen.queryByRole("textbox", { name: "消息" })).toBeNull();
+  expect(screen.queryByRole("button", { name: /发送/ })).toBeNull();
+  expect(mock.invoke).not.toHaveBeenCalledWith("gui_submit", expect.anything());
+});
+
 it("keeps streamed Markdown visible when the completed history arrives", async () => {
   render(<App />);
   showHistory([]);

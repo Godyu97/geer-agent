@@ -9,12 +9,12 @@ use std::{
 
 use tokio::{
     io::{AsyncRead, AsyncReadExt},
-    process::{Child, Command},
+    process::Child,
     task::JoinHandle,
     time::timeout,
 };
 
-use crate::config::bash_arg;
+use crate::config::{background_command, bash_arg};
 
 const COMMAND_TIMEOUT: Duration = Duration::from_secs(10);
 const KILL_TIMEOUT: Duration = Duration::from_secs(2);
@@ -121,7 +121,7 @@ async fn run_command_captured(
     limit: Duration,
     capture_limit: usize,
 ) -> io::Result<CommandOutput> {
-    let mut command = Command::new(bash_bin);
+    let mut command = background_command(bash_bin);
     // Windows 命令行由 Git 启动器和 MSYS 运行时重新解析：未加引号的 `*.txt` 会被展开成文件名，
     // 反斜杠会被当作转义吞掉。命令行只放固定的引导脚本，命令与参数一律经环境变量传入。
     let mut prelude = String::new();
@@ -228,7 +228,7 @@ async fn kill_tree(bash_bin: &Path, child: &mut Child, pgid_file: Option<&Path>)
     {
         let _ = timeout(
             KILL_TIMEOUT,
-            Command::new(bash_bin)
+            background_command(bash_bin)
                 .args(["-c", r#"kill -KILL -- "-$1""#, "geer-kill", &pgid])
                 .stdin(Stdio::null())
                 .stdout(Stdio::null())
@@ -241,13 +241,13 @@ async fn kill_tree(bash_bin: &Path, child: &mut Child, pgid_file: Option<&Path>)
     if let Some(pid) = child.id() {
         #[cfg(windows)]
         let mut killer = {
-            let mut killer = Command::new("taskkill");
+            let mut killer = background_command("taskkill");
             killer.args(["/T", "/F", "/PID", &pid.to_string()]);
             killer
         };
         #[cfg(not(windows))]
         let mut killer = {
-            let mut killer = Command::new("kill");
+            let mut killer = background_command("kill");
             killer.args(["-KILL", "--", &format!("-{pid}")]);
             killer
         };

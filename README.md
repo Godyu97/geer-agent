@@ -28,6 +28,10 @@ cargo run --features gui
 
 在程序实际选用的 `.env` 中设置 `GEER_AGENT_UI=gui` 后，上述 `cargo run` 会打开窗口。未设置时仍按 `auto` 选择终端界面；也可以执行 `GEER_AGENT_UI=gui cargo run --features gui` 临时启动。GUI 提供完整会话记录、侧栏会话切换、Markdown 回答、流式输出、用量与工具授权。现有 `/help`、`/new`、`/open`、`/save`、`/compact`、`/sessions`、`/exit` 等命令可直接在输入框使用。Enter 发送，Shift+Enter 换行；授权默认拒绝。关闭窗口时等待正在执行的请求并补写会话，保存失败时可重试、返回或明确退出。若持久化已关闭或数据库不可用，关闭含有对话的仅内存会话前会提示数据无法保存。
 
+日常桌面使用请先执行 `make gui-build`，再直接打开 `target/release/geer-agent.exe`（Windows）或 `target/release/geer-agent`（Linux）。该构建启用 `desktop-gui`，默认 `auto` 直接进入 GUI；Windows 从启动起不创建控制台，后台版本探测、工具执行与超时清理也不弹出控制台。`GEER_AGENT_UI=gui` 同样有效，配置错误在窗口内显示。桌面构建只支持 GUI；需要 TUI/REPL 时使用普通 `make run` 或不含 `desktop-gui` 的构建。`make gui` / `cargo run --features gui` 仍是从已有终端运行的开发入口，调用者的终端会继续保留。
+
+Linux 桌面入口模板位于 `src/ui/gui/geer-agent.desktop`：把 `Exec` 改为桌面可执行文件的实际绝对路径，保留双引号及 `Terminal=false`，然后保存到 `~/.local/share/applications/geer-agent.desktop`，从应用菜单打开。启动器直接运行二进制，不调用 Cargo 或终端模拟器。配置仍按既有 `.env` 查找顺序加载，无需以项目目录作为启动工作目录。原因、技术方案及验收步骤见 [GUI 启动优化方案](doc/plan/2026-10-01-gui-launch.md)。
+
 Linux 需要 WebKitGTK 4.1 等 Tauri 开发依赖。Fedora 按 [Tauri 官方前置要求](https://tauri.app/start/prerequisites/) 安装 `webkit2gtk4.1-devel openssl-devel curl wget file libappindicator-gtk3-devel librsvg2-devel libxdo-devel` 及 C 开发工具；如编译提示找不到 `dbus-1.pc`，还需 `dbus-devel`。从 Wayland 会话中运行，可用 `GDK_BACKEND=wayland` 做原生 Wayland 验收。Windows 11 使用 MSVC Rust 工具链、Microsoft C++ Build Tools、WebView2 和 Node.js；本项目工具执行还需要 Git for Windows Bash。前端产物嵌入启用 GUI 的二进制，修改前端后需重新运行 `npm run build` 和 Cargo 构建。默认 `cargo build` 不需要 Node 或 GTK/WebKitGTK。
 
 侧栏的“管理会话”支持勾选、全选当前列表和批量删除；切换“当前 / 全部”范围会清空选择。确认弹窗显示标题、完整 UUID 和当前会话替换提示，默认取消。删除其他会话或取消操作会保留聊天草稿；删除当前会话成功后，消息区和草稿清空。失败项可点击“重试删除 / 清理”。
@@ -126,6 +130,7 @@ make help      # 列出目标
 make check     # fmt -> test-safety -> test -> clippy
 make run       # 终端 TUI / REPL
 make gui       # 构建前端并以 GUI feature 运行
+make gui-build # 构建日常桌面使用的 release 产物
 ```
 
 ## 测试与系统安全
@@ -144,8 +149,11 @@ make check
 # GUI Rust 测试先准备前端产物；前端测试也走受限入口。
 ./scripts/test-safe.sh make gui-frontend
 make test FEATURES=gui
+make test FEATURES=desktop-gui
 make gui-test
 ```
+
+桌面构建的测试覆盖共用业务与模式选择；依赖 REPL 输入输出的进程集成测试仅在普通构建中运行，由 `make check` 验证。
 
 `make test`、`make gui-test`、`make clippy` 和 `make clippy-all` 通过 `scripts/test-safe.sh` 启动独立的 systemd 用户服务。Cargo 编译、测试程序与后代进程都归入本次服务的 cgroup；前端测试安装依赖和 GUI clippy 准备前端的阶段也先进入受限服务。入口检查内核实际的内存、swap、任务限制和临时目录挂载，缺少 systemd 用户服务、cgroup v2、有效限制或临时目录隔离时直接失败，不自动执行无约束测试。`make check` 按 fmt → test-safety → test → clippy 顺序执行，即使传入 `make -j` 也保持这个顺序。
 

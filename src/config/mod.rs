@@ -1,8 +1,10 @@
 //! 配置层：可被任意业务模块引用。本模块不依赖其它业务模块。
 
 mod path;
+mod process;
 
 pub(crate) use path::{bash_arg, from_msys, msys_style, plain_path};
+pub(crate) use process::background_command;
 
 use std::{
     error::Error,

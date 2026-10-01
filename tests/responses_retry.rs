@@ -1,3 +1,5 @@
+#![cfg(not(feature = "desktop-gui"))]
+
 use sea_orm::{ConnectionTrait, Database, DbBackend, Statement};
 use serde_json::Value;
 use std::{

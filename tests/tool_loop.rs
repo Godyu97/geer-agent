@@ -1,3 +1,5 @@
+#![cfg(not(feature = "desktop-gui"))]
+
 use std::{
     io::{Read, Write},
     net::{TcpListener, TcpStream},

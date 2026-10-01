@@ -25,7 +25,7 @@ TEST ?=
 TEST_ARGS ?=
 
 .PHONY: help build run test test-safety fmt fmt-check clippy clippy-all check \
-	release embed gui-deps gui-frontend gui-check gui-test gui doc clean
+	release embed gui-deps gui-frontend gui-check gui-test gui gui-build doc clean
 
 help:
 	@echo "geer-agent 开发入口"
@@ -46,6 +46,7 @@ help:
 	@echo "  make gui-check      前端 tsc --noEmit"
 	@echo "  make gui-test       前端 vitest"
 	@echo "  make gui            构建前端并以 --features gui 运行"
+	@echo "  make gui-build      构建可直接打开、无需额外终端的桌面 release 产物"
 	@echo "  make doc            cargo doc --no-deps"
 	@echo "  make clean          cargo clean，并删除前端 dist"
 	@echo
@@ -114,6 +115,10 @@ gui-test:
 gui: export GEER_AGENT_UI := gui
 gui: gui-frontend
 	$(CARGO) run --features gui $(RUN_ARGS)
+
+# 桌面产物与终端程序共用源码；Windows 的窗口子系统只能在编译时选择。
+gui-build: gui-frontend
+	$(CARGO) build --release --features desktop-gui
 
 doc:
 	$(CARGO) doc --no-deps $(CARGO_FEATURES)

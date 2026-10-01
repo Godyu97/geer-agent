@@ -2,7 +2,9 @@
 
 use std::{io, path::Path, time::Duration};
 
-use tokio::{process::Command, time::timeout};
+use tokio::time::timeout;
+
+use crate::config::background_command;
 
 mod conversation;
 
@@ -45,7 +47,7 @@ impl PromptContext {
 }
 
 async fn bash_version(bash_bin: &Path) -> io::Result<String> {
-    let mut command = Command::new(bash_bin);
+    let mut command = background_command(bash_bin);
     // 中文等本地化环境会把首行翻译成「GNU bash，版本」，固定 C locale 才能稳定识别。
     command
         .arg("--version")
@@ -132,7 +134,7 @@ fn parse_pretty_name(content: &str) -> Option<String> {
 }
 
 async fn command_first_line(program: &str, args: &[&str]) -> Option<String> {
-    let mut command = Command::new(program);
+    let mut command = background_command(program);
     command.args(args).kill_on_drop(true);
     let output = timeout(BASH_VERSION_TIMEOUT, command.output())
         .await

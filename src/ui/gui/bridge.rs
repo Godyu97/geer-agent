@@ -115,7 +115,7 @@ pub(super) struct GuiBridge {
 }
 
 impl GuiBridge {
-    pub(super) fn start(app: AppHandle) -> Self {
+    pub(super) fn start(app: AppHandle, startup_error: Option<String>) -> Self {
         let (work, incoming) = mpsc::channel();
         let bus = Arc::new(EventBus::default());
         let authorization_bus = Arc::clone(&bus);
@@ -135,6 +135,10 @@ impl GuiBridge {
         let worker_closing = Arc::clone(&closing);
         let worker_app = app.clone();
         std::thread::spawn(move || {
+            if let Some(error) = startup_error {
+                wait_for_startup_error(incoming, &worker_bus, &worker_app, error);
+                return;
+            }
             worker(
                 incoming,
                 worker_bus,

@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=geer-agent
+Comment=Local agent desktop interface
+# 使用前将 Exec 中的路径替换为桌面构建产物的绝对路径。
+Exec="/absolute/path/to/geer-agent"
+Terminal=false
+Categories=Development;
+StartupNotify=true

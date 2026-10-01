@@ -5,7 +5,7 @@ mod bridge;
 use std::error::Error;
 use tauri::{Manager, WindowEvent};
 
-pub(super) fn run() -> Result<(), Box<dyn Error>> {
+pub(super) fn run(startup_error: Option<String>) -> Result<(), Box<dyn Error>> {
     tauri::Builder::default()
         .plugin(tauri_plugin_clipboard_manager::init())
         .plugin(tauri_plugin_dialog::init())
@@ -15,8 +15,11 @@ pub(super) fn run() -> Result<(), Box<dyn Error>> {
             bridge::gui_authorize,
             bridge::gui_force_close,
         ])
-        .setup(|app| {
-            app.manage(bridge::GuiBridge::start(app.handle().clone()));
+        .setup(move |app| {
+            app.manage(bridge::GuiBridge::start(
+                app.handle().clone(),
+                startup_error,
+            ));
             Ok(())
         })
         .on_window_event(|window, event| {
