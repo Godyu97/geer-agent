@@ -4,9 +4,9 @@
 .DEFAULT_GOAL := help
 
 CARGO ?= cargo
-NPM ?= npm
+BUN ?= bun
 PYTHON ?= python3
-FRONTEND := src/ui/gui/frontend
+FRONTEND := src/ui/frontend
 SAFE_RUN := $(abspath scripts/test-safe.sh)
 # 服务中的 make 不继承 jobserver；间接引用也避免 make -n 执行受限服务的准备命令。
 MAKE_IN_SERVICE := $(MAKE)
@@ -25,7 +25,7 @@ TEST ?=
 TEST_ARGS ?=
 
 .PHONY: help build run test test-safety fmt fmt-check clippy clippy-all check \
-	release embed gui-deps gui-frontend gui-check gui-test gui gui-build doc clean
+	release embed frontend-deps frontend-check frontend-test gui-deps gui-frontend gui-check gui-test gui gui-build web-frontend web web-build web-test doc clean
 
 help:
 	@echo "geer-agent 开发入口"
@@ -37,11 +37,15 @@ help:
 	@echo "  make fmt            cargo fmt --all"
 	@echo "  make fmt-check      仅检查格式，不改文件"
 	@echo "  make clippy         cargo clippy --all-targets"
-	@echo "  make clippy-all     先构建 GUI 前端，再 clippy --features gui"
+	@echo "  make clippy-all     先构建两种前端，再 clippy --features gui,web"
 	@echo "  make check          收工质量门：fmt -> test-safety -> test -> clippy"
 	@echo "  make release        cargo build --release"
 	@echo "  make embed          cargo build --release --features embed-env"
-	@echo "  make gui-deps       前端 npm ci"
+	@echo "  make web            构建并启动 Web UI（0.0.0.0:9928）"
+	@echo "  make web-build      嵌入 Web 前端的 release 产物"
+	@echo "  make web-test       共用前端及受限 Web Rust 测试"
+	@echo "  make frontend-test  共用前端受限测试"
+	@echo "  make gui-deps       前端 Bun 冻结安装"
 	@echo "  make gui-frontend   构建 GUI 静态前端"
 	@echo "  make gui-check      前端 tsc --noEmit"
 	@echo "  make gui-test       前端 vitest"
@@ -78,10 +82,11 @@ fmt-check:
 clippy:
 	"$(SAFE_RUN)" $(CARGO) clippy --all-targets $(CARGO_FEATURES)
 
-# --all-features 会同时打开 embed-env，缺 .env 时无法编译；这里只加 gui。
+# --all-features 会打开 embed-env；这里检查两个可选 UI。
 clippy-all:
-	"$(SAFE_RUN)" $(MAKE_IN_SERVICE) gui-frontend NPM="$(NPM)"
-	"$(SAFE_RUN)" $(CARGO) clippy --all-targets --features gui
+	"$(SAFE_RUN)" $(MAKE_IN_SERVICE) gui-frontend BUN="$(BUN)"
+	"$(SAFE_RUN)" $(MAKE_IN_SERVICE) web-frontend BUN="$(BUN)"
+	"$(SAFE_RUN)" $(CARGO) clippy --all-targets --features gui,web
 
 # 安全入口回归先于项目测试；不加 -D warnings。
 check:
@@ -97,20 +102,39 @@ release:
 embed:
 	$(CARGO) build --release --features embed-env
 
-gui-deps: $(FRONTEND)/node_modules
+frontend-deps:
+	@test -f $(FRONTEND)/bun.lock || { echo "缺少 bun.lock；请先迁移并提交锁文件"; exit 1; }
+	cd $(FRONTEND) && $(BUN) install --frozen-lockfile --concurrent-scripts 1
 
-$(FRONTEND)/node_modules: $(FRONTEND)/package-lock.json $(FRONTEND)/package.json
-	cd $(FRONTEND) && $(NPM) ci
+gui-deps: frontend-deps
 
-gui-frontend: $(FRONTEND)/node_modules
-	cd $(FRONTEND) && $(NPM) run build
+gui-frontend: frontend-deps
+	cd $(FRONTEND) && $(BUN) run build:gui
 
-gui-check: $(FRONTEND)/node_modules
-	cd $(FRONTEND) && $(NPM) run check
+web-frontend: frontend-deps
+	cd $(FRONTEND) && $(BUN) run build:web
 
-gui-test:
-	"$(SAFE_RUN)" $(MAKE_IN_SERVICE) gui-deps NPM="$(NPM)"
-	cd $(FRONTEND) && "$(SAFE_RUN)" $(NPM) test
+frontend-check: frontend-deps
+	cd $(FRONTEND) && $(BUN) run check
+
+gui-check: frontend-check
+
+frontend-test:
+	"$(SAFE_RUN)" $(MAKE_IN_SERVICE) frontend-deps BUN="$(BUN)"
+	cd $(FRONTEND) && "$(SAFE_RUN)" $(BUN) run test
+
+gui-test: frontend-test
+
+web-test: frontend-test
+	"$(SAFE_RUN)" $(MAKE_IN_SERVICE) web-frontend BUN="$(BUN)"
+	$(MAKE) test FEATURES=web TEST="$(TEST)" TEST_ARGS="$(TEST_ARGS)"
+
+web: export GEER_AGENT_UI := web
+web: web-frontend
+	$(CARGO) run --features web $(RUN_ARGS)
+
+web-build: web-frontend
+	$(CARGO) build --release --features web
 
 gui: export GEER_AGENT_UI := gui
 gui: gui-frontend

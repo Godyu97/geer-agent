@@ -31,7 +31,7 @@ pub(crate) struct Prompt {
     events: Vec<RawEvent>,
     // 展示用首句独立于待保存队列和可压缩的模型上下文，不进入快照。
     first_user_input: Option<String>,
-    #[cfg(any(feature = "gui", test))]
+    #[cfg(any(feature = "gui", feature = "web", test))]
     display_events: Vec<RawEvent>,
 }
 
@@ -52,14 +52,14 @@ pub(crate) struct RawEvent {
     pub(crate) payload: Value,
 }
 
-#[cfg(any(feature = "gui", test))]
+#[cfg(any(feature = "gui", feature = "web", test))]
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub(crate) struct TranscriptEntry {
     pub(crate) role: &'static str,
     pub(crate) text: String,
 }
 
-#[cfg(any(feature = "gui", test))]
+#[cfg(any(feature = "gui", feature = "web", test))]
 fn transcript_text(payload: &Value) -> Option<String> {
     if let Some(text) = payload.get("text").and_then(Value::as_str)
         && !text.is_empty()
@@ -127,7 +127,7 @@ impl Prompt {
             message_serial: 0,
             events: Vec::new(),
             first_user_input: None,
-            #[cfg(any(feature = "gui", test))]
+            #[cfg(any(feature = "gui", feature = "web", test))]
             display_events: Vec::new(),
         }
     }
@@ -357,7 +357,7 @@ impl Prompt {
         self.message_serial = 0;
         self.events.clear();
         self.first_user_input = None;
-        #[cfg(any(feature = "gui", test))]
+        #[cfg(any(feature = "gui", feature = "web", test))]
         self.display_events.clear();
         match &mut self.state {
             State::Chat { history } => history.clear(),
@@ -416,13 +416,13 @@ impl Prompt {
         self.message_serial = snapshot.message_serial;
         self.events.clear();
         self.first_user_input = None;
-        #[cfg(any(feature = "gui", test))]
+        #[cfg(any(feature = "gui", feature = "web", test))]
         self.display_events.clear();
         Ok(())
     }
 
     fn record_event(&mut self, event: RawEvent) {
-        #[cfg(any(feature = "gui", test))]
+        #[cfg(any(feature = "gui", feature = "web", test))]
         self.display_events.push(event.clone());
         self.events.push(event);
     }
@@ -433,7 +433,7 @@ impl Prompt {
             .find(|event| event.kind == "user")
             .and_then(|event| event.payload.get("text").and_then(Value::as_str))
             .map(str::to_owned);
-        #[cfg(any(feature = "gui", test))]
+        #[cfg(any(feature = "gui", feature = "web", test))]
         {
             self.display_events = events;
         }
@@ -443,7 +443,7 @@ impl Prompt {
         self.first_user_input.as_deref()
     }
 
-    #[cfg(any(feature = "gui", test))]
+    #[cfg(any(feature = "gui", feature = "web", test))]
     pub(crate) fn transcript(&self) -> Vec<TranscriptEntry> {
         let mut entries = Vec::new();
         for event in &self.display_events {

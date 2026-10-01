@@ -45,3 +45,16 @@ fn executable_env_selects_gui_and_process_override_keeps_repl_available() {
     assert!(String::from_utf8_lossy(&output.stdout).contains("bye"));
     fs::remove_dir_all(dir).unwrap();
 }
+
+#[cfg(not(feature = "web"))]
+#[test]
+fn web_mode_without_feature_reports_the_build_entry() {
+    let mut command = support::command(env!("CARGO_BIN_EXE_geer-agent"));
+    command
+        .env("GEER_AGENT_UI", "web")
+        .env("GEER_AGENT_WEB_PORT", "0");
+    let output = support::run(&mut command, b"").unwrap();
+    assert!(!output.status.success());
+    let error = String::from_utf8_lossy(&output.stderr);
+    assert!(error.contains("当前构建未包含 Web UI") && error.contains("make web"));
+}

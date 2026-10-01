@@ -4,7 +4,7 @@
   "version": "0.1.0",
   "identifier": "dev.geer.agent",
   "build": {
-    "frontendDist": "frontend/dist"
+    "frontendDist": "../frontend/dist/gui"
   },
   "app": {
     "windows": [

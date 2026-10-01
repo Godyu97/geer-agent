@@ -12,17 +12,17 @@ cargo run
 
 复制可执行文件到其他目录运行时，优先读取可执行文件同级的 `.env`；若不存在，则读取 `~/.geer-agent/.env`。普通本地 Cargo 构建产物在同级没有 `.env` 时，也会检查项目根目录的 `.env`。启动工作目录中的其他 `.env` 不参与查找。所有候选位置都没有外部 `.env` 时，也可以只设置同名进程环境变量。`OPENAI_BASE_URL` 可选，默认使用 OpenAI 地址；`OPENAI_API` 可选，默认使用 Responses API，另可设为 `chat-completions`。
 
-`GEER_AGENT_UI=auto|gui|tui|repl` 可写在上述位置的 `.env`，进程环境变量优先。默认 `auto` 在交互终端使用 TUI，在输入或输出接管道时使用文本 REPL；显式 `tui` 要求交互终端。`gui` 必须在构建时启用 Cargo 的 `gui` feature，否则程序会提示构建方式。三种界面继续使用同一个 `geer-agent` 可执行文件。
+`GEER_AGENT_UI=auto|gui|web|tui|repl` 可写在上述位置的 `.env`，进程环境变量优先。默认 `auto` 在交互终端使用 TUI，在输入或输出接管道时使用文本 REPL；显式 `tui` 要求交互终端。`gui` / `web` 分别要求 Cargo 的 `gui` / `web` feature，否则程序会提示构建方式。四种界面继续使用同一个 `geer-agent` 可执行文件。
 
 ## 桌面 GUI（可选）
 
-GUI 使用 Tauri 2 + React/TypeScript。先构建静态前端，再启用 Rust feature：
+GUI 使用 Tauri 2 + React/TypeScript，与 Web 共用前端。开发需要 Bun 1.4.2 和兼容 Vite/tsc/Vitest 的 Node.js；依赖和脚本入口统一使用 Bun。先构建静态前端，再启用 Rust feature：
 
 ```sh
-cd src/ui/gui/frontend
-npm ci
-npm run build
-cd ../../../..
+cd src/ui/frontend
+bun install --frozen-lockfile --concurrent-scripts 1
+bun run build:gui
+cd ../../..
 cargo run --features gui
 ```
 
@@ -32,9 +32,49 @@ cargo run --features gui
 
 Linux 桌面入口模板位于 `src/ui/gui/geer-agent.desktop`：把 `Exec` 改为桌面可执行文件的实际绝对路径，保留双引号及 `Terminal=false`，然后保存到 `~/.local/share/applications/geer-agent.desktop`，从应用菜单打开。启动器直接运行二进制，不调用 Cargo 或终端模拟器。配置仍按既有 `.env` 查找顺序加载，无需以项目目录作为启动工作目录。原因、技术方案及验收步骤见 [GUI 启动优化方案](doc/plan/2026-10-01-gui-launch.md)。
 
-Linux 需要 WebKitGTK 4.1 等 Tauri 开发依赖。Fedora 按 [Tauri 官方前置要求](https://tauri.app/start/prerequisites/) 安装 `webkit2gtk4.1-devel openssl-devel curl wget file libappindicator-gtk3-devel librsvg2-devel libxdo-devel` 及 C 开发工具；如编译提示找不到 `dbus-1.pc`，还需 `dbus-devel`。从 Wayland 会话中运行，可用 `GDK_BACKEND=wayland` 做原生 Wayland 验收。Windows 11 使用 MSVC Rust 工具链、Microsoft C++ Build Tools、WebView2 和 Node.js；本项目工具执行还需要 Git for Windows Bash。前端产物嵌入启用 GUI 的二进制，修改前端后需重新运行 `npm run build` 和 Cargo 构建。默认 `cargo build` 不需要 Node 或 GTK/WebKitGTK。
+Linux 需要 WebKitGTK 4.1 等 Tauri 开发依赖。Fedora 按 [Tauri 官方前置要求](https://tauri.app/start/prerequisites/) 安装 `webkit2gtk4.1-devel openssl-devel curl wget file libappindicator-gtk3-devel librsvg2-devel libxdo-devel` 及 C 开发工具；如编译提示找不到 `dbus-1.pc`，还需 `dbus-devel`。从 Wayland 会话中运行，可用 `GDK_BACKEND=wayland` 做原生 Wayland 验收。Windows 11 使用 MSVC Rust 工具链、Microsoft C++ Build Tools、WebView2 、Bun 1.4.2 和兼容 Vite 的 Node.js；本项目工具执行还需要 Git for Windows Bash。前端产物嵌入启用 GUI 的二进制，修改前端后需重新运行 `bun run build:gui` 和 Cargo 构建。默认 `cargo build` 不需要 Node 或 GTK/WebKitGTK。
 
 侧栏的“管理会话”支持勾选、全选当前列表和批量删除；切换“当前 / 全部”范围会清空选择。确认弹窗显示标题、完整 UUID 和当前会话替换提示，默认取消。删除其他会话或取消操作会保留聊天草稿；删除当前会话成功后，消息区和草稿清空。失败项可点击“重试删除 / 清理”。
+
+## 浏览器 Web UI（可选）
+
+```sh
+make web
+# 修改监听端口；默认 9928
+GEER_AGENT_WEB_PORT=9930 make web
+# 构建包含静态页面的独立 release 二进制
+make web-build
+```
+
+`GEER_AGENT_UI=web` 选择独立 Web 宿主；监听固定为 `0.0.0.0`，端口由 `GEER_AGENT_WEB_PORT` 配置，范围 1–65535。打开启动输出中的本机地址，或从手机访问服务器的局域网 IP。端口非法、被占用、缺少模型配置会明确退出。Web 不依赖 GTK/WebKitGTK；默认 Cargo 构建也不需要前端。
+
+未设置或留空 `GEER_AGENT_WEB_TOKEN` 时，启动会生成并显示一次临时访问口令；在 `.env` 或进程环境中设置非空值可固定口令，固定口令不打印。登录凭证存于本进程内存，通过 HttpOnly/SameSite Cookie 传递，重启后需要重新登录。写请求和 WebSocket 校验同源；模型密钥留在 Rust 服务端。
+
+这是单用户共享会话：多个浏览器共用当前会话和 workspace，操作互斥，状态过期的提交会被拒绝。重连恢复完整历史、正在生成的回答和授权，未确认的操作不会自动重发。各页面的输入草稿按会话 UUID 保留。任一已登录端的第一份工具授权回复生效；无人回复 120 秒或所有端断开后默认拒绝。workspace 输入的是**服务器目录**，工具也在服务器执行。GUI 与 Web 是独立运行模式。
+
+Web 保留 GUI 的聊天、Markdown、完整历史、工具进度、用量、压缩、保存和会话管理功能，以及 Catppuccin Mocha 视觉。手机通过顶部会话和状态按钮展开面板；局域网 HTTP 无法自动复制时提供可选择的代码。输入 `/exit` 保存后只离开当前页面，关闭标签页也不会停止服务；终端 Ctrl+C/SIGTERM 才停止服务并保存，保存失败返回非零状态。
+
+服务最多接收 16 个 WebSocket，每端待发送事件上限 256；慢端断开后可重新同步。输入上限 65536 字节，入站帧/消息上限 512 KiB；15 秒探测一次，45 秒无响应断开。
+
+## 共用 React / TypeScript 的管理方式
+
+唯一前端包位于 `src/ui/frontend`，只维护 `bun.lock`。依赖升级在这里进行，安装必须使用 `bun install --frozen-lockfile --concurrent-scripts 1`；构建和测试使用 `bun run`，Vite、tsc、Vitest 沿用兼容 Node 的运行方式。不要为 Web 再复制 App、会话管理或样式。
+
+- `protocol.ts` 统一事件/快照类型，`model.ts` 管理纯状态更新；新业务行为在共用层实现和回归。
+- `App.tsx` 与 `style.css` 共用交互和视觉，宿主差异通过 `HostAdapter` 注入；组件只调用适配接口。
+- `hosts/desktop.ts` 处理 Tauri IPC、目录选择和系统剪贴板，`hosts/web.ts` 处理 WS、重连和浏览器剪贴板；Web 登录在 `WebGate.tsx`。
+- Vite 模式在构建时选择宿主，分别输出 `dist/gui` 和 `dist/web`；Web 产物不引入 Tauri IPC。继续拆组件时按消息、会话面板、授权弹窗等能力拆进本包，无需建立两个应用或发布 UI 库。
+
+```sh
+make frontend-check
+make frontend-test                 # 受限 Vitest，共用 GUI/Web 回归
+make gui-frontend                  # bun run build:gui
+make web-frontend                  # bun run build:web
+make web-test                      # 前端 + 受限 Rust Web 测试
+make clippy-all                    # 两种前端 + gui,web Rust 检查
+```
+
+旧 `gui-deps` / `gui-check` / `gui-test` 入口仍可使用。`BUN=/absolute/path/to/bun` 可覆盖 Make 的 Bun 路径。UI 接入逻辑和维护边界见 [架构文档](docs/design/architecture.md)。
 
 ## 终端界面
 
@@ -46,7 +86,7 @@ F3 或 `/sessions [--all]` 打开会话管理面板并保留聊天草稿。上�
 
 ## 工具调用
 
-三种界面向模型提供 11 个工具：`get_current_time`、`bash`、`ls`、`glob`、`rg`、`read`、`write`、`edit`、`search`、`web_search`、`web_fetch`。模型选择工具后，程序执行并把结果交回模型继续回答。`GEER_AGENT_TOOLS=off` 可在启动时关闭所有工具；默认开启。服务端模型需要支持所选 API 的函数工具调用协议。
+四种界面向模型提供 11 个工具：`get_current_time`、`bash`、`ls`、`glob`、`rg`、`read`、`write`、`edit`、`search`、`web_search`、`web_fetch`。模型选择工具后，程序执行并把结果交回模型继续回答。`GEER_AGENT_TOOLS=off` 可在启动时关闭所有工具；默认开启。服务端模型需要支持所选 API 的函数工具调用协议。
 
 `read` 接受 `path`、可选的 1 起始行号 `offset` 和行数 `limit`，单次最多返回 2000 行、50 KiB 的 UTF-8 文本。`write` 接受 `path` 与 `content`，创建或覆盖文件。`edit` 接受 `path` 和 `edits` 数组，其中每项是 `oldText`、`newText`；旧文本必须在原文件中唯一匹配，各项不能重叠。`bash` 接受 `command`，在当前 workspace 运行，10 秒超时，结果最多 2000 字符。
 
@@ -181,7 +221,7 @@ make gui-test
 GEER_TEST_MEMORY_MAX=6G GEER_TEST_RUNTIME_MAX=15min make test FEATURES=gui
 ```
 
-需要其他 Cargo 参数时，用 `TEST_ARGS`；需要直接验证其它命令时，用 `./scripts/test-safe.sh <命令> [参数...]`。不要直接在开发主机运行裸 `cargo test`、`npm test` 或测试二进制，也不要同时启动多组测试去叠加资源额度。Windows、macOS 和没有 systemd 用户服务的环境需要先提供带内存、进程数量、总时限和后代清理能力的独立测试环境；受限入口不会静默降级。不要对整个 `user.slice` 设置测试额度，否则会一起限制 ChatGPT、桌面等同用户服务。[cgroup v2 文档](https://docs.kernel.org/admin-guide/cgroup-v2.html) 说明了进程后代的资源归属与内存/任务控制。
+需要其他 Cargo 参数时，用 `TEST_ARGS`；需要直接验证其它命令时，用 `./scripts/test-safe.sh <命令> [参数...]`。不要直接在开发主机运行裸 `cargo test`、`bun run test` 或测试二进制，也不要同时启动多组测试去叠加资源额度。Windows、macOS 和没有 systemd 用户服务的环境需要先提供带内存、进程数量、总时限和后代清理能力的独立测试环境；受限入口不会静默降级。不要对整个 `user.slice` 设置测试额度，否则会一起限制 ChatGPT、桌面等同用户服务。[cgroup v2 文档](https://docs.kernel.org/admin-guide/cgroup-v2.html) 说明了进程后代的资源归属与内存/任务控制。
 
 新增或修改测试时遵守以下约定：
 

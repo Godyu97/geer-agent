@@ -6,7 +6,7 @@
 
 `geer-agent` 是 [GeekAgent 教程](https://geektutu.com/books/geekagent) 的 **Rust 学习实现**。原教程用 TypeScript 从零做一个最小 Agent/Harness；本仓库用 Rust 跟同一条能力曲线，服务仓库所有者的 Rust 入门，而不是做生产级编码代理。
 
-当前状态：Cargo 二进制 crate（edition 2024），已具备两种模型 API、工具循环、压缩、会话持久化、TUI 与可选 GUI。`src/main.rs` 调用 `ui::run`；文本界面位于 `src/ui/repl/`，三种界面通过 `interaction` 共用 Agent 的会话能力。功能继续按教程能力增量增长，架构现状见 `docs/design/architecture.md`。
+当前状态：Cargo 二进制 crate（edition 2024），已具备两种模型 API、工具循环、压缩、会话持久化、TUI 与可选 GUI/Web。`src/main.rs` 调用 `ui::run`；文本界面位于 `src/ui/repl/`，四种界面通过 `interaction` 共用 Agent 的会话能力。功能继续按教程能力增量增长，架构现状见 `docs/design/architecture.md`。
 
 ## 先读哪份治理文件
 
@@ -78,7 +78,7 @@ make test
 make clippy
 ```
 
-根目录 `Makefile` 是这些命令的入口：`make help` 查看目标；收工用 `make check`（`fmt` → `test-safety` → `test` → `clippy`，顺序执行）。`test-safety` 需要 Python 3 标准库。测试与 clippy 使用独立受限服务，详见下节与 `README.md`。默认不加 `gui` / `embed-env`；GUI 用 `make gui`，内嵌 `.env` 用 `make embed`。
+根目录 `Makefile` 是这些命令的入口：`make help` 查看目标；收工用 `make check`（`fmt` → `test-safety` → `test` → `clippy`，顺序执行）。`test-safety` 需要 Python 3 标准库。测试与 clippy 使用独立受限服务，详见下节与 `README.md`。默认不加 `gui` / `embed-env`；GUI 用 `make gui`，Web 用 `make web`，内嵌 `.env` 用 `make embed`。
 
 改了代码再收工时：先 `fmt`，再相关 `test`，再 `clippy`。学习项目不要开 `-D warnings` 当门禁，但新引入的 clippy 警告要处理，不要留 `todo!()` / 无故 `unwrap`。
 
@@ -88,7 +88,7 @@ make clippy
 
 2026 年 9 月 Fedora 曾发生全局 OOM 并终止 ChatGPT/Codex。已证实缺失命令测试的空 `PATH` 与 Bash 远程启动文件可触发 Fedora 缺失命令处理中的递归 fork；历史证据不能证明每次 OOM 都来自同一测试。把子进程、线程、输出和编译峰值都纳入测试安全范围。
 
-- **先隔离再运行**：开发主机上测试必须用 `make test` / `make gui-test` / `make check` 或 `scripts/test-safe.sh`。禁止裸跑 `cargo test`、`npm test`、测试二进制或未受限的危险复现。脚本默认独立 cgroup：`MemoryMax=4G`、`MemorySwapMax=0`、`TasksMax=256`、`RuntimeMaxSec=10min`、`TimeoutStopSec=5s`、`KillMode=control-group`、`OOMPolicy=kill`；编译默认 2 并行、Rust 测试默认 1 线程，Vitest 固定 1 worker 且关闭文件并行。必须确认实际限制有效；入口失败不得绕过。没有 systemd/cgroup 的环境先提供等效隔离。
+- **先隔离再运行**：开发主机上测试必须用 `make test` / `make gui-test` / `make check` 或 `scripts/test-safe.sh`。禁止裸跑 `cargo test`、`bun run test`、测试二进制或未受限的危险复现。脚本默认独立 cgroup：`MemoryMax=4G`、`MemorySwapMax=0`、`TasksMax=256`、`RuntimeMaxSec=10min`、`TimeoutStopSec=5s`、`KillMode=control-group`、`OOMPolicy=kill`；编译默认 2 并行、Rust 测试默认 1 线程，Vitest 固定 1 worker 且关闭文件并行。必须确认实际限制有效；入口失败不得绕过。没有 systemd/cgroup 的环境先提供等效隔离。
 - **先单项再完整**：Shell、PATH、超时与清理代码修改后，先运行 `make test-safety`，再受限运行缺失命令单项和 `process_safety` 回归，最后跑完整检查。`test-safety` 的探针必须各自受限且顺序执行；组内 OOM 仅允许固定上界的分配。不得执行无约束递归来证明修复，也不要并发运行多组完整测试叠加额度。
 - **隔离启动环境**：直接 Bash 测试探针必须带 `--noprofile --norc`，清除 `BASH_ENV ENV SSH_CLIENT SSH_CONNECTION SSH_TTY`。清空 `PATH` 只对受控子进程生效；保留 `GEER_AGENT_SCRIPT` / `GEER_AGENT_ARG_*` 等工具内部参数，禁止用 `env -i` 误删。哨兵启动文件只建在测试临时目录，不读取或改写宿主 `~/.bashrc`、`/etc/profile.d/`。
 - **标准输入明确**：无输入时 `stdin(Stdio::null())`；有 REPL 输入时使用管道、限时写入并显式 EOF。不得把远程网络连接或交互终端继承给测试探针。
@@ -102,12 +102,20 @@ make clippy
 
 - Edition 2024；工具链以本机 `rustc`/`cargo` 为准，不要无故加 `rust-toolchain.toml`。
 - 二进制 crate，入口 `src/main.rs`。模块按能力增长：`src/<module>.rs` 或 `src/<module>/mod.rs`，不要一上来铺 `domain/application/infrastructure`。
-- 业务模块不依赖具体 UI：`config` 可被所有模块引用；`provider` 不引用 `tools` / `agent` / `ui`；`tools` 不引用 `provider` / `agent` / `ui`；`agent` 实现 `interaction::Session`，组合模型、工具与会话，不引用 `ui`。`interaction` 定义中立契约并执行共用命令，可使用会话数据类型，但不导入具体 Agent 或 UI。`ui::run` 与 GUI 工作线程是组合点，可创建 Agent、注入授权；`ui/repl` / `ui/tui` / GUI 命令适配通过 `interaction::execute` 执行消息和会话写操作，读取绘图数据可直接使用 Session。入口 `main` 只调用 `ui::run`。
+- 业务模块不依赖具体 UI：`config` 可被所有模块引用；`provider` 不引用 `tools` / `agent` / `ui`；`tools` 不引用 `provider` / `agent` / `ui`；`agent` 实现 `interaction::Session`，组合模型、工具与会话，不引用 `ui`。`interaction` 定义中立契约并执行共用命令，可使用会话数据类型，但不导入具体 Agent 或 UI。`ui::run` 与共用图形工作线程是组合点，可创建 Agent、注入授权；`ui/repl` / `ui/tui` / GUI/Web 命令适配通过 `interaction::execute` 执行消息和会话写操作，读取绘图数据可直接使用 Session。入口 `main` 只调用 `ui::run`。
 - 标识符英文；注释只写「为什么」和 Rust 初学者不容易看出来的所有权/生命周期/错误处理选择，用中文。
 - 库路径与可失败逻辑用 `Result`/`Option`。`unwrap`/`expect` 仅限「这是 bug」或测试。禁止 `unsafe`。
 - 优先标准库。新 crate 必须能回答「std 为什么不够」。异步、流式输出、HTTP 客户端等在对应 change 的 design 里论证后再加。
 - 公开行为用测试钉住：单元测试跟模块走，REPL/流式/工具调用等用集成测试或可重复的手工验收步骤（写进 spec scenario / task 验证）。
 - 配置对齐教程语义：OpenAI 兼容的 `base_url` / `api_key` / `model`，从环境变量读取；缺 key 时明确退出，不要静默假成功。
+
+## 图形前端约定
+
+- GUI/Web 唯一 React TS 包为 `src/ui/frontend`，包管理与脚本入口用 Bun 1.4.2，只维护 `bun.lock`，不再用 npm。
+- 安装用 `bun install --frozen-lockfile --concurrent-scripts 1`；不强制替换 Vite、tsc、Vitest 的 Node 运行方式。
+- 业务交互、reducer、协议类型、样式在共用包中修改；宿主能力放在 `hosts/desktop.ts` / `hosts/web.ts`，通过 HostAdapter 注入，不复制第二套 App。
+- Rust `ui/app` 共用 Agent 工作线程、展示命令、事件缓存、授权和保存判定。`ui/gui` 只保留 Tauri/窗口，`ui/web` 只保留认证/HTTP/WS；图形层仍通过 `interaction::execute` 写会话。
+- 前端测试用 `make frontend-test`；Web Rust 测试用 `make web-test` 或构建 Web 前端后 `make test FEATURES=web`。默认 Cargo 不依赖静态前端；可选 UI 构建先运行对应 frontend 目标。
 
 ## Git 工作流
 

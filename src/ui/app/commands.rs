@@ -1,4 +1,4 @@
-//! GUI 输入框沿用终端命令语义；流式回调交给窗口桥接层传输。
+//! 图形界面 输入框沿用终端命令语义；流式回调交给窗口桥接层传输。
 
 use std::io;
 
@@ -40,7 +40,7 @@ where
             .await
         {
             Err(error) => {
-                result.error = Some(super::commands::error_text(&error));
+                result.error = Some(crate::ui::commands::error_text(&error));
                 None
             }
             Ok(outcome) => match outcome {

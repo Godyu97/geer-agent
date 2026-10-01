@@ -568,7 +568,7 @@ impl SessionManager {
         ids
     }
 
-    #[cfg(any(feature = "gui", test))]
+    #[cfg(any(feature = "gui", feature = "web", test))]
     pub(crate) fn volatile_ids(&self) -> Vec<String> {
         let mut ids: Vec<_> = std::iter::once(&self.active)
             .chain(self.parked.values())

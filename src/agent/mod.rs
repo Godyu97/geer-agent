@@ -12,8 +12,6 @@ use std::{
 use tokio::time::{Instant, timeout_at};
 use uuid::Uuid;
 
-#[cfg(feature = "gui")]
-pub(crate) use crate::session::SessionEntry;
 use crate::{
     config::{CompactionConfig, Config, DEFAULT_RESOURCE_LIMITS, OpenAiApi, ResourceLimits},
     dao::{SessionStore, TraceStore},
@@ -430,17 +428,17 @@ impl Agent {
         self.tools.set_confirm(confirm);
     }
 
-    #[cfg(feature = "gui")]
+    #[cfg(any(feature = "gui", feature = "web"))]
     pub(crate) fn transcript(&self) -> Vec<crate::prompt::TranscriptEntry> {
         self.sessions.active.prompt.transcript()
     }
 
-    #[cfg(feature = "gui")]
+    #[cfg(any(feature = "gui", feature = "web"))]
     pub(crate) fn unsaved_ids(&self) -> Vec<String> {
         self.sessions.unsaved_ids()
     }
 
-    #[cfg(feature = "gui")]
+    #[cfg(any(feature = "gui", feature = "web"))]
     pub(crate) fn volatile_ids(&self) -> Vec<String> {
         self.sessions.volatile_ids()
     }

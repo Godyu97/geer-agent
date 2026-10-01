@@ -7,17 +7,11 @@ mod tui;
 #[cfg(feature = "gui")]
 mod gui;
 
-#[cfg(any(feature = "gui", test))]
-#[path = "gui/authorization.rs"]
-mod gui_authorization;
+#[cfg(any(feature = "gui", feature = "web", test))]
+mod app;
 
-#[cfg(any(feature = "gui", test))]
-#[path = "gui/commands.rs"]
-mod gui_commands;
-
-#[cfg(any(feature = "gui", test))]
-#[path = "gui/close.rs"]
-mod gui_close;
+#[cfg(feature = "web")]
+mod web;
 
 use std::{
     error::Error,
@@ -55,6 +49,10 @@ pub(crate) fn run() -> Result<(), Box<dyn Error>> {
             "当前构建未包含 GUI；请先构建前端，再用 cargo run --features gui 启动。",
         )
         .into()),
+        #[cfg(feature = "web")]
+        UiMode::Web => web::run(),
+        #[cfg(not(feature = "web"))]
+        UiMode::Web => Err(io::Error::other("当前构建未包含 Web UI；请用 make web 启动。").into()),
         UiMode::Tui if !terminal => {
             Err(io::Error::other("TUI 需要交互终端，请改用 GEER_AGENT_UI=repl。").into())
         }
@@ -82,7 +80,7 @@ fn resolve_mode(mode: UiMode, terminal: bool, desktop: bool) -> Result<UiMode, &
     if desktop {
         return match mode {
             UiMode::Auto | UiMode::Gui => Ok(UiMode::Gui),
-            UiMode::Tui | UiMode::Repl => Err(
+            UiMode::Tui | UiMode::Repl | UiMode::Web => Err(
                 "桌面构建只支持 GUI；请将 GEER_AGENT_UI 设为 auto 或 gui。使用终端界面请运行不含 desktop-gui 的构建（make run）。",
             ),
         };
@@ -104,7 +102,7 @@ mod tests {
             for mode in [UiMode::Auto, UiMode::Gui] {
                 assert_eq!(resolve_mode(mode, terminal, true), Ok(UiMode::Gui));
             }
-            for mode in [UiMode::Tui, UiMode::Repl] {
+            for mode in [UiMode::Tui, UiMode::Repl, UiMode::Web] {
                 assert!(
                     resolve_mode(mode, terminal, true)
                         .unwrap_err()
@@ -118,7 +116,7 @@ mod tests {
     fn terminal_build_keeps_existing_selection() {
         assert_eq!(resolve_mode(UiMode::Auto, true, false), Ok(UiMode::Tui));
         assert_eq!(resolve_mode(UiMode::Auto, false, false), Ok(UiMode::Repl));
-        for mode in [UiMode::Gui, UiMode::Tui, UiMode::Repl] {
+        for mode in [UiMode::Gui, UiMode::Tui, UiMode::Repl, UiMode::Web] {
             assert_eq!(resolve_mode(mode, false, false), Ok(mode));
         }
     }

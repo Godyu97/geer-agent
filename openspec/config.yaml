@@ -12,7 +12,9 @@ context: |
   2. 一次变更一个可运行切片：对应教程一天的能力，结束时 cargo run 能看到效果。
   3. 只增量不推翻：在已有模块上扩展。禁止把「重写前一天」写进设计或任务，除非 proposal 标明 BREAKING 且用户同意。
 
-  技术栈：Rust 2024 edition，二进制 crate geer-agent，main 调 ui::run。已有 Responses/Chat Completions、工具循环、压缩、会话持久化、Ratatui TUI 与可选 Tauri GUI。文本 UI 在 ui/repl，三种 UI 共用 interaction 的命令执行和 Session 契约；Agent 组合模型、工具与会话。没有 CI；格式用 make fmt，测试与 clippy 必须经 make test / make clippy 的独立受限服务，收工顺序执行 make check，不裸跑测试。详见 AGENTS.md 的资源及临时目录隔离约束。
+  技术栈：Rust 2024 edition，二进制 crate geer-agent，main 调 ui::run。已有 Responses/Chat Completions、工具循环、压缩、会话持久化、Ratatui TUI 与可选 Tauri GUI/Web。文本 UI 在 ui/repl，四种 UI 共用 interaction 的命令执行和 Session 契约；GUI/Web 共用 ui/app 工作线程、状态、授权与保存判定，Agent 组合模型、工具与会话。没有 CI；格式用 make fmt，测试与 clippy 必须经 make test / make clippy 的独立受限服务，收工顺序执行 make check，不裸跑测试。详见 AGENTS.md 的资源及临时目录隔离约束。
+
+  GUI/Web 的 React TypeScript 代码共用 src/ui/frontend，通过 HostAdapter 接入宿主，不另建 Web 前端副本。依赖、锁文件与脚本使用 Bun 1.4.2，只维护 bun.lock；安装冻结锁文件，Vite/tsc/Vitest 保持 Node 兼容运行。默认 Cargo 无需前端；可选宿主构建先准备对应静态产物，前端测试经 make frontend-test 受限执行。
 
   把教程当行为来源，不要当 TypeScript 逐行翻译稿。design 必须说明概念如何映射到 Rust（所有权、错误处理、模块、异步），而不是复刻 dayN/ 目录或 npm 包名。
 

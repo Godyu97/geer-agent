@@ -2,6 +2,8 @@
 
 mod path;
 mod process;
+#[cfg(any(feature = "web", test))]
+pub(crate) mod web;
 
 pub(crate) use path::{bash_arg, from_msys, msys_style, plain_path};
 pub(crate) use process::background_command;
@@ -20,6 +22,7 @@ const DEFAULT_MAX_DURATION: Duration = Duration::from_secs(600);
 pub(crate) enum UiMode {
     Auto,
     Gui,
+    Web,
     Tui,
     Repl,
 }
@@ -29,9 +32,10 @@ impl UiMode {
         match value.map(str::trim) {
             None | Some("") | Some("auto") => Ok(Self::Auto),
             Some("gui") => Ok(Self::Gui),
+            Some("web") => Ok(Self::Web),
             Some("tui") => Ok(Self::Tui),
             Some("repl") => Ok(Self::Repl),
-            Some(_) => Err("GEER_AGENT_UI 只能是 auto、gui、tui 或 repl。".to_owned()),
+            Some(_) => Err("GEER_AGENT_UI 只能是 auto、gui、web、tui 或 repl。".to_owned()),
         }
     }
 }

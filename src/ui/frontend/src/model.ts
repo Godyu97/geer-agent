@@ -1,7 +1,6 @@
-export type Entry = {
-  role: "user" | "assistant" | "tool" | "system";
-  text: string;
-};
+import type { Entry, Event, Snapshot, Connection, DeletePreview, DeleteReport } from "./protocol";
+export type { Entry, Event, Snapshot, Connection, Usage, Status, SessionEntry, DeletePreview, DeleteReport } from "./protocol";
+
 export type Turn = { start: number; entries: Entry[] };
 
 export function groupTranscript(entries: Entry[]): Turn[] {
@@ -14,72 +13,6 @@ export function groupTranscript(entries: Entry[]): Turn[] {
   return turns;
 }
 
-export type Usage = { input: number; output: number };
-export type Status = {
-  model: string;
-  session_id: string;
-  session_title: string;
-  workspace: string;
-  context_tokens: number;
-  context_window_tokens: number;
-  turn_tokens: number;
-  total_tokens: number;
-  usage_complete: boolean;
-};
-export type SessionEntry = {
-  id: string;
-  title: string;
-  updated_at_ms: number;
-  model: string;
-  status: string;
-  active: boolean;
-  uncertain_tools: boolean;
-  workspace: string;
-};
-export type DeletePreview = {
-  targets: { id: string; title: string; active: boolean }[];
-};
-export type DeleteReport = {
-  items: {
-    id: string;
-    state: "deleted" | "absent" | "failed" | "cleanup_pending";
-    error: string | null;
-  }[];
-  new_session_id: string | null;
-};
-export type Snapshot = {
-  status: Status;
-  sessions: SessionEntry[];
-  all_sessions: SessionEntry[];
-  transcript: Entry[];
-  unsaved_ids: string[];
-  authorization_id?: number | null;
-};
-export type Event =
-  | {
-      type: "snapshot";
-      request_id: number | null;
-      snapshot: Snapshot;
-      notice: string | null;
-      error: string | null;
-      delete_confirmation?: DeletePreview | null;
-      delete_report?: DeleteReport | null;
-    }
-  | { type: "started"; request_id: number }
-  | { type: "delta"; request_id: number; text: string }
-  | { type: "tool_progress"; request_id: number; name: string }
-  | { type: "usage"; request_id: number; usage: Usage | null }
-  | { type: "authorization"; id: number; prompt: string }
-  | { type: "diagnostic"; message: string }
-  | { type: "startup_error"; message: string }
-  | { type: "closing" }
-  | {
-      type: "close_failed";
-      report: string;
-      unsaved_ids: string[];
-      can_retry: boolean;
-    };
-
 export type Action =
   | Event
   | { type: "queued"; pending: Pending }
@@ -88,8 +21,10 @@ export type Action =
   | { type: "close_dismissed" }
   | { type: "delete_dismissed" };
 
-export type Pending = { id: number; line: string };
+export type Pending = { id: number; line: string; local?: boolean };
 export type ViewState = {
+  connection: Connection;
+  deleteRevision: number | null;
   snapshot: Snapshot | null;
   pending: Pending | null;
   live: string;
@@ -111,6 +46,8 @@ export type ViewState = {
 };
 
 export const initialState: ViewState = {
+  connection: "connected",
+  deleteRevision: null,
   snapshot: null,
   pending: null,
   live: "",
@@ -129,6 +66,16 @@ export const initialState: ViewState = {
 
 export function applyEvent(state: ViewState, event: Action): ViewState {
   switch (event.type) {
+    case "sync": {
+      const run = event.state.running;
+      return { ...state, snapshot: event.state.snapshot, pending: run ? { id: run.request_id, line: run.line, local: false } : null, live: run?.text ?? "", liveTools: run?.tools ?? [], liveUsage: run?.usage ?? 0, authorization: event.state.authorization, diagnostics: event.state.diagnostics, startupError: event.state.startup_error, closing: event.state.closing, notice: event.state.notice, error: event.state.error, deleteReport: event.state.delete_report, deleteConfirmation: null, deleteRevision: null };
+    }
+    case "connection":
+      return { ...state, connection: event.status, authorization: event.status === "connected" ? state.authorization : null, deleteConfirmation: null };
+    case "client_exited":
+      return { ...state, connection: "exited", closing: false, pending: null, closeFailed: null, authorization: null };
+    case "delete_confirmation":
+      return { ...state, deleteConfirmation: event.preview, deleteRevision: event.revision };
     case "queued":
       return {
         ...state,
@@ -141,7 +88,7 @@ export function applyEvent(state: ViewState, event: Action): ViewState {
         error: null,
       };
     case "submit_failed":
-      return state.pending?.id === event.request_id
+      return state.pending?.id === event.request_id && state.pending.local !== false
         ? {
             ...state,
             pending: null,
@@ -149,8 +96,9 @@ export function applyEvent(state: ViewState, event: Action): ViewState {
             liveTools: [],
             error: event.message,
           }
-        : state;
+        : { ...state, error: event.message };
     case "authorization_cleared":
+    case "authorization_resolved":
       // 后端收到回复后可能立即发出下一项授权；只清除已回复的那一项，否则工作线程会一直等待。
       return state.authorization?.id === event.id
         ? { ...state, authorization: null }
@@ -160,15 +108,15 @@ export function applyEvent(state: ViewState, event: Action): ViewState {
     case "delete_dismissed":
       return { ...state, deleteConfirmation: null };
     case "snapshot":
-      if (event.request_id !== null && state.pending?.id !== event.request_id)
+      if (event.snapshot.revision === undefined && event.request_id !== null && state.pending?.id !== event.request_id)
         return state;
       return {
         ...state,
         snapshot: event.snapshot,
-        pending: event.request_id === null ? state.pending : null,
-        live: event.request_id === null ? state.live : "",
-        liveTools: event.request_id === null ? state.liveTools : [],
-        liveUsage: event.request_id === null ? state.liveUsage : 0,
+        pending: event.snapshot.revision === undefined && event.request_id === null ? state.pending : null,
+        live: event.snapshot.revision === undefined && event.request_id === null ? state.live : "",
+        liveTools: event.snapshot.revision === undefined && event.request_id === null ? state.liveTools : [],
+        liveUsage: event.snapshot.revision === undefined && event.request_id === null ? state.liveUsage : 0,
         authorization:
           state.authorization?.id === event.snapshot.authorization_id
             ? state.authorization
@@ -179,7 +127,7 @@ export function applyEvent(state: ViewState, event: Action): ViewState {
         deleteReport: event.delete_report ?? null,
       };
     case "started":
-      return state;
+      return event.line === undefined ? state : { ...state, pending: { id: event.request_id, line: event.line, local: false }, live: "", liveTools: [], liveUsage: 0, notice: null, error: null, deleteConfirmation: null };
     case "delta":
       return state.pending?.id === event.request_id
         ? { ...state, live: state.live + event.text }

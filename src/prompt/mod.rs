@@ -8,7 +8,7 @@ use crate::config::background_command;
 
 mod conversation;
 
-#[cfg(feature = "gui")]
+#[cfg(any(feature = "gui", feature = "web"))]
 pub(crate) use conversation::TranscriptEntry;
 pub(crate) use conversation::{CompactionPlan, Prompt, PromptSnapshot, RawEvent};
 

@@ -30,7 +30,7 @@ impl DiagnosticBuffer {
         Self { active: true }
     }
 
-    #[cfg(feature = "gui")]
+    #[cfg(any(feature = "gui", feature = "web"))]
     pub(crate) fn drain(&self) -> Vec<String> {
         BUFFER.with(|buffer| {
             buffer

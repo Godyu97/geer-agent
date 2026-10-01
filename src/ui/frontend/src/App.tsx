@@ -1,4 +1,6 @@
 import {
+  createContext,
+  useContext,
   useEffect,
   useLayoutEffect,
   useMemo,
@@ -9,10 +11,8 @@ import {
 import type { KeyboardEvent, ReactNode } from "react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
-import { Channel, invoke } from "@tauri-apps/api/core";
-import { getCurrentWindow } from "@tauri-apps/api/window";
-import { writeText } from "@tauri-apps/plugin-clipboard-manager";
-import { open } from "@tauri-apps/plugin-dialog";
+import { host as defaultHost } from "@host";
+import type { HostAdapter } from "./host";
 import {
   applyEvent,
   groupTranscript,
@@ -20,8 +20,10 @@ import {
   safeExternalHref,
   shouldSubmit,
 } from "./model";
-import type { Entry, Event, Pending } from "./model";
+import type { Entry, Pending } from "./model";
 import "./style.css";
+
+const CopyContext = createContext<(text: string) => Promise<void>>(async () => {});
 
 function plainText(node: ReactNode): string {
   if (typeof node === "string" || typeof node === "number") return String(node);
@@ -39,6 +41,7 @@ function Message({
   entry: Entry;
   onCopyError: (message: string) => void;
 }) {
+  const copy = useContext(CopyContext);
   const label = {
     user: "李火旺🔥",
     assistant: "Geer",
@@ -66,7 +69,7 @@ function Message({
                   <button
                     className="copy"
                     onClick={() =>
-                      void writeText(plainText(children)).catch((error) =>
+                      void copy(plainText(children)).catch((error) =>
                         onCopyError(String(error)),
                       )
                     }
@@ -148,9 +151,15 @@ function ConversationTurn({
   );
 }
 
-export default function App() {
+export default function App({ host = defaultHost, onUnauthenticated }: { host?: HostAdapter; onUnauthenticated?: () => void } = {}) {
   const [state, dispatch] = useReducer(applyEvent, initialState);
   const [input, setInput] = useState("");
+  const drafts = useRef(new Map<string, string>());
+  const inputSession = useRef<string | null>(null);
+  const currentInput = useRef(input);
+  currentInput.current = input;
+  const [drawer, setDrawer] = useState<"sessions" | "info" | null>(null);
+  const [manualCopy, setManualCopy] = useState<string | null>(null);
   const [visibleCount, setVisibleCount] = useState(120);
   const [localError, setLocalError] = useState<string | null>(null);
   const [workspaceEditing, setWorkspaceEditing] = useState(false);
@@ -169,13 +178,10 @@ export default function App() {
   const lastWorkspace = useRef<string | null>(null);
   const prependHeight = useRef<number | null>(null);
 
+  useEffect(() => host.connect(dispatch), [host]);
   useEffect(() => {
-    const channel = new Channel<Event>();
-    channel.onmessage = (event) => dispatch(event);
-    void invoke("gui_connect", { onEvent: channel }).catch((error) => {
-      dispatch({ type: "startup_error", message: String(error) });
-    });
-  }, []);
+    if (state.connection === "unauthenticated") onUnauthenticated?.();
+  }, [state.connection, onUnauthenticated]);
 
   const sessionId = state.snapshot?.status.session_id ?? null;
   const workspace = state.snapshot?.status.workspace ?? null;
@@ -194,9 +200,16 @@ export default function App() {
     ));
   }, [displayedSessions]);
   useEffect(() => {
-    if (state.deleteReport?.new_session_id === sessionId) setInput("");
-    else setSelectedSessions(new Set());
-  }, [sessionId]);
+    const removed = new Set(state.deleteReport?.items.filter((item) => item.state === "deleted" || item.state === "cleanup_pending").map((item) => item.id) ?? []);
+    for (const id of removed) drafts.current.delete(id);
+    const previous = inputSession.current;
+    if (sessionId !== previous) {
+      if (previous && !removed.has(previous)) drafts.current.set(previous, currentInput.current);
+      inputSession.current = sessionId;
+      setInput(sessionId ? drafts.current.get(sessionId) ?? "" : "");
+      if (state.deleteReport?.new_session_id !== sessionId) setSelectedSessions(new Set());
+    }
+  }, [sessionId, state.deleteReport]);
   useEffect(() => {
     if (sessionId !== lastSession.current) {
       followBottom.current = true;
@@ -242,10 +255,12 @@ export default function App() {
       current.current.pending ||
       current.current.closing ||
       current.current.startupError ||
-      current.current.authorization
+      current.current.authorization ||
+      current.current.connection !== "connected"
     )
       return;
-    const pending: Pending = { id: nextRequest.current++, line: line.trim() };
+    const submittedSession = inputSession.current;
+    const pending: Pending = { id: nextRequest.current++, line: line.trim(), local: true };
     current.current = {
       ...current.current,
       pending,
@@ -259,10 +274,12 @@ export default function App() {
     }
     setLocalError(null);
     try {
-      await invoke("gui_submit", { requestId: pending.id, line: pending.line });
-      if (clearComposer) setInput("");
+      await host.submit({ requestId: pending.id, line: pending.line, revision: pending.line.startsWith("/delete --yes ") ? (current.current.deleteRevision ?? current.current.snapshot?.revision) : current.current.snapshot?.revision });
+      if (clearComposer && submittedSession) {
+        drafts.current.delete(submittedSession);
+        if (inputSession.current === submittedSession) setInput("");
+      }
     } catch (error) {
-      current.current = { ...current.current, pending: null };
       dispatch({
         type: "submit_failed",
         request_id: pending.id,
@@ -276,7 +293,7 @@ export default function App() {
     const request = current.current.authorization;
     if (!request) return;
     try {
-      await invoke("gui_authorize", { id: request.id, allowed });
+      await host.authorize(request.id, allowed);
     } catch (error) {
       setLocalError(String(error));
     }
@@ -286,11 +303,7 @@ export default function App() {
   async function browseWorkspace() {
     setLocalError(null);
     try {
-      const selected = await open({
-        directory: true,
-        multiple: false,
-        defaultPath: workspaceInput || status?.workspace,
-      });
+      const selected = await host.pickWorkspace?.(workspaceInput || status?.workspace);
       if (typeof selected === "string") setWorkspaceInput(selected);
     } catch (error) {
       setLocalError(String(error));
@@ -300,7 +313,7 @@ export default function App() {
   async function retryClose() {
     dispatch({ type: "closing" });
     try {
-      await getCurrentWindow().close();
+      await host.close(current.current.snapshot?.revision);
     } catch (error) {
       setLocalError(String(error));
     }
@@ -315,7 +328,8 @@ export default function App() {
     !!state.pending ||
     state.closing ||
     !!state.startupError ||
-    !!state.authorization;
+    !!state.authorization ||
+    state.connection !== "connected";
   const disabled = operationBusy || !!state.deleteConfirmation;
   const contextPercent = status
     ? Math.min(
@@ -339,16 +353,25 @@ export default function App() {
     });
   }
 
+  async function copy(text: string) {
+    try { await host.copy(text); }
+    catch (error) { if (host.kind === "web") setManualCopy(text); else throw error; }
+  }
+
   return (
-    <div className="app-shell">
+    <CopyContext.Provider value={copy}>
+    <div className={`app-shell ${drawer ? `drawer-${drawer}` : ""}`}>
+      {drawer && <button className="drawer-shade" aria-label="关闭面板" onClick={() => setDrawer(null)} />}
+      {state.connection === "exited" && <div className="modal-backdrop"><div className="modal"><h2>已离开工作区</h2><p>共享服务继续运行。重新连接可恢复最新会话。</p><button className="primary" onClick={() => location.reload()}>重新连接</button></div></div>}
       <aside className="sidebar">
+        {drawer === "sessions" && <button className="drawer-close" onClick={() => setDrawer(null)}>关闭会话面板</button>}
         <div className="brand">
           <div className="brand-mark">
             g<span>·</span>
           </div>
           <div>
             <strong>geer-agent</strong>
-            <small>Desktop workspace</small>
+            <small>{host.kind === "web" ? "Shared workspace" : "Desktop workspace"}</small>
           </div>
         </div>
         <div className="workspace-card">
@@ -376,9 +399,7 @@ export default function App() {
                 onChange={(event) => setWorkspaceInput(event.target.value)}
               />
               <div className="workspace-actions">
-                <button disabled={disabled} onClick={() => void browseWorkspace()}>
-                  浏览
-                </button>
+                {host.pickWorkspace ? <button disabled={disabled} onClick={() => void browseWorkspace()}>浏览</button> : <small>服务器目录路径</small>}
                 <button
                   className="workspace-confirm"
                   disabled={disabled || !workspaceInput.trim()}
@@ -533,20 +554,22 @@ export default function App() {
           {state.startupError
             ? "启动失败"
             : state.snapshot
-              ? "本地运行"
+              ? (host.kind === "web" ? (state.connection === "connected" ? "已连接共享服务" : "连接中断 · 正在同步") : "本地运行")
               : "正在连接"}
         </div>
       </aside>
 
       <main className="main-panel">
         <header className="topbar">
-          <div>
+          <button className="sessions-toggle" aria-label="会话面板" aria-expanded={drawer === "sessions"} onClick={() => setDrawer(drawer === "sessions" ? null : "sessions")}>☰</button>
+          <div className="topbar-title">
             <strong title={status?.session_id}>{status?.session_title ?? "对话"}</strong>
             <span className="session-id" title={status?.session_id}>
               {status ? shortId(status.session_id) : "初始化中"}
             </span>
           </div>
           <div className="top-actions">
+            <button className="info-toggle" aria-label="状态面板" aria-expanded={drawer === "info"} onClick={() => setDrawer(drawer === "info" ? null : "info")}>状态</button>
             <button disabled={disabled} onClick={() => void submit("/compact")}>
               压缩
             </button>
@@ -566,6 +589,7 @@ export default function App() {
           </div>
         ) : (
           <>
+            {host.kind === "web" && state.connection !== "connected" && state.connection !== "exited" && <div className="connection-banner" role="status">连接已中断，正在恢复状态；未确认的操作不会自动重发。</div>}
             <div
               className="feed"
               ref={stream}
@@ -690,6 +714,7 @@ export default function App() {
       </main>
 
       <aside className="info-panel">
+        {drawer === "info" && <button className="drawer-close" onClick={() => setDrawer(null)}>关闭状态面板</button>}
         <div className="section-title">运行状态</div>
         <div className="info-card">
           <small>模型</small>
@@ -730,6 +755,11 @@ export default function App() {
         </div>
       </aside>
 
+      {manualCopy !== null && <div className="modal-backdrop"><div className="modal" role="dialog" aria-modal="true" aria-label="手动复制">
+        <h2>复制代码</h2><p>当前浏览器无法自动复制，请选择下方文本后复制。</p>
+        <textarea aria-label="待复制代码" className="manual-copy" readOnly value={manualCopy} onFocus={(event) => event.currentTarget.select()} ref={(node) => node?.focus()} />
+        <div className="modal-actions"><button className="secondary" onClick={() => setManualCopy(null)}>完成</button></div>
+      </div></div>}
       {state.authorization && (
         <div className="modal-backdrop">
           <div
@@ -838,7 +868,7 @@ export default function App() {
               </button>
               <button
                 className="secondary"
-                onClick={() => void invoke("gui_force_close")}
+                onClick={() => void host.forceClose()}
               >
                 仍然退出
               </button>
@@ -855,5 +885,6 @@ export default function App() {
         <div className="closing-overlay">正在等待当前操作完成并保存会话…</div>
       )}
     </div>
+    </CopyContext.Provider>
   );
 }

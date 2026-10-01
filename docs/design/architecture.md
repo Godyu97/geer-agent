@@ -1,12 +1,12 @@
 # geer-agent 技术架构与优化方案
 
-本文梳理当前项目的模块职责、运行流程和依赖边界，并记录 REPL 与 UI 分层重构。现在文本界面位于 `ui/repl`，只负责输入、渲染与交互确认；三种 UI 共用 `interaction::execute` 执行消息和会话命令。Agent 继续实现会话能力与模型/工具编排，Provider 负责协议交互。
+本文梳理当前项目的模块职责、运行流程和依赖边界，并记录 REPL 与 UI 分层重构。现在文本界面位于 `ui/repl`，只负责输入、渲染与交互确认；四种 UI 共用 `interaction::execute` 执行消息和会话命令。Agent 继续实现会话能力与模型/工具编排，Provider 负责协议交互。
 
 原顶层 REPL 没有自己的模型循环，但仍直接分派新建、保存、压缩、打开、workspace 和删除等 Session 操作；TUI/GUI 各自重复这套逻辑。本次抽取的是这些共用操作，并将终端授权输入迁入 UI。正文、工具进度、重试和压缩通知仍使用现有字符串回调，结构化模型事件列为后续优化。
 
 ## 分析范围与依据
 
-- 分析日期：2026 年 9 月 30 日。
+- 初版分析：2026 年 9 月 30 日；GUI/Web 接入更新：2026 年 10 月 1 日。
 - 依据：当前工作区源码、依赖清单、已有测试与相关 OpenSpec 设计；本次重构从 HEAD `8482deb` 开始。
 - 已实施范围：[centralize-ui-session-commands](/home/lihongyu/projects/geer-agent/openspec/changes/centralize-ui-session-commands/design.md)，使用 `skip_specs`，沿用当前行为契约。
 - 验证：共用执行单元测试、三种界面相关回归与受限构建检查，具体记录见文末。
@@ -24,11 +24,13 @@
 | 模型接口 | async-openai，Responses 与 Chat Completions | 访问用户配置的 OpenAI 兼容端点，解析流式正文、工具调用和用量 |
 | 文本界面 | 标准输入输出与 ANSI 颜色 | 按行输入、命令处理、流式输出和管道兼容 |
 | 全屏终端 | Ratatui 与 Crossterm | 键盘事件、布局、颜色、滚动和终端恢复 |
-| 桌面界面 | 可选 Tauri 2，React 与 TypeScript，Vite | 窗口、Rust 桥接、前端状态与 Markdown 展示 |
+| 桌面界面 | 可选 Tauri 2 | 窗口、IPC、目录选择和剪贴板 |
+| 浏览器界面 | 可选 Axum 0.8、include_dir、WebSocket | HTTP 监听、口令与凭证、同源校验、资源与事件传输 |
+| 共用图形前端 | React/TypeScript、Vite/tsc/Vitest，Bun 1.4.2 管理 | 一套交互、状态、协议、Mocha 样式，构建时选择宿主 |
 | 数据持久化 | SeaORM 与 MongoDB driver | SQLite、PostgreSQL、MySQL、MongoDB 的会话与 Trace 适配 |
 | 配置与数据 | dotenvy、Serde、serde_json、UUID | 环境配置、快照、事件与标识符 |
 
-依赖依据见 [Cargo.toml](/home/lihongyu/projects/geer-agent/Cargo.toml) 与 [GUI 前端依赖清单](/home/lihongyu/projects/geer-agent/src/ui/gui/frontend/package.json)。GUI 依赖由 `gui` feature 控制；`embed-env` 在编译时内嵌配置。数据库驱动目前属于默认 Rust 依赖，运行时关闭持久化不会移除它们的编译成本。
+依赖依据见 [Cargo.toml](/home/lihongyu/projects/geer-agent/Cargo.toml) 与 [共用前端依赖清单](/home/lihongyu/projects/geer-agent/src/ui/frontend/package.json)。GUI 依赖由 `gui` feature 控制；`embed-env` 在编译时内嵌配置。数据库驱动目前属于默认 Rust 依赖，运行时关闭持久化不会移除它们的编译成本。
 
 ### 启动流程
 
@@ -41,10 +43,42 @@
 | `repl` | 文本 REPL |
 | `tui` | 要求 stdin 与 stdout 均为终端，否则报错 |
 | `gui` | 要求编译时启用 `gui` feature，否则提示构建方式 |
+| `web` | 要求 `web` feature，监听 0.0.0.0:9928（端口可 env 配置） |
 
-终端路径在 `ui::run` 中创建 Tokio runtime 和 Agent，再调用具体界面；GUI 路径先进入 Tauri 事件循环，在独立工作线程内创建 runtime 和 Agent。
+终端路径在 `ui::run` 中创建 Tokio runtime 和 Agent，再调用具体界面；GUI 路径进入 Tauri，Web 路径创建 HTTP 服务；两者在 `ui/app` 独立工作线程内创建 runtime 和 Agent。
 
 这里的 `ui::run` 同时承担启动组合职责：它决定用哪个界面，并连接会话对象与界面回调。这样的组合点可以引用 `agent`；业务模块仍不应引用具体 UI。
+
+## GUI / Web 接入与 React TS 复用（2026-10-01）
+
+本次增量见 [add-web-ui 设计](/home/lihongyu/projects/geer-agent/openspec/changes/add-web-ui/design.md)。终端继续借用 `interaction::Session`；两种图形宿主共用 `ui/app`，所有会话写操作仍交给 `interaction::execute`，没有第二个 Agent 或数据库模型。
+
+```mermaid
+flowchart LR
+    React["共用 React App / reducer / protocol / CSS"] --> Desktop["HostAdapter: desktop"]
+    React --> Browser["HostAdapter: web"]
+    Desktop --> IPC["ui/gui: Tauri IPC / 窗口"]
+    Browser --> HTTP["ui/web: Cookie / Origin / HTTP / WS"]
+    IPC --> Runtime["ui/app: 串行命令 / 工作线程"]
+    HTTP --> Runtime
+    Runtime --> Execute["interaction::execute → Agent"]
+    Runtime --> Hub["完整快照 + 当前流 + 授权 + 20 条诊断"]
+    Hub --> IPC
+    Hub --> HTTP
+    HTTP --> Gate["独立授权应答 / 首答生效"]
+    IPC --> Gate
+    Gate --> Runtime
+```
+
+Agent 含非 Send 确认回调，只在工作线程创建和使用。UI/网络跨线程发送拥有所有权的字符串和快照。授权回复使用独立 Gate，能唤醒正在等待的模型/工具操作；不会排在同一工作队列后面。
+
+事件中心在同一锁内注册客户端并发送缓存完整状态，连接恢复无需等待被模型或授权占用的工作线程。每个操作有全局数字编号、UUID 和来源客户端，快照有递增 revision。忙碌提交立即拒绝，旧 revision 不能把消息写入另一端刚切换的会话。删除预览只发给来源端，Web 确认必须匹配原 UUID 集与修订号，任何后续操作使旧预览失效；GUI 的既有显式 --yes 命令保持兼容。
+
+Web 是单用户多浏览器：所有端共用当前会话/workspace，第一份有效授权回复生效；120 秒或全部端断线默认拒绝。每端 256 项有界队列，最多 16 个连接；慢端关闭后通过完整状态重连。输入限制 65536 字节，WS 消息/帧限制 512 KiB，Ping/Pong 15/45 秒。`/exit` 共用保存判定后只退出来源页面；Ctrl+C/SIGTERM 停接新命令、取消授权并等待当前操作和保存，失败非零退出。
+
+WebConfig 仅在选中 Web 时解析：固定 IPv4 全接口、默认 9928，`GEER_AGENT_WEB_PORT` 可改。`GEER_AGENT_WEB_TOKEN` 非空时固定，否则生成随机口令并只打印一次。登录换取内存随机凭证，Cookie 为 HttpOnly/SameSite=Strict；重启失效，POST 和 WS 核对 Origin/Host。模型密钥不传给浏览器。静态页面由 include_dir 嵌入二进制，可独立分发。
+
+**前端管理建议已落地：** [src/ui/frontend](/home/lihongyu/projects/geer-agent/src/ui/frontend/package.json) 是唯一包，只提交 bun.lock，Bun 冻结安装和 bun run 统一脚本。Vite 模式把 `@host` 编译为桌面或浏览器适配器，输出 dist/gui 与 dist/web；浏览器包没有 Tauri IPC。协议在 protocol.ts，纯 reducer 在 model.ts，App 与 CSS 共用；WebGate 只负责登录，宿主适配器只负责连接、提交、授权、复制和关闭。后续按交互能力拆组件即可，不建立两个 React 工程或提前抽发布库。草稿按会话 UUID 保留；375px 布局使用会话/状态抽屉，HTTP 剪贴板失败提供手动复制。
 
 ## 当前模块职责与协作关系
 
@@ -53,8 +87,11 @@
 | 模块 | 当前职责 | 关键边界 |
 | --- | --- | --- |
 | [config](/home/lihongyu/projects/geer-agent/src/config/mod.rs) | 配置查找与校验、模型/API/UI 选择、资源额度、跨平台路径辅助 | 不依赖其他业务模块；缺失必要配置会返回错误 |
-| [ui](/home/lihongyu/projects/geer-agent/src/ui/mod.rs) | 启动分派、REPL/TUI/GUI 的输入、确认、布局和展示 | 组合点创建 Agent 并注入各自授权回调；错误展示前缀由 UI helper 生成 |
+| [ui](/home/lihongyu/projects/geer-agent/src/ui/mod.rs) | 启动分派、REPL/TUI/GUI/Web 的输入、确认、布局和展示 | 组合点创建 Agent 并注入各自授权回调；错误展示前缀由 UI helper 生成 |
 | [ui/repl](/home/lihongyu/projects/geer-agent/src/ui/repl/mod.rs) | 文本提示符、逐行输入、流式输出、颜色、EOF 和终端确认 | 消息与会话操作委托 `interaction::execute`，不引用 `provider`、`agent` 或 `tools` |
+| [ui/app](/home/lihongyu/projects/geer-agent/src/ui/app/runtime.rs) | 共用图形工作线程、串行操作、事件缓存、授权与保存判定 | Agent 不跨线程；不依赖 Tauri/HTTP |
+| [ui/gui](/home/lihongyu/projects/geer-agent/src/ui/gui/bridge.rs) | 窗口与 IPC 生命周期 | 调用共用图形运行时 |
+| [ui/web](/home/lihongyu/projects/geer-agent/src/ui/web/mod.rs) | HTTP、WS、认证、资源与网络额度 | 不执行模型或会话业务 |
 | [interaction](/home/lihongyu/projects/geer-agent/src/interaction/mod.rs) | 会话契约、命令解析、共用命令执行、操作结果与错误、状态与用量、诊断缓冲 | 通过泛型 Session 调用业务；不创建 Agent，不含 Ratatui、Tauri 或 ANSI 类型 |
 | [agent](/home/lihongyu/projects/geer-agent/src/agent/mod.rs:410) | 实现会话契约，编排模型步骤、工具循环、预算、压缩和检查点 | 持有 Provider、Tools 和 SessionManager，不选择具体界面 |
 | [prompt](/home/lihongyu/projects/geer-agent/src/prompt/conversation.rs:24) | 系统提示、协议历史、轮次提交/回滚、压缩边界、快照和原始事件 | 持有模型上下文；目前还包含 GUI 历史展示投影 |
@@ -73,12 +110,15 @@ flowchart TD
     Main["main"] --> UI["ui::run<br/>配置与启动组合"]
     UI --> Repl["ui::repl<br/>文本界面"]
     UI --> Tui["ui::tui<br/>全屏终端"]
-    UI --> Gui["ui::gui<br/>窗口与工作线程"]
+    UI --> Gui["ui::gui<br/>Tauri 宿主"]
+    UI --> Web["ui::web<br/>HTTP/WS 宿主"]
+    Gui --> App["ui::app<br/>共用工作线程与事件缓存"]
+    Web --> App
     UI -->|"终端路径创建"| Agent["agent::Agent"]
-    Gui -->|"工作线程创建"| Agent
+    App -->|"工作线程创建"| Agent
     Repl --> Execute["interaction::execute<br/>消息与会话命令"]
     Tui --> Execute
-    Gui --> Execute
+    App --> Execute
     Execute -->|"interaction::Session"| Agent
     Agent --> Provider["provider<br/>单次模型步骤"]
     Agent --> Tools["tools<br/>授权与工具执行"]
@@ -94,7 +134,7 @@ flowchart TD
     DAO --> DB["会话与 Trace 数据库"]
 ```
 
-`interaction::Session` 是接口，`agent::Agent` 是它的实现。`execute` 到 Agent 的箭头表示运行时通过接口调用，不表示 interaction 导入具体 Agent。REPL/TUI 借用 Session；GUI bridge 在工作线程中持有 Agent，并读取历史与未保存状态。UI 需要的 status/session_entries 等只读数据仍可直接通过 Session 获取，写操作则共用 execute。
+`interaction::Session` 是接口，`agent::Agent` 是它的实现。`execute` 到 Agent 的箭头表示运行时通过接口调用，不表示 interaction 导入具体 Agent。REPL/TUI 借用 Session；`ui/app` 在工作线程中持有 Agent，GUI/Web bridge 只传输命令和事件，并读取历史与未保存状态。UI 需要的 status/session_entries 等只读数据仍可直接通过 Session 获取，写操作则共用 execute。
 
 ### 不能忽略的双向模块引用
 
@@ -192,7 +232,7 @@ REPL 是 Read–Eval–Print Loop，即读取输入、调用处理逻辑、打�
 | --- | --- | --- |
 | 读取一行输入、识别 EOF 与无效 UTF-8 | REPL | 文本 UI |
 | 把命令文本解析为 `Input` | interaction | 界面无关的命令语义 |
-| 把 Input 分派到消息、新建、保存、打开等操作 | interaction::execute | 三种 UI 共用的会话执行 |
+| 把 Input 分派到消息、新建、保存、打开等操作 | interaction::execute | 四种 UI 共用的会话执行 |
 | 实际执行消息和会话操作 | Agent 实现 Session | 业务编排 |
 | 发请求、解析模型流与工具调用 | Provider | 模型协议适配 |
 | 提示符、颜色、stdout/stderr、flush | REPL | 文本 UI |
@@ -222,7 +262,7 @@ REPL 中的循环是文本 UI 的控制流：读下一行、显示结果、确�
 | 预算收尾失败提示 | Agent | TUI 有专门前缀识别 |
 | `retry 1/5...` 等重试提示 | Responses Provider | 与正文共用回调，界面没有独立的重试类型 |
 
-对应实现见 [Agent 工具循环](/home/lihongyu/projects/geer-agent/src/agent/mod.rs:873)、[TUI 进度识别](/home/lihongyu/projects/geer-agent/src/ui/tui/mod.rs:560)、[GUI 工具进度识别](/home/lihongyu/projects/geer-agent/src/ui/gui/commands.rs:16) 和 [Responses 重试](/home/lihongyu/projects/geer-agent/src/provider/openai/responses.rs:130)。
+对应实现见 [Agent 工具循环](/home/lihongyu/projects/geer-agent/src/agent/mod.rs:873)、[TUI 进度识别](/home/lihongyu/projects/geer-agent/src/ui/tui/mod.rs:560)、[GUI 工具进度识别](/home/lihongyu/projects/geer-agent/src/ui/app/commands.rs:16) 和 [Responses 重试](/home/lihongyu/projects/geer-agent/src/provider/openai/responses.rs:130)。
 
 这是已经存在的展示耦合：改一句核心文案就可能改变 UI 分类；三个界面的分类范围也不一致。如果模型恰好在一次回调中输出同样的前缀或完整标记，也有被误判为进度的可能。GUI 对完整标记的校验更严格，但仍然需要从字符串猜测来源。
 
@@ -279,7 +319,10 @@ src/
       color.rs             # 文本界面私有颜色
       authorization.rs     # 从 Tools 移入的终端授权输入
     tui/                   # 保留现有实现
-    gui/                   # 保留现有桥接与前端
+    app/                   # 共用图形会话运行时
+    gui/                   # Tauri 宿主
+    web/                   # HTTP/WS 宿主
+    frontend/              # 唯一 Bun + React TS 包
   agent/                   # 保留业务入口与已有 guard
   provider/                # 保留两种 API
   tools/                   # 保留工具注册、验证、执行和授权缓存
@@ -391,8 +434,8 @@ Session 可先把数据类型与运行管理分开，DAO 只引用数据契约�
 | 阶段 | 一个可运行的切片 | 验收重点 |
 | --- | --- | --- |
 | 已完成 | 共用 execute 与操作结果，整体迁入 `ui/repl`，CLI 授权移入 UI | 三种界面复用同一 Session；命令、流式、EOF、删除与授权保持原样 |
-| 后续 1 | 替换混合字符串回调，贯通 Provider → Agent → 三种 UI 的语义事件 | 模型正文不被当作工具标记；工具、重试、压缩和收尾通知各自分类 |
-| 后续 2 | 选一个会话操作返回结构化报告，再整理历史投影 | 三种界面消费同一业务数据；旧存档、压缩、待补写、删除与关闭语义不回归 |
+| 后续 1 | 替换混合字符串回调，贯通 Provider → Agent → 四种 UI 的语义事件 | 模型正文不被当作工具标记；工具、重试、压缩和收尾通知各自分类 |
+| 后续 2 | 选一个会话操作返回结构化报告，再整理历史投影 | 四种界面消费同一业务数据；旧存档、压缩、待补写、删除与关闭语义不回归 |
 | 后续 3 | 按已明确的职责提取 Agent/Session 子模块 | 普通启动和两种 API 路径仍可运行；缩小阅读与修改范围 |
 
 后续每个切片独立规划、实现与验证；各会话报告也应分次迁移。
@@ -412,7 +455,7 @@ Session 可先把数据类型与运行管理分开，DAO 只引用数据契约�
 
 ### 检查入口
 
-先 fmt，再按改动选择受限测试，最后 clippy；收工执行 `make check`。所有测试通过 [Makefile](/home/lihongyu/projects/geer-agent/Makefile) 和受限入口运行，不裸跑测试二进制、Cargo 测试或 npm 测试：
+先 fmt，再按改动选择受限测试，最后 clippy；收工执行 `make check`。所有测试通过 [Makefile](/home/lihongyu/projects/geer-agent/Makefile) 和受限入口运行，不裸跑测试二进制、Cargo 测试或 Bun 前端测试：
 
 ```sh
 make fmt
@@ -442,7 +485,7 @@ Day12 `search-fetch` 增量通过最终 `make check`（231 项 Rust 测试，1 �
 
 ## 保留的设计与后续文档维护
 
-继续保留单一业务实现、两种模型协议、按会话拥有 Prompt、GUI 工作线程和现有工具注册表。REPL 可以作为文本 UI 名称继续使用，无需因名称歧义删除这个运行模式。泛型 Session 与回调已适合当前单线程节奏，不必改成对象安全的 `dyn Session`。
+继续保留单一业务实现、两种模型协议、按会话拥有 Prompt、共用图形工作线程和现有工具注册表。REPL 可以作为文本 UI 名称继续使用，无需因名称歧义删除这个运行模式。泛型 Session 与回调已适合当前单线程节奏，不必改成对象安全的 `dyn Session`。
 
 本次边界调整不需要新的业务分层目录、依赖注入容器、全局主题框架或事件总线。数据库依赖的编译成本可以在有测量数据和明确需求时单独评估，不在 UI 重构中移除现有后端。
 
