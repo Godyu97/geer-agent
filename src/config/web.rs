@@ -28,7 +28,7 @@ impl WebConfig {
 
     fn parse(port: Option<&str>, token: Option<&str>) -> io::Result<Self> {
         let port = match port {
-            None => 9928,
+            None => 8827,
             Some(value) => value
                 .trim()
                 .parse::<u16>()
@@ -59,7 +59,7 @@ mod tests {
     fn defaults_fixed_token_and_port_validation() {
         let first = WebConfig::parse(None, None).unwrap();
         let second = WebConfig::parse(None, Some("  ")).unwrap();
-        assert_eq!(first.port, 9928);
+        assert_eq!(first.port, 8827);
         assert!(first.generated && second.generated);
         assert_ne!(first.token, second.token);
         let fixed = WebConfig::parse(Some("9930"), Some("secret")).unwrap();

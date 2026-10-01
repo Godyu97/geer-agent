@@ -46,13 +46,16 @@ pub(crate) fn run() -> Result<(), Box<dyn Error>> {
         UiMode::Gui => gui::run(None),
         #[cfg(not(feature = "gui"))]
         UiMode::Gui => Err(io::Error::other(
-            "当前构建未包含 GUI；请先构建前端，再用 cargo run --features gui 启动。",
+            "当前构建未包含 GUI；请用 make build 构建通用程序，再设置 GEER_AGENT_UI=gui 启动。",
         )
         .into()),
         #[cfg(feature = "web")]
         UiMode::Web => web::run(),
         #[cfg(not(feature = "web"))]
-        UiMode::Web => Err(io::Error::other("当前构建未包含 Web UI；请用 make web 启动。").into()),
+        UiMode::Web => Err(io::Error::other(
+            "当前构建未包含 Web UI；请用 make build 构建通用程序，再设置 GEER_AGENT_UI=web 启动。",
+        )
+        .into()),
         UiMode::Tui if !terminal => {
             Err(io::Error::other("TUI 需要交互终端，请改用 GEER_AGENT_UI=repl。").into())
         }

@@ -14,6 +14,36 @@ cargo run
 
 `GEER_AGENT_UI=auto|gui|web|tui|repl` 可写在上述位置的 `.env`，进程环境变量优先。默认 `auto` 在交互终端使用 TUI，在输入或输出接管道时使用文本 REPL；显式 `tui` 要求交互终端。`gui` / `web` 分别要求 Cargo 的 `gui` / `web` feature，否则程序会提示构建方式。四种界面继续使用同一个 `geer-agent` 可执行文件。
 
+## 统一构建与界面选择
+
+日常使用三个 Make 入口，均包含 GUI、Web、TUI 和 REPL，自动安装前端依赖并构建两种静态页面：
+
+| 命令 | Cargo 调用 | 结果 |
+| --- | --- | --- |
+| `make build` | `cargo build --features gui,web` | 仅构建 debug，产物在 `target/debug/` |
+| `make release` | `cargo build --release --features gui,web` | 仅构建 release，产物在 `target/release/` |
+| `make run` | `cargo run --features gui,web` | 构建 debug 并启动 |
+
+Cargo 没有 `cargo release` 命令，release 构建使用 `cargo build --release`。两种 profile 的程序都名为 `geer-agent`（Windows 为 `geer-agent.exe`），支持同样的四种界面。
+
+**启动界面由 ENV 决定，构建时不固定 UI。** 可以在程序选用的 `.env` 中设置 `GEER_AGENT_UI=gui|web|tui|repl|auto`；进程环境优先，同一个产物切换 UI 无需重新编译。
+
+```sh
+GEER_AGENT_UI=gui make run
+GEER_AGENT_UI=web make run
+GEER_AGENT_UI=tui ./target/release/geer-agent
+GEER_AGENT_UI=repl ./target/release/geer-agent
+```
+
+Windows PowerShell：
+
+```powershell
+$env:GEER_AGENT_UI = 'gui' # 可换为 web、tui、repl 或 auto
+.\target\release\geer-agent.exe
+```
+
+通用构建需要 Bun、Node 和下文的 GUI 原生依赖。仅需终端时直接 `cargo build` / `cargo run`，无需前端或 GUI 原生依赖；仅需 Web 时先 `make frontend-build`，再 `cargo build --features web`。精简构建若选择未编入的 UI，会明确报错。
+
 ## 桌面 GUI（可选）
 
 GUI 使用 Tauri 2 + React/TypeScript，与 Web 共用前端。开发需要 Bun 1.4.2 和兼容 Vite/tsc/Vitest 的 Node.js；依赖和脚本入口统一使用 Bun。先构建静态前端，再启用 Rust feature：
@@ -28,7 +58,9 @@ cargo run --features gui
 
 在程序实际选用的 `.env` 中设置 `GEER_AGENT_UI=gui` 后，上述 `cargo run` 会打开窗口。未设置时仍按 `auto` 选择终端界面；也可以执行 `GEER_AGENT_UI=gui cargo run --features gui` 临时启动。GUI 提供完整会话记录、侧栏会话切换、Markdown 回答、流式输出、用量与工具授权。现有 `/help`、`/new`、`/open`、`/save`、`/compact`、`/sessions`、`/exit` 等命令可直接在输入框使用。Enter 发送，Shift+Enter 换行；授权默认拒绝。关闭窗口时等待正在执行的请求并补写会话，保存失败时可重试、返回或明确退出。若持久化已关闭或数据库不可用，关闭含有对话的仅内存会话前会提示数据无法保存。
 
-日常桌面使用请先执行 `make gui-build`，再直接打开 `target/release/geer-agent.exe`（Windows）或 `target/release/geer-agent`（Linux）。该构建启用 `desktop-gui`，默认 `auto` 直接进入 GUI；Windows 从启动起不创建控制台，后台版本探测、工具执行与超时清理也不弹出控制台。`GEER_AGENT_UI=gui` 同样有效，配置错误在窗口内显示。桌面构建只支持 GUI；需要 TUI/REPL 时使用普通 `make run` 或不含 `desktop-gui` 的构建。`make gui` / `cargo run --features gui` 仍是从已有终端运行的开发入口，调用者的终端会继续保留。
+通用程序通过 `GEER_AGENT_UI=gui` 启动桌面窗口，并保留 TUI/REPL 和 Web 选择。Windows 通用程序保留控制台子系统，从已有终端运行时终端会保留；双击通用程序可能出现控制台窗口。
+
+如需 Windows 双击完全无控制台，可在 `make frontend-build` 后执行 `cargo build --release --features desktop-gui`，再打开对应 release 产物。这个专用构建默认进入 GUI，只支持 GUI，配置错误在窗口显示；后台工具执行不弹出控制台。它会替换同一路径的通用 release 程序，切回通用版本需要重新 `make release`。
 
 Linux 桌面入口模板位于 `src/ui/gui/geer-agent.desktop`：把 `Exec` 改为桌面可执行文件的实际绝对路径，保留双引号及 `Terminal=false`，然后保存到 `~/.local/share/applications/geer-agent.desktop`，从应用菜单打开。启动器直接运行二进制，不调用 Cargo 或终端模拟器。配置仍按既有 `.env` 查找顺序加载，无需以项目目录作为启动工作目录。原因、技术方案及验收步骤见 [GUI 启动优化方案](doc/plan/2026-10-01-gui-launch.md)。
 
@@ -39,14 +71,15 @@ Linux 需要 WebKitGTK 4.1 等 Tauri 开发依赖。Fedora 按 [Tauri 官方前�
 ## 浏览器 Web UI（可选）
 
 ```sh
-make web
-# 修改监听端口；默认 9928
-GEER_AGENT_WEB_PORT=9930 make web
-# 构建包含静态页面的独立 release 二进制
-make web-build
+GEER_AGENT_UI=web make run
+# 修改监听端口；默认 8827
+GEER_AGENT_UI=web GEER_AGENT_WEB_PORT=8828 make run
+# 构建通用 release 程序，再以 Web 模式启动
+make release
+GEER_AGENT_UI=web ./target/release/geer-agent
 ```
 
-`GEER_AGENT_UI=web` 选择独立 Web 宿主；监听固定为 `0.0.0.0`，端口由 `GEER_AGENT_WEB_PORT` 配置，范围 1–65535。打开启动输出中的本机地址，或从手机访问服务器的局域网 IP。端口非法、被占用、缺少模型配置会明确退出。Web 不依赖 GTK/WebKitGTK；默认 Cargo 构建也不需要前端。
+`GEER_AGENT_UI=web` 选择独立 Web 宿主；监听固定为 `0.0.0.0`，端口由 `GEER_AGENT_WEB_PORT` 配置，范围 1–65535。打开启动输出中的本机地址，或从手机访问服务器的局域网 IP。端口非法、被占用、缺少模型配置会明确退出。仅启用 web 的精简构建不依赖 GTK/WebKitGTK；Make 通用构建包含 GUI，因此需要 GUI 原生依赖。默认 Cargo 构建不需要前端。
 
 未设置或留空 `GEER_AGENT_WEB_TOKEN` 时，启动会生成并显示一次临时访问口令；在 `.env` 或进程环境中设置非空值可固定口令，固定口令不打印。登录凭证存于本进程内存，通过 HttpOnly/SameSite Cookie 传递，重启后需要重新登录。写请求和 WebSocket 校验同源；模型密钥留在 Rust 服务端。
 
@@ -68,13 +101,12 @@ Web 保留 GUI 的聊天、Markdown、完整历史、工具进度、用量、压
 ```sh
 make frontend-check
 make frontend-test                 # 受限 Vitest，共用 GUI/Web 回归
-make gui-frontend                  # bun run build:gui
-make web-frontend                  # bun run build:web
+make frontend-build                # bun run build:gui，再 build:web
 make web-test                      # 前端 + 受限 Rust Web 测试
 make clippy-all                    # 两种前端 + gui,web Rust 检查
 ```
 
-旧 `gui-deps` / `gui-check` / `gui-test` 入口仍可使用。`BUN=/absolute/path/to/bun` 可覆盖 Make 的 Bun 路径。UI 接入逻辑和维护边界见 [架构文档](docs/design/architecture.md)。
+Make 不维护旧 GUI/Web 专用构建和运行别名。`BUN=/absolute/path/to/bun` 可覆盖 Make 的 Bun 路径。UI 接入逻辑和维护边界见 [架构文档](docs/design/architecture.md)。
 
 ## 终端界面
 
@@ -167,10 +199,10 @@ cargo build --release --features embed-env
 
 ```sh
 make help      # 列出目标
-make check     # fmt -> test-safety -> test -> clippy
-make run       # 终端 TUI / REPL
-make gui       # 构建前端并以 GUI feature 运行
-make gui-build # 构建日常桌面使用的 release 产物
+make build     # 全界面 debug 构建，不启动
+make release   # 全界面 release 构建，不启动
+make run       # debug 构建并启动，由 GEER_AGENT_UI 选择界面
+make check     # fmt -> test-safety -> test -> clippy（默认终端配置）
 ```
 
 ## 测试与系统安全
@@ -187,15 +219,15 @@ make test TEST_ARGS='--test process_safety'
 make check
 
 # GUI Rust 测试先准备前端产物；前端测试也走受限入口。
-./scripts/test-safe.sh make gui-frontend
-make test FEATURES=gui
-make test FEATURES=desktop-gui
-make gui-test
+./scripts/test-safe.sh make frontend-build
+make test FEATURES=gui,web
+make clippy-all
+make frontend-test
 ```
 
 桌面构建的测试覆盖共用业务与模式选择；依赖 REPL 输入输出的进程集成测试仅在普通构建中运行，由 `make check` 验证。
 
-`make test`、`make gui-test`、`make clippy` 和 `make clippy-all` 通过 `scripts/test-safe.sh` 启动独立的 systemd 用户服务。Cargo 编译、测试程序与后代进程都归入本次服务的 cgroup；前端测试安装依赖和 GUI clippy 准备前端的阶段也先进入受限服务。入口检查内核实际的内存、swap、任务限制和临时目录挂载，缺少 systemd 用户服务、cgroup v2、有效限制或临时目录隔离时直接失败，不自动执行无约束测试。`make check` 按 fmt → test-safety → test → clippy 顺序执行，即使传入 `make -j` 也保持这个顺序。
+`make test`、`make frontend-test`、`make clippy` 和 `make clippy-all` 通过 `scripts/test-safe.sh` 启动独立的 systemd 用户服务。Cargo 编译、测试程序与后代进程都归入本次服务的 cgroup；前端测试安装依赖和全界面 clippy 准备前端的阶段也先进入受限服务。入口检查内核实际的内存、swap、任务限制和临时目录挂载，缺少 systemd 用户服务、cgroup v2、有效限制或临时目录隔离时直接失败，不自动执行无约束测试。`make check` 按 fmt → test-safety → test → clippy 顺序执行，即使传入 `make -j` 也保持这个顺序。
 
 每个服务设置 `PrivateTmp=disconnected`，使用独立 tmpfs 中的 `/tmp` 和 `/var/tmp`，并固定 `TMPDIR`、`TMP`、`TEMP` 为 `/tmp`。标准库临时文件和直接写入 `/tmp` 的测试都使用本轮私有目录，不向宿主 `/tmp` 累积文件。入口比较宿主与服务内目录的设备号，并确认文件系统为 tmpfs，实际隔离不成立就拒绝启动测试。主机需要支持此选项的 systemd 和可用的用户/挂载命名空间。
 

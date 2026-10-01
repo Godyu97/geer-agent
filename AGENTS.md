@@ -78,7 +78,7 @@ make test
 make clippy
 ```
 
-根目录 `Makefile` 是这些命令的入口：`make help` 查看目标；收工用 `make check`（`fmt` → `test-safety` → `test` → `clippy`，顺序执行）。`test-safety` 需要 Python 3 标准库。测试与 clippy 使用独立受限服务，详见下节与 `README.md`。默认不加 `gui` / `embed-env`；GUI 用 `make gui`，Web 用 `make web`，内嵌 `.env` 用 `make embed`。
+根目录 `Makefile` 是这些命令的入口：`make help` 查看目标；收工用 `make check`（`fmt` → `test-safety` → `test` → `clippy`，顺序执行）。`test-safety` 需要 Python 3 标准库。测试与 clippy 使用独立受限服务，详见下节与 `README.md`。Make 的 `build` / `release` / `run` 默认编入 `gui,web` 并准备两种静态前端，启动时通过 `GEER_AGENT_UI` 选择 GUI/Web/TUI/REPL；前两者只构建 debug/release。直接 Cargo 默认仍是轻量终端配置，test/clippy 默认同样不加 feature。特殊 `embed-env` / `desktop-gui` 构建直接使用 Cargo，不维护旧 GUI/Web Make 别名。
 
 改了代码再收工时：先 `fmt`，再相关 `test`，再 `clippy`。学习项目不要开 `-D warnings` 当门禁，但新引入的 clippy 警告要处理，不要留 `todo!()` / 无故 `unwrap`。
 
@@ -88,7 +88,7 @@ make clippy
 
 2026 年 9 月 Fedora 曾发生全局 OOM 并终止 ChatGPT/Codex。已证实缺失命令测试的空 `PATH` 与 Bash 远程启动文件可触发 Fedora 缺失命令处理中的递归 fork；历史证据不能证明每次 OOM 都来自同一测试。把子进程、线程、输出和编译峰值都纳入测试安全范围。
 
-- **先隔离再运行**：开发主机上测试必须用 `make test` / `make gui-test` / `make check` 或 `scripts/test-safe.sh`。禁止裸跑 `cargo test`、`bun run test`、测试二进制或未受限的危险复现。脚本默认独立 cgroup：`MemoryMax=4G`、`MemorySwapMax=0`、`TasksMax=256`、`RuntimeMaxSec=10min`、`TimeoutStopSec=5s`、`KillMode=control-group`、`OOMPolicy=kill`；编译默认 2 并行、Rust 测试默认 1 线程，Vitest 固定 1 worker 且关闭文件并行。必须确认实际限制有效；入口失败不得绕过。没有 systemd/cgroup 的环境先提供等效隔离。
+- **先隔离再运行**：开发主机上测试必须用 `make test` / `make frontend-test` / `make check` 或 `scripts/test-safe.sh`。禁止裸跑 `cargo test`、`bun run test`、测试二进制或未受限的危险复现。脚本默认独立 cgroup：`MemoryMax=4G`、`MemorySwapMax=0`、`TasksMax=256`、`RuntimeMaxSec=10min`、`TimeoutStopSec=5s`、`KillMode=control-group`、`OOMPolicy=kill`；编译默认 2 并行、Rust 测试默认 1 线程，Vitest 固定 1 worker 且关闭文件并行。必须确认实际限制有效；入口失败不得绕过。没有 systemd/cgroup 的环境先提供等效隔离。
 - **先单项再完整**：Shell、PATH、超时与清理代码修改后，先运行 `make test-safety`，再受限运行缺失命令单项和 `process_safety` 回归，最后跑完整检查。`test-safety` 的探针必须各自受限且顺序执行；组内 OOM 仅允许固定上界的分配。不得执行无约束递归来证明修复，也不要并发运行多组完整测试叠加额度。
 - **隔离启动环境**：直接 Bash 测试探针必须带 `--noprofile --norc`，清除 `BASH_ENV ENV SSH_CLIENT SSH_CONNECTION SSH_TTY`。清空 `PATH` 只对受控子进程生效；保留 `GEER_AGENT_SCRIPT` / `GEER_AGENT_ARG_*` 等工具内部参数，禁止用 `env -i` 误删。哨兵启动文件只建在测试临时目录，不读取或改写宿主 `~/.bashrc`、`/etc/profile.d/`。
 - **标准输入明确**：无输入时 `stdin(Stdio::null())`；有 REPL 输入时使用管道、限时写入并显式 EOF。不得把远程网络连接或交互终端继承给测试探针。
@@ -115,7 +115,7 @@ make clippy
 - 安装用 `bun install --frozen-lockfile --concurrent-scripts 1`；不强制替换 Vite、tsc、Vitest 的 Node 运行方式。
 - 业务交互、reducer、协议类型、样式在共用包中修改；宿主能力放在 `hosts/desktop.ts` / `hosts/web.ts`，通过 HostAdapter 注入，不复制第二套 App。
 - Rust `ui/app` 共用 Agent 工作线程、展示命令、事件缓存、授权和保存判定。`ui/gui` 只保留 Tauri/窗口，`ui/web` 只保留认证/HTTP/WS；图形层仍通过 `interaction::execute` 写会话。
-- 前端测试用 `make frontend-test`；Web Rust 测试用 `make web-test` 或构建 Web 前端后 `make test FEATURES=web`。默认 Cargo 不依赖静态前端；可选 UI 构建先运行对应 frontend 目标。
+- 前端测试用 `make frontend-test`；Web Rust 测试用 `make web-test` 或构建 Web 前端后 `make test FEATURES=web`。默认 Cargo 不依赖静态前端；可选 UI 的直接 Cargo 构建先运行 `make frontend-build`；Make 通用构建自动准备。
 
 ## Git 工作流
 

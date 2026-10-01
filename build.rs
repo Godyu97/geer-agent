@@ -5,7 +5,7 @@ fn main() {
         println!("cargo:rerun-if-changed=src/ui/frontend/dist/web");
         assert!(
             std::path::Path::new("src/ui/frontend/dist/web/index.html").is_file(),
-            "Web 前端不存在；请先执行 make web-frontend，再用 --features web 构建。"
+            "Web 前端不存在；请先执行 make frontend-build，再用 --features web 构建。"
         );
     }
     #[cfg(feature = "gui")]
@@ -16,5 +16,5 @@ fn main() {
             .config_path("src/ui/gui/tauri.conf.json")
             .capabilities_path_pattern("src/ui/gui/capabilities/*.json"),
     )
-    .expect("GUI 构建失败；请先在 src/ui/frontend 执行 bun install --frozen-lockfile && bun run build:gui");
+    .expect("GUI 构建失败；请先执行 make frontend-build");
 }

@@ -43,7 +43,7 @@
 | `repl` | 文本 REPL |
 | `tui` | 要求 stdin 与 stdout 均为终端，否则报错 |
 | `gui` | 要求编译时启用 `gui` feature，否则提示构建方式 |
-| `web` | 要求 `web` feature，监听 0.0.0.0:9928（端口可 env 配置） |
+| `web` | 要求 `web` feature，监听 0.0.0.0:8827（端口可 env 配置） |
 
 终端路径在 `ui::run` 中创建 Tokio runtime 和 Agent，再调用具体界面；GUI 路径进入 Tauri，Web 路径创建 HTTP 服务；两者在 `ui/app` 独立工作线程内创建 runtime 和 Agent。
 
@@ -76,7 +76,9 @@ Agent 含非 Send 确认回调，只在工作线程创建和使用。UI/网络�
 
 Web 是单用户多浏览器：所有端共用当前会话/workspace，第一份有效授权回复生效；120 秒或全部端断线默认拒绝。每端 256 项有界队列，最多 16 个连接；慢端关闭后通过完整状态重连。输入限制 65536 字节，WS 消息/帧限制 512 KiB，Ping/Pong 15/45 秒。`/exit` 共用保存判定后只退出来源页面；Ctrl+C/SIGTERM 停接新命令、取消授权并等待当前操作和保存，失败非零退出。
 
-WebConfig 仅在选中 Web 时解析：固定 IPv4 全接口、默认 9928，`GEER_AGENT_WEB_PORT` 可改。`GEER_AGENT_WEB_TOKEN` 非空时固定，否则生成随机口令并只打印一次。登录换取内存随机凭证，Cookie 为 HttpOnly/SameSite=Strict；重启失效，POST 和 WS 核对 Origin/Host。模型密钥不传给浏览器。静态页面由 include_dir 嵌入二进制，可独立分发。
+Make 的 build/release/run 统一启用 gui,web，并先构建两种静态前端；构建不固定 UI，运行时由 GEER_AGENT_UI 选择。直接 Cargo 默认仍是终端构建。Windows 通用程序保留控制台能力，desktop-gui 专用 feature 仍仅用于无控制台桌面构建。
+
+WebConfig 仅在选中 Web 时解析：固定 IPv4 全接口、默认 8827，`GEER_AGENT_WEB_PORT` 可改。`GEER_AGENT_WEB_TOKEN` 非空时固定，否则生成随机口令并只打印一次。登录换取内存随机凭证，Cookie 为 HttpOnly/SameSite=Strict；重启失效，POST 和 WS 核对 Origin/Host。模型密钥不传给浏览器。静态页面由 include_dir 嵌入二进制，可独立分发。
 
 **前端管理建议已落地：** [src/ui/frontend](/home/lihongyu/projects/geer-agent/src/ui/frontend/package.json) 是唯一包，只提交 bun.lock，Bun 冻结安装和 bun run 统一脚本。Vite 模式把 `@host` 编译为桌面或浏览器适配器，输出 dist/gui 与 dist/web；浏览器包没有 Tauri IPC。协议在 protocol.ts，纯 reducer 在 model.ts，App 与 CSS 共用；WebGate 只负责登录，宿主适配器只负责连接、提交、授权、复制和关闭。后续按交互能力拆组件即可，不建立两个 React 工程或提前抽发布库。草稿按会话 UUID 保留；375px 布局使用会话/状态抽屉，HTTP 剪贴板失败提供手动复制。
 
@@ -466,7 +468,7 @@ make clippy
 make check
 ```
 
-按改动选择相关项并顺序执行。若修改 GUI 事件或前端，补充 `make gui-check`、`make gui-test`，构建前端后再进行带 `gui` feature 的 Rust 检查和原生交互验收。
+按改动选择相关项并顺序执行。若修改 GUI 事件或前端，补充 `make frontend-check`、`make frontend-test`，构建前端后再进行带 `gui` feature 的 Rust 检查和原生交互验收。
 
 ### 本次验收记录
 
