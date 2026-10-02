@@ -49,3 +49,8 @@ workspace 设置先完成输入解析、目录校验、静态环境提示组装�
 工具测试在两个临时目录放置不同内容，验证 Bash、文件工具和查询工具都使用显式 workspace。双协议模拟服务检查 workspace 出现在系统提示且旧会话历史不进入新会话。TUI 测试覆盖 F2、Enter、Esc、草稿和窄屏；GUI 测试覆盖输入、浏览取消、切换错误、忙碌禁用与列表筛选。
 
 最终运行 Rust 格式、测试和 Clippy，GUI 前端类型检查、测试与构建，以及 OpenSpec 严格校验。本机验证 REPL、TUI 和 Linux GUI；Windows 原生目录对话框只记录未实测边界。
+
+## 落地补充（2026-10-02）
+
+- Windows：`make fmt`、前端 check/build、OpenSpec 严格校验通过；受限 test/clippy 入口按平台要求失败。同日 Fedora 受限 `make check` / `frontend-test` 覆盖同仓库实现。
+- REPL 手工验收通过（查看/切换/空格路径/会话列表/无效路径保持状态）。桌面窗口可启动；系统目录选择器未点击实测。

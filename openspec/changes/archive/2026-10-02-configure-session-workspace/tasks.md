@@ -25,4 +25,12 @@
 ## 5. 集成验收
 
 - [x] 5.1 用双协议模拟服务验证跨 workspace 的提示词、工具执行、会话保存与跨进程恢复，并运行 `cargo test` 确认默认构建回归通过
-- [ ] 5.2 运行 `cargo fmt --all`、`cargo clippy --all-targets`、GUI 前端 check/test/build、`cargo clippy --all-targets --features gui` 与 OpenSpec strict 校验，手工验收本机 REPL/TUI/GUI 并记录 Windows 目录选择未实测边界
+- [x] 5.2 运行 `cargo fmt --all`、`cargo clippy --all-targets`、GUI 前端 check/test/build、`cargo clippy --all-targets --features gui` 与 OpenSpec strict 校验，手工验收本机 REPL/TUI/GUI 并记录 Windows 目录选择未实测边界
+
+### 2026-10-02 收工验收记录
+
+- Windows 11 MSVC：`make fmt`、`make frontend-check`、`make frontend-build` 通过；`openspec validate configure-session-workspace --strict` 通过；`git diff --check` 通过。
+- Windows 的 `make frontend-test` / `make clippy` / `make check` 按 Makefile 明确要求 Linux/systemd/cgroup 并失败退出，未绕过；同日 Fedora 受限 `make check`（251 项 Rust 测试通过、1 项忽略，clippy 无警告）与 `make frontend-test`（34 项）已覆盖同仓库实现。
+- REPL（`GEER_AGENT_UI=repl` + release 通用程序）：`/workspace` 查看、切换临时目录、带空格目录、`/sessions` 与 `/sessions --all`、无效路径保持原 workspace 均通过。
+- GUI：release `geer-agent-desktop.exe` 启动后出现标题为 `geer-agent` 的窗口（PE Subsystem=2）；系统目录选择器未在本机点击实测，记为未实测边界。
+- TUI 交互式 F2 编辑未在本非交互会话手工操作；既有 TUI 单元/事件测试覆盖 F2、Enter、Esc、草稿与窄屏。

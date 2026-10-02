@@ -21,3 +21,11 @@
 - [x] 4.1 更新 README 与配置示例，说明编译、`.env` 选择、Linux/Windows 依赖及终端入口；逐条核对可运行命令。
 - [x] 4.2 运行格式化、Rust/前端测试、Clippy、OpenSpec 严格校验及现有环境可做的入口验收；把通过项和限制写入 `doc/plan`。
 - [ ] 4.3 在具备开发依赖的 Fedora Wayland 环境和 Windows 11 MSVC 环境中，完成原生 GUI 运行、输入法、剪贴板、缩放、多显示器及会话保存验收。
+
+### 2026-10-02 Windows 11 MSVC 部分验收（4.3 未完）
+
+- 宿主：Windows 11，`x86_64-pc-windows-msvc`，WebView2 可用；release `geer-agent-desktop.exe` PE Subsystem=2（Windows GUI），通用 `geer-agent.exe` Subsystem=3（CUI）。
+- 启动：进程启动桌面程序后出现标题 `geer-agent` 的窗口，进程保持运行直至主动结束；无额外控制台。
+- 同日 Windows 原生 `make release` 已验证双产物与复制哈希；管道 REPL 入口仍可用。
+- 尚未覆盖：中文输入法候选 Enter、代码块剪贴板写入、窗口拖拽缩放与 100%–200% DPI、多显示器拖移、GUI 内完整会话保存/恢复点击路径。
+- Fedora Wayland：当前执行机无可用环境；该平台原生验收仍未执行。

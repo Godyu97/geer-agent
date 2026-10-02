@@ -54,3 +54,8 @@ GUI 使用会话侧栏、消息区、多行输入及用量面板。支持 Markdo
 - `cargo check --features gui --target x86_64-pc-windows-gnu --tests`、`cargo clippy --all-targets --all-features --target x86_64-pc-windows-gnu` 通过，验证 GUI Rust 代码可在已安装的 Windows GNU 交叉目标上编译检查；这不是 Win11 MSVC 构建或运行测试。
 - `openspec validate add-desktop-gui --strict` 通过。默认二进制的管道 `/exit` 正常；未编入 GUI 而选择 `GEER_AGENT_UI=gui` 时明确报错，非交互环境强制 TUI 也明确报错。
 - 本机 `wayland-info` 能连接 Wayland socket，但 `cargo check --features gui` 停在 `libdbus-sys`：缺少 `dbus-1.pc`；`pkg-config` 同时报告缺少 GTK 3 与 WebKitGTK 4.1 开发包。因此尚未打开 Linux 原生窗口，也没有实测 Wayland 输入法、剪贴板、窗口缩放或多显示器。当前没有 Windows 11 环境；Win11 MSVC/WebView2 真机验收同样待完成。
+
+## 落地补充（2026-10-02）
+
+- Windows 11 MSVC：release 桌面程序 `geer-agent-desktop.exe` 启动成功，PE Subsystem=2，窗口标题 `geer-agent`，无额外控制台；通用程序 Subsystem=3。同日原生 Make 双产物与哈希已核对。
+- 本轮未在 GUI 内手工完成输入法、剪贴板、DPI/多显示器与会话保存点击路径；Fedora Wayland 原生验收仍未执行。
