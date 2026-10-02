@@ -10,7 +10,7 @@ use super::{
     authorization::AuthorizationGate,
     close::close_failure,
     commands::{CommandResult, handle_line, tool_progress},
-    events::{AppEvent, AppSnapshot, EventHub, EventSink},
+    events::{AppEvent, AppSnapshot, Confirmation, EventHub, EventSink},
 };
 use crate::{
     agent::{self, Agent},
@@ -102,12 +102,15 @@ impl AppRuntime {
             Input::Delete {
                 ids,
                 confirmed: true,
-            } if self.host == Host::Web => Some(ids),
+            } if self.host == Host::Web => Some(Confirmation::Sessions(ids)),
+            Input::Memory(command) if command.confirmed() => {
+                command.action().map(Confirmation::Memory)
+            }
             _ => None,
         };
         let request_id = self
             .hub
-            .begin(client, &line, revision, confirmed.as_deref())?;
+            .begin(client, &line, revision, confirmed.as_ref())?;
         self.work
             .send(Work::Submit {
                 request_id,
@@ -271,6 +274,19 @@ fn snapshot(
     client: Option<&str>,
     result: CommandResult,
 ) {
+    let memories = if agent.status().memory.state == crate::memory::MemoryState::Disabled {
+        Vec::new()
+    } else {
+        match runtime.block_on(agent.memories()) {
+            Ok(entries) => entries,
+            Err(error) => {
+                app.hub.publish(AppEvent::Diagnostic {
+                    message: format!("记忆列表读取失败：{error}"),
+                });
+                Vec::new()
+            }
+        }
+    };
     let read = |scope| match runtime.block_on(agent.session_entries(scope)) {
         Ok(entries) => entries,
         Err(error) => {
@@ -289,6 +305,7 @@ fn snapshot(
             unsaved_ids: agent.unsaved_ids(),
             authorization_id: app.authorization.pending_id(),
             revision: 0,
+            memories,
         },
         request_id,
         client,

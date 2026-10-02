@@ -7,6 +7,7 @@ use sea_orm::{
 };
 use sea_orm_migration::prelude::*;
 
+use crate::memory::MemoryEntry;
 use crate::session::{SessionEvent, SessionRecord, StoreDeletion};
 use crate::trace::{TraceCursor, TraceError, TracePage, TraceRecord, TraceStatus};
 
@@ -89,10 +90,78 @@ mod session_event_entity {
 
 struct Migrator;
 
+mod memory_entity {
+    use sea_orm::entity::prelude::*;
+
+    #[derive(Clone, Debug, PartialEq, DeriveEntityModel)]
+    #[sea_orm(table_name = "agent_memories")]
+    pub struct Model {
+        #[sea_orm(primary_key, auto_increment = false)]
+        pub id: String,
+        #[sea_orm(column_type = "Text")]
+        pub content: String,
+        pub created_at_ms: i64,
+        pub updated_at_ms: i64,
+    }
+
+    impl ActiveModelBehavior for ActiveModel {}
+
+    #[derive(Clone, Copy, Debug, EnumIter, DeriveRelation)]
+    pub enum Relation {}
+}
+
+struct CreateMemories;
+
+impl MigrationName for CreateMemories {
+    fn name(&self) -> &str {
+        "m20261002_000001_create_memories"
+    }
+}
+
+#[async_trait::async_trait]
+impl MigrationTrait for CreateMemories {
+    async fn up(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+        manager
+            .create_table(
+                Table::create()
+                    .table(Alias::new("agent_memories"))
+                    .col(
+                        ColumnDef::new(Alias::new("id"))
+                            .string()
+                            .not_null()
+                            .primary_key(),
+                    )
+                    .col(ColumnDef::new(Alias::new("content")).text().not_null())
+                    .col(
+                        ColumnDef::new(Alias::new("created_at_ms"))
+                            .big_integer()
+                            .not_null(),
+                    )
+                    .col(
+                        ColumnDef::new(Alias::new("updated_at_ms"))
+                            .big_integer()
+                            .not_null(),
+                    )
+                    .to_owned(),
+            )
+            .await
+    }
+
+    async fn down(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+        manager
+            .drop_table(Table::drop().table(Alias::new("agent_memories")).to_owned())
+            .await
+    }
+}
+
 #[async_trait::async_trait]
 impl MigratorTrait for Migrator {
     fn migrations() -> Vec<Box<dyn MigrationTrait>> {
-        vec![Box::new(CreateTrace), Box::new(CreateSessions)]
+        vec![
+            Box::new(CreateTrace),
+            Box::new(CreateSessions),
+            Box::new(CreateMemories),
+        ]
     }
 }
 
@@ -265,6 +334,66 @@ pub(crate) struct SqlStore {
 }
 
 impl SqlStore {
+    pub(super) async fn list_memories(&self) -> Result<Vec<MemoryEntry>, TraceError> {
+        memory_entity::Entity::find()
+            .all(&self.db)
+            .await
+            .map(|rows| {
+                rows.into_iter()
+                    .map(|row| MemoryEntry {
+                        id: row.id,
+                        content: row.content,
+                        created_at_ms: row.created_at_ms,
+                        updated_at_ms: row.updated_at_ms,
+                    })
+                    .collect()
+            })
+            .map_err(|_| TraceError("SQL 记忆读取失败".into()))
+    }
+
+    pub(super) async fn insert_memory(&self, entry: &MemoryEntry) -> Result<(), TraceError> {
+        memory_entity::ActiveModel {
+            id: ActiveValue::Set(entry.id.clone()),
+            content: ActiveValue::Set(entry.content.clone()),
+            created_at_ms: ActiveValue::Set(entry.created_at_ms),
+            updated_at_ms: ActiveValue::Set(entry.updated_at_ms),
+        }
+        .insert(&self.db)
+        .await
+        .map(|_| ())
+        .map_err(|_| TraceError("SQL 记忆写入失败".into()))
+    }
+
+    pub(super) async fn update_memory(&self, entry: &MemoryEntry) -> Result<bool, TraceError> {
+        memory_entity::Entity::update_many()
+            .set(memory_entity::ActiveModel {
+                content: ActiveValue::Set(entry.content.clone()),
+                updated_at_ms: ActiveValue::Set(entry.updated_at_ms),
+                ..Default::default()
+            })
+            .filter(memory_entity::Column::Id.eq(&entry.id))
+            .exec(&self.db)
+            .await
+            .map(|result| result.rows_affected > 0)
+            .map_err(|_| TraceError("SQL 记忆更新失败".into()))
+    }
+
+    pub(super) async fn delete_memory(&self, id: &str) -> Result<bool, TraceError> {
+        memory_entity::Entity::delete_by_id(id.to_owned())
+            .exec(&self.db)
+            .await
+            .map(|result| result.rows_affected > 0)
+            .map_err(|_| TraceError("SQL 记忆删除失败".into()))
+    }
+
+    pub(super) async fn clear_memories(&self) -> Result<u64, TraceError> {
+        memory_entity::Entity::delete_many()
+            .exec(&self.db)
+            .await
+            .map(|result| result.rows_affected)
+            .map_err(|_| TraceError("SQL 记忆清空失败".into()))
+    }
+
     pub(super) async fn connect(url: &str) -> Result<Self, TraceError> {
         if url.starts_with("sqlite:") && !url.starts_with("sqlite::memory:") {
             let options = SqliteConnectOptions::from_str(url)

@@ -1,6 +1,7 @@
 use std::{cell::RefCell, error::Error, io};
 
 use super::{Session, SessionScope, SessionStatus, Usage};
+use crate::memory::{MemoryAction, MemoryEntry, MemoryPreview, MemoryService};
 use crate::session::{
     DeleteItem, DeletePreview, DeleteReport, DeleteState, DeleteTarget, SessionEntry,
 };
@@ -14,9 +15,35 @@ pub(crate) struct MockSession {
     pub(crate) fail_open: bool,
     pub(crate) id: String,
     pub(crate) workspace: String,
+    pub(crate) memory: MemoryService,
 }
 
 impl Session for MockSession {
+    async fn memories(&self) -> Result<Vec<MemoryEntry>, Box<dyn Error>> {
+        Ok(self.memory.list().await?)
+    }
+    async fn search_memory(&self, query: &str) -> Result<Vec<MemoryEntry>, Box<dyn Error>> {
+        Ok(self.memory.search(query).await?)
+    }
+    async fn add_memory(&mut self, content: &str) -> Result<(MemoryEntry, bool), Box<dyn Error>> {
+        Ok(self.memory.write(content).await?)
+    }
+    async fn edit_memory(
+        &mut self,
+        id: &str,
+        content: &str,
+    ) -> Result<(MemoryEntry, bool), Box<dyn Error>> {
+        Ok(self.memory.edit(id, content).await?)
+    }
+    async fn preview_memory(&self, action: MemoryAction) -> Result<MemoryPreview, Box<dyn Error>> {
+        Ok(self.memory.preview(action).await?)
+    }
+    async fn delete_memory(&mut self, id: &str) -> Result<bool, Box<dyn Error>> {
+        Ok(self.memory.delete(id).await?)
+    }
+    async fn clear_memories(&mut self) -> Result<u64, Box<dyn Error>> {
+        Ok(self.memory.clear().await?)
+    }
     fn session_id(&self) -> &str {
         if self.id.is_empty() {
             "mock-session"
@@ -44,6 +71,8 @@ impl Session for MockSession {
             turn_tokens: 0,
             total_tokens: 0,
             usage_complete: true,
+            instructions_loaded: false,
+            memory: self.memory.status(),
         }
     }
 

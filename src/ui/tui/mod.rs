@@ -1,6 +1,7 @@
 //! Ratatui 终端界面。只通过界面无关契约使用会话能力。
 
 mod input;
+mod memory;
 mod sessions;
 
 use std::{cell::RefCell, error::Error, io, rc::Rc};
@@ -26,6 +27,7 @@ use crate::interaction::{
     Usage,
 };
 use input::Input;
+use memory::{MemoryAction, MemoryPanel};
 use sessions::{SessionAction, SessionPanel};
 
 const PANEL_WIDTH: u16 = 28;
@@ -72,6 +74,7 @@ enum Mode {
     Confirm,
     Workspace,
     Sessions,
+    Memories,
 }
 
 struct State {
@@ -85,12 +88,14 @@ struct State {
     scroll_back: usize,
     exit_requested: bool,
     sessions: SessionPanel,
+    memories: MemoryPanel,
 }
 
 enum Action {
     Submit(String),
     Exit,
     Session(SessionAction),
+    Memory(MemoryAction),
 }
 
 impl Tui {
@@ -119,12 +124,15 @@ impl Tui {
                         turn_tokens: 0,
                         total_tokens: 0,
                         usage_complete: true,
+                        instructions_loaded: false,
+                        memory: crate::memory::MemoryService::disabled().status(),
                     },
                     estimating: false,
                     live_chars: 0,
                     scroll_back: 0,
                     exit_requested: false,
                     sessions: SessionPanel::new(SessionScope::Current),
+                    memories: MemoryPanel::default(),
                 },
             })),
             diagnostics,
@@ -154,6 +162,7 @@ impl Tui {
             match action {
                 Action::Exit => break,
                 Action::Session(action) => self.session_action(session, action).await?,
+                Action::Memory(action) => self.memory_action(session, action).await?,
                 Action::Submit(line) => {
                     if self.handle_line(session, &line).await? {
                         break;
@@ -192,6 +201,12 @@ impl Tui {
         }
 
         let command = match command {
+            Command::Memory(command) => {
+                self.screen.borrow_mut().state.mode = Mode::Memories;
+                self.memory_action(session, MemoryAction::Command(command))
+                    .await?;
+                return Ok(false);
+            }
             Command::Sessions(scope) => {
                 self.show_sessions(session, scope).await?;
                 return Ok(false);
@@ -238,6 +253,11 @@ impl Tui {
         let message = match result {
             Err(error) => Some(error_text(&error)),
             Ok(CommandOutcome::Empty | CommandOutcome::Message) => None,
+            Ok(CommandOutcome::Memories { entries, query }) => {
+                Some(crate::memory::list_text(&entries, query.is_some()))
+            }
+            Ok(CommandOutcome::MemoryChanged(message)) => Some(message),
+            Ok(CommandOutcome::MemoryPreview(preview)) => Some(preview.text()),
             Ok(CommandOutcome::Exit) => return Ok(true),
             Ok(CommandOutcome::Help) => Some(interaction::help_text().to_owned()),
             Ok(CommandOutcome::NewSession { session_id, .. }) => {
@@ -283,6 +303,59 @@ impl Tui {
         let terminal = ratatui::try_restore();
         self.diagnostics.finish();
         paste.and(terminal)
+    }
+
+    async fn show_memories(&mut self, session: &impl Session) -> io::Result<()> {
+        let entries = session.memories().await;
+        let mut screen = self.screen.borrow_mut();
+        screen.state.mode = Mode::Memories;
+        screen.state.memories.ready =
+            session.status().memory.state == crate::memory::MemoryState::Ready;
+        match entries {
+            Ok(entries) => screen.state.memories.refresh(entries),
+            Err(error) => screen.state.memories.message = format!("记忆读取失败：{error}"),
+        }
+        screen.state.sync_session(session.status());
+        screen.draw()
+    }
+
+    async fn memory_action(
+        &mut self,
+        session: &mut impl Session,
+        action: MemoryAction,
+    ) -> io::Result<()> {
+        let command = match action {
+            MemoryAction::Open => return self.show_memories(session).await,
+            MemoryAction::Close => {
+                let mut screen = self.screen.borrow_mut();
+                screen.state.mode = Mode::Chat;
+                screen.state.memories = MemoryPanel::default();
+                return screen.draw();
+            }
+            MemoryAction::Command(command) => command,
+        };
+        let result =
+            interaction::execute(session, Command::Memory(command), |_| Ok(()), |_| Ok(())).await;
+        match result {
+            Ok(CommandOutcome::MemoryPreview(preview)) => {
+                self.screen.borrow_mut().state.memories.confirm(preview)
+            }
+            Ok(CommandOutcome::MemoryChanged(message)) => {
+                self.screen.borrow_mut().state.memories.completed(message);
+                return self.show_memories(session).await;
+            }
+            Ok(CommandOutcome::Memories { query, .. }) => {
+                self.screen.borrow_mut().state.memories.query = query.unwrap_or_default();
+                return self.show_memories(session).await;
+            }
+            Err(error) => self.screen.borrow_mut().state.memories.message = error_text(&error),
+            Ok(_) => return Err(io::Error::other("记忆面板收到不支持的操作结果")),
+        }
+        let mut screen = self.screen.borrow_mut();
+        screen.state.memories.ready =
+            session.status().memory.state == crate::memory::MemoryState::Ready;
+        screen.state.sync_session(session.status());
+        screen.draw()
     }
 
     async fn show_sessions(
@@ -399,7 +472,7 @@ impl Screen {
                 self.state.exit_requested = true;
                 String::new()
             }
-            Action::Session(_) => String::new(),
+            Action::Session(_) | Action::Memory(_) => String::new(),
         };
         let allowed = authorization_allowed(&answer);
         self.state.append(
@@ -483,7 +556,13 @@ impl State {
                 if self.mode == Mode::Sessions {
                     return self.sessions.key(key).map(Action::Session);
                 }
+                if self.mode == Mode::Memories {
+                    return self.memories.key(key).map(Action::Memory);
+                }
                 match key.code {
+                    KeyCode::F(4) if self.mode == Mode::Chat => {
+                        return Some(Action::Memory(MemoryAction::Open));
+                    }
                     KeyCode::F(3) if self.mode == Mode::Chat => {
                         return Some(Action::Session(SessionAction::Reload(
                             SessionScope::Current,
@@ -529,6 +608,7 @@ impl State {
                     _ => {}
                 }
             }
+            Event::Paste(value) if self.mode == Mode::Memories => self.memories.paste(&value),
             Event::Paste(value) if self.mode != Mode::Sessions => {
                 self.active_input_mut().paste(&value)
             }
@@ -580,6 +660,10 @@ fn render(frame: &mut Frame, state: &State) {
     }
     if state.mode == Mode::Sessions {
         sessions::render(frame, &state.sessions);
+        return;
+    }
+    if state.mode == Mode::Memories {
+        memory::render(frame, &state.memories, &state.status.memory);
         return;
     }
     let input_height = if area.height >= 4 { 3 } else { 1 };
@@ -683,11 +767,18 @@ fn render_panel(frame: &mut Frame, state: &State, area: Rect) {
         Line::raw(format!("会话  {}", status.session_id)),
         Line::raw(format!("标题  {}", status.session_title)),
         Line::raw(format!("目录  {}（F2）", status.workspace)),
-        Line::raw(""),
+        Line::raw(format!(
+            "指令  {}",
+            if status.instructions_loaded {
+                "AGENTS.md 已加载"
+            } else {
+                "无项目指令"
+            }
+        )),
+        Line::raw(format!("记忆  {}（F4）", status.memory.label())),
         Line::raw("── 上下文（估算）──"),
         Line::raw(format!("{context} / {window}")),
         Line::raw(format!("{percent}% used")),
-        Line::raw(""),
         Line::raw("── 本轮 ──"),
         Line::raw(format!("{turn} tokens")),
         Line::raw("── 累计 ──"),
@@ -713,8 +804,9 @@ fn render_input(frame: &mut Frame, state: &State, area: Rect) {
     let title = match state.mode {
         Mode::Confirm => "授权确认",
         Mode::Workspace => "Workspace · Enter 切换 · Esc 取消",
-        Mode::Chat => "输入 · F2 Workspace · F3 会话",
+        Mode::Chat => "输入 · F2 Workspace · F3 会话 · F4 记忆",
         Mode::Sessions => "会话管理",
+        Mode::Memories => "记忆管理",
     };
     let block = Block::bordered().title(title);
     let inner = if area.height >= 3 {
@@ -733,6 +825,7 @@ fn render_input(frame: &mut Frame, state: &State, area: Rect) {
         Mode::Workspace => "路径 › ",
         Mode::Chat => "你 › ",
         Mode::Sessions => "",
+        Mode::Memories => "",
     };
     let prompt = if Line::raw(full_prompt).width() < inner.width as usize {
         full_prompt
@@ -778,12 +871,15 @@ mod tests {
                 turn_tokens: 3,
                 total_tokens: 7,
                 usage_complete: true,
+                instructions_loaded: false,
+                memory: crate::memory::MemoryService::disabled().status(),
             },
             estimating: false,
             live_chars: 0,
             scroll_back: 0,
             exit_requested: false,
             sessions: super::SessionPanel::new(crate::interaction::SessionScope::Current),
+            memories: super::MemoryPanel::default(),
         }
     }
 
@@ -983,6 +1079,27 @@ mod tests {
             KeyModifiers::CONTROL,
         )));
         assert!(matches!(exit, Some(Action::Exit)));
+    }
+
+    #[test]
+    fn memory_shortcut_and_panel_preserve_the_chat_draft() {
+        let mut state = state();
+        state.input.set("未发送草稿");
+        let f4 = || Event::Key(KeyEvent::new(KeyCode::F(4), KeyModifiers::NONE));
+        assert!(matches!(
+            state.handle_event(f4()),
+            Some(Action::Memory(super::MemoryAction::Open))
+        ));
+        state.mode = Mode::Memories;
+        state.handle_event(Event::Paste("列表不接收聊天粘贴".into()));
+        assert_eq!(state.input.text(), "未发送草稿");
+        assert!(matches!(
+            state.handle_event(Event::Key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))),
+            Some(Action::Memory(super::MemoryAction::Close))
+        ));
+        state.mode = Mode::Confirm;
+        assert!(state.handle_event(f4()).is_none());
+        assert_eq!(state.mode, Mode::Confirm);
     }
 
     #[test]

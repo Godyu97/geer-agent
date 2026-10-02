@@ -11,6 +11,7 @@ pub(crate) struct CommandResult {
     pub(crate) error: Option<String>,
     pub(crate) delete_confirmation: Option<DeletePreview>,
     pub(crate) delete_report: Option<DeleteReport>,
+    pub(crate) memory_confirmation: Option<crate::memory::MemoryPreview>,
 }
 
 pub(crate) fn tool_progress(delta: &str) -> Option<&str> {
@@ -45,6 +46,14 @@ where
             }
             Ok(outcome) => match outcome {
                 CommandOutcome::Empty | CommandOutcome::Message | CommandOutcome::Exit => None,
+                CommandOutcome::Memories { entries, query } => {
+                    Some(crate::memory::list_text(&entries, query.is_some()))
+                }
+                CommandOutcome::MemoryChanged(message) => Some(message),
+                CommandOutcome::MemoryPreview(preview) => {
+                    result.memory_confirmation = Some(preview);
+                    None
+                }
                 CommandOutcome::Help => Some(interaction::help_text().to_owned()),
                 CommandOutcome::NewSession { session_id, .. } => {
                     Some(format!("已开始新会话。Session ID: {session_id}"))

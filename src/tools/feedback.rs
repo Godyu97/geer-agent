@@ -154,6 +154,9 @@ fn render_result(mut metadata: Value, body: &str, max: usize, complete_lines: bo
                 "\n[输出已截断；请收窄 query 或减少 num_results，再用 web_fetch 读取来源。]"
             }
             Some("web_fetch") => "\n[输出已截断；尚未获得完整网页正文，请选择更具体的页面。]",
+            Some("memory_search" | "memory_write") => {
+                "\n[记忆输出已截断；请缩小搜索关键词，完整内容可在记忆管理界面查看。]"
+            }
             _ => "\n[输出已截断；请缩小 path/pattern/glob 后重试，或用 read 读取已定位文件。]",
         }
     } else {

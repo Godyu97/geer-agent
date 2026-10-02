@@ -4,6 +4,78 @@ use super::{CommandOutcome, Operation, execute, save};
 use crate::interaction::{Input, Session, SessionScope, test_support::MockSession};
 
 #[tokio::test]
+async fn memory_management_never_calls_the_model_and_confirmation_is_separate() {
+    use crate::{
+        config::{TraceDatabase, TraceDatabaseConfig},
+        dao::MemoryStore,
+        interaction::{MemoryCommand, parse_input},
+        memory::{MemoryAction, MemoryService},
+    };
+    let mut session = MockSession {
+        memory: MemoryService::new(
+            MemoryStore::connect(&TraceDatabaseConfig {
+                kind: TraceDatabase::Sqlite,
+                url: "sqlite::memory:".into(),
+            })
+            .await
+            .unwrap(),
+        )
+        .await
+        .unwrap(),
+        ..Default::default()
+    };
+    let command = |line: &str| parse_input(line);
+    execute(
+        &mut session,
+        command("/memory add useful fact"),
+        |_| panic!("不调用模型"),
+        |_| panic!("不调用模型"),
+    )
+    .await
+    .unwrap();
+    let id = session.memories().await.unwrap()[0].id.clone();
+    let outcome = execute(
+        &mut session,
+        command("/memory search USEFUL"),
+        |_| Ok(()),
+        |_| Ok(()),
+    )
+    .await
+    .unwrap();
+    assert!(matches!(outcome, CommandOutcome::Memories { entries, .. } if entries.len() == 1));
+    execute(
+        &mut session,
+        command(&format!("/memory edit {id} edited fact")),
+        |_| Ok(()),
+        |_| Ok(()),
+    )
+    .await
+    .unwrap();
+    let preview = execute(
+        &mut session,
+        command("/memory clear"),
+        |_| Ok(()),
+        |_| Ok(()),
+    )
+    .await
+    .unwrap();
+    assert!(
+        matches!(preview, CommandOutcome::MemoryPreview(preview) if preview.action == MemoryAction::Clear && preview.count == 1)
+    );
+    assert_eq!(session.memories().await.unwrap().len(), 1);
+    execute(
+        &mut session,
+        Input::Memory(MemoryCommand::Clear { confirmed: true }),
+        |_| Ok(()),
+        |_| Ok(()),
+    )
+    .await
+    .unwrap();
+    assert!(session.memories().await.unwrap().is_empty());
+    assert!(session.seen.is_empty());
+}
+
+#[tokio::test]
 async fn forwards_deltas_and_usage_in_order_and_preserves_partial_failure() {
     let mut session = MockSession {
         fail: true,

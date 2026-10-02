@@ -5,6 +5,7 @@ mod agent;
 mod config;
 mod dao;
 mod interaction;
+mod memory;
 mod prompt;
 mod provider;
 mod session;

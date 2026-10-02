@@ -13,6 +13,8 @@ const MAX_OUTPUT_BYTES: u64 = 4 * 1024 * 1024;
 
 pub fn command(program: impl AsRef<OsStr>) -> Command {
     let mut command = Command::new(program);
+    // 新增默认持久化能力不能让未指定数据库的旧夹具写入宿主库。
+    command.env("GEER_AGENT_MEMORY", "off");
     // 测试不能借由继承的远程会话或启动钩子执行宿主机的 Shell 配置。
     for name in ["BASH_ENV", "ENV", "SSH_CLIENT", "SSH_CONNECTION", "SSH_TTY"] {
         command.env_remove(name);

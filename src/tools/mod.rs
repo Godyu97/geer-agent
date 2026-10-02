@@ -17,6 +17,7 @@ use chrono::Local;
 use futures_util::future::join_all;
 use serde_json::{Value, json};
 
+use crate::memory::{MemoryService, list_text};
 use feedback::{ToolError, fields, optional_string, string};
 
 type ConfirmFn = Box<dyn FnMut(&str) -> io::Result<bool>>;
@@ -41,6 +42,8 @@ enum ToolKind {
     Read,
     Write,
     Edit,
+    MemoryWrite,
+    MemorySearch,
 }
 
 const BUILTINS: &[ToolKind] = &[
@@ -55,6 +58,8 @@ const BUILTINS: &[ToolKind] = &[
     ToolKind::Search,
     ToolKind::WebSearch,
     ToolKind::WebFetch,
+    ToolKind::MemoryWrite,
+    ToolKind::MemorySearch,
 ];
 
 impl ToolKind {
@@ -71,6 +76,8 @@ impl ToolKind {
             Self::Read => "read",
             Self::Write => "write",
             Self::Edit => "edit",
+            Self::MemoryWrite => "memory_write",
+            Self::MemorySearch => "memory_search",
         }
     }
 
@@ -86,7 +93,9 @@ impl ToolKind {
             | Self::Write
             | Self::Edit
             | Self::WebSearch
-            | Self::WebFetch => ExecutionMode::Sequential,
+            | Self::WebFetch
+            | Self::MemoryWrite
+            | Self::MemorySearch => ExecutionMode::Sequential,
         }
     }
 }
@@ -137,6 +146,8 @@ enum PreparedCall {
     },
     WebSearch(web_access::SearchRequest),
     WebFetch(reqwest::Url),
+    MemoryWrite(String),
+    MemorySearch(String),
 }
 
 impl ToolOutput {
@@ -164,9 +175,14 @@ pub(crate) struct Tools {
     grants: HashSet<String>,
     confirm: ConfirmFn,
     web: Option<web_access::WebAccess>,
+    memory: MemoryService,
 }
 
 impl Tools {
+    pub(crate) fn set_memory(&mut self, memory: MemoryService) {
+        self.memory = memory;
+    }
+
     pub(crate) fn set_confirm(&mut self, confirm: impl FnMut(&str) -> io::Result<bool> + 'static) {
         self.confirm = Box::new(confirm);
     }
@@ -205,6 +221,7 @@ impl Tools {
             grants: HashSet::new(),
             confirm: Box::new(|_| Ok(false)),
             web: None,
+            memory: MemoryService::disabled(),
         })
     }
 
@@ -215,6 +232,9 @@ impl Tools {
     pub(crate) fn specs(&self) -> Vec<Spec> {
         if self.enabled {
             Self::definitions()
+                .into_iter()
+                .filter(|spec| !spec.name.starts_with("memory_") || self.memory.available())
+                .collect()
         } else {
             Vec::new()
         }
@@ -329,6 +349,34 @@ impl Tools {
                     web_access::SearchRequest::parse(&args)?,
                 )),
                 ToolKind::WebFetch => Ok(PreparedCall::WebFetch(web_access::parse_fetch(&args)?)),
+                ToolKind::MemoryWrite | ToolKind::MemorySearch => {
+                    let field = if kind == ToolKind::MemoryWrite {
+                        "content"
+                    } else {
+                        "query"
+                    };
+                    fields(&args, &[field], "")?;
+                    let value = string(&args, field)?.trim();
+                    if value.is_empty() {
+                        return Err(ToolError::invalid(
+                            field,
+                            "不能为空白。",
+                            "提供非空正文或搜索关键词。",
+                        ));
+                    }
+                    if !self.memory.available() {
+                        return Err(ToolError::new(
+                            "memory_unavailable",
+                            "长期记忆已关闭或不可用。",
+                            "查看 UI 的记忆状态，恢复数据库后再尝试。",
+                        ));
+                    }
+                    Ok(if kind == ToolKind::MemoryWrite {
+                        PreparedCall::MemoryWrite(value.into())
+                    } else {
+                        PreparedCall::MemorySearch(value.into())
+                    })
+                }
                 ToolKind::Read | ToolKind::Write | ToolKind::Edit => {
                     let operation = file::Operation::parse(name, &args)?;
                     let resolved = file::resolve_path(cwd, string(&args, "path")?)?;
@@ -344,6 +392,7 @@ impl Tools {
         .map_err(|error| error.output(name, path.as_deref()))?;
         let detail = match &prepared {
             PreparedCall::Time => return Ok(prepared),
+            PreparedCall::MemoryWrite(_) | PreparedCall::MemorySearch(_) => return Ok(prepared),
             PreparedCall::Bash(command) => format!("命令：{command}"),
             PreparedCall::Query { path, .. } if name == "search" => {
                 format!("workspace：{}\n搜索路径：{}", cwd.display(), path.display())
@@ -404,7 +453,10 @@ impl Tools {
                 }
             }
             PreparedCall::Query { path, query } => query.run(bash_bin, cwd, &path).await,
-            PreparedCall::WebSearch(_) | PreparedCall::WebFetch(_) => ToolError::new(
+            PreparedCall::WebSearch(_)
+            | PreparedCall::WebFetch(_)
+            | PreparedCall::MemoryWrite(_)
+            | PreparedCall::MemorySearch(_) => ToolError::new(
                 "execution_failed",
                 "网页工具必须串行执行。",
                 "检查工具注册表的调度模式。",
@@ -441,6 +493,42 @@ impl Tools {
                     }
                 }
                 match job {
+                    PreparedCall::MemoryWrite(content) => match self.memory.write(&content).await {
+                        Ok((entry, changed)) => ToolOutput::ok(
+                            feedback::bounded_result(
+                                json!({"tool": name, "status":"ok", "id":entry.id, "changed":changed}),
+                                if changed {
+                                    "已记住。"
+                                } else {
+                                    "这条记忆已存在。"
+                                },
+                                bash::MAX_RESULT_CHARS,
+                            ),
+                            changed,
+                        ),
+                        Err(error) => ToolError::new(
+                            "memory_failed",
+                            error.to_string(),
+                            "查看记忆状态；数据库失败不是保存成功。",
+                        )
+                        .output(name, None),
+                    },
+                    PreparedCall::MemorySearch(query) => match self.memory.search(&query).await {
+                        Ok(entries) => ToolOutput::ok(
+                            feedback::bounded_result(
+                                json!({"tool":name,"status":"ok","count":entries.len(),"changed":false,"truncated":false}),
+                                &list_text(&entries, true),
+                                bash::MAX_RESULT_CHARS,
+                            ),
+                            false,
+                        ),
+                        Err(error) => ToolError::new(
+                            "memory_failed",
+                            error.to_string(),
+                            "查看记忆状态；数据库失败不是没有结果。",
+                        )
+                        .output(name, None),
+                    },
                     PreparedCall::WebSearch(request) => {
                         self.web
                             .as_ref()
@@ -495,6 +583,8 @@ impl Tools {
         BUILTINS.iter().copied().map(|kind| {
             let (description, properties, required) = match kind {
                 ToolKind::Time => ("获取当前系统本地日期与时间。", json!({}), vec![]),
+                ToolKind::MemoryWrite => ("自动保存值得跨会话保留的用户偏好、项目事实或重要决定，数据库全局共享；不要保存临时进度或随时可从文件读取的内容。精确重复不会新增。", json!({"content":{"type":"string","minLength":1,"description":"一条独立、简洁、脱离当前对话也能理解的事实。"}}), vec!["content"]),
+                ToolKind::MemorySearch => ("自动按关键词搜索全局长期记忆；回忆用户偏好、项目事实或过去决定时先调用。空白分词、不区分大小写，最多十条。", json!({"query":{"type":"string","minLength":1,"description":"一个或多个空白分隔的关键词，如 博客 人称。"}}), vec!["query"]),
                 ToolKind::Bash => ("在当前 workspace 执行 Bash（Linux bash / Windows Git Bash，非 cmd/PowerShell），非交互，10 秒/2000 字符。目录用 ls、路径用 glob、正文用 search；读取或局部修改用 read/edit。首次需授权。", json!({"command":{"type":"string","minLength":1,"description":"兼容 Linux bash 与 Git Bash 的命令：POSIX 语法、GNU 工具、/ 分隔路径；不等待输入、不常驻后台。"}}), vec!["command"]),
                 ToolKind::Ls => ("列出目录直接子项，含隐藏项，目录以 / 结尾；不递归。截断时缩小 path 或改用 glob。例：{\"path\":\"src\"}。", json!({"path":query_path}), vec![]),
                 ToolKind::Glob => ("按路径通配查找文件，不搜索正文。沿用 rg 忽略规则；显式 glob 可覆盖忽略/隐藏过滤，不跟随目录符号链接。结果相对 path，截断时收窄范围。例：{\"pattern\":\"**/*.rs\",\"path\":\"src\"}。", json!({"path":query_path,"pattern":pattern}), vec!["pattern"]),

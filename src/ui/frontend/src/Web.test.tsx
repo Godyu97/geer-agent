@@ -11,8 +11,8 @@ import WebGate from "./WebGate";
 afterEach(() => { cleanup(); vi.useRealTimers(); vi.unstubAllGlobals(); });
 const snapshot: Snapshot = {
   revision: 2,
-  status: { model: "test", session_id: "one", session_title: "one", workspace: "/server", context_tokens: 0, context_window_tokens: 100, turn_tokens: 0, total_tokens: 0, usage_complete: true },
-  sessions: [], all_sessions: [], transcript: [], unsaved_ids: [], authorization_id: null,
+  status: { model: "test", session_id: "one", session_title: "one", workspace: "/server", context_tokens: 0, context_window_tokens: 100, turn_tokens: 0, total_tokens: 0, usage_complete: true, instructions_loaded: false, memory: { state: "ready", count: 0, error: null } },
+  sessions: [], all_sessions: [], memories: [], transcript: [], unsaved_ids: [], authorization_id: null,
 };
 function sync(extra: Partial<Extract<Event, { type: "sync" }>["state"]> = {}): Event {
   return { type: "sync", state: { snapshot, running: null, authorization: null, diagnostics: [], startup_error: null, closing: false, notice: null, error: null, delete_report: null, ...extra } };

@@ -21,6 +21,7 @@ import {
   shouldSubmit,
 } from "./model";
 import type { Entry, Pending } from "./model";
+import MemoryPanel, { MemoryConfirmation, memoryLabel } from "./MemoryPanel";
 import "./style.css";
 
 const CopyContext = createContext<(text: string) => Promise<void>>(async () => {});
@@ -160,6 +161,7 @@ export default function App({ host = defaultHost, onUnauthenticated }: { host?: 
   currentInput.current = input;
   const [drawer, setDrawer] = useState<"sessions" | "info" | null>(null);
   const [manualCopy, setManualCopy] = useState<string | null>(null);
+  const [memoryOpen, setMemoryOpen] = useState(false);
   const [visibleCount, setVisibleCount] = useState(120);
   const [localError, setLocalError] = useState<string | null>(null);
   const [workspaceEditing, setWorkspaceEditing] = useState(false);
@@ -274,7 +276,8 @@ export default function App({ host = defaultHost, onUnauthenticated }: { host?: 
     }
     setLocalError(null);
     try {
-      await host.submit({ requestId: pending.id, line: pending.line, revision: pending.line.startsWith("/delete --yes ") ? (current.current.deleteRevision ?? current.current.snapshot?.revision) : current.current.snapshot?.revision });
+      const memoryConfirmed = /^\/memory (?:delete --yes |clear --yes$)/.test(pending.line);
+      await host.submit({ requestId: pending.id, line: pending.line, revision: memoryConfirmed ? (current.current.memoryRevision ?? current.current.snapshot?.revision) : pending.line.startsWith("/delete --yes ") ? (current.current.deleteRevision ?? current.current.snapshot?.revision) : current.current.snapshot?.revision });
       if (clearComposer && submittedSession) {
         drafts.current.delete(submittedSession);
         if (inputSession.current === submittedSession) setInput("");
@@ -330,7 +333,7 @@ export default function App({ host = defaultHost, onUnauthenticated }: { host?: 
     !!state.startupError ||
     !!state.authorization ||
     state.connection !== "connected";
-  const disabled = operationBusy || !!state.deleteConfirmation;
+  const disabled = operationBusy || !!state.deleteConfirmation || !!state.memoryConfirmation;
   const contextPercent = status
     ? Math.min(
         100,
@@ -570,6 +573,7 @@ export default function App({ host = defaultHost, onUnauthenticated }: { host?: 
           </div>
           <div className="top-actions">
             <button className="info-toggle" aria-label="状态面板" aria-expanded={drawer === "info"} onClick={() => setDrawer(drawer === "info" ? null : "info")}>状态</button>
+            <button disabled={!state.snapshot || !!state.authorization || !!state.deleteConfirmation || !!state.memoryConfirmation} onClick={() => setMemoryOpen(true)}>记忆</button>
             <button disabled={disabled} onClick={() => void submit("/compact")}>
               压缩
             </button>
@@ -753,7 +757,22 @@ export default function App({ host = defaultHost, onUnauthenticated }: { host?: 
             <small key={id}>{shortId(id)}</small>
           ))}
         </div>
+        <div className="info-card">
+          <small>项目指令</small>
+          <strong>{status?.instructions_loaded ? "AGENTS.md 已加载" : "无项目指令"}</strong>
+          <small>长期记忆</small>
+          <strong>{memoryLabel(status?.memory)}</strong>
+          {status?.memory.error && <small className="warning">{status.memory.error}</small>}
+        </div>
       </aside>
+
+      {memoryOpen && <MemoryPanel entries={state.snapshot?.memories ?? []} status={status?.memory} disabled={disabled} error={localError ?? state.error} notice={state.notice} onClose={() => setMemoryOpen(false)} onSubmit={(line) => void submit(line, false)} />}
+      {state.memoryConfirmation && <MemoryConfirmation preview={state.memoryConfirmation} disabled={operationBusy} onCancel={() => dispatch({ type: "memory_dismissed" })} onConfirm={() => {
+        const action = current.current.memoryConfirmation?.action;
+        if (!action) return;
+        dispatch({ type: "memory_dismissed" });
+        void submit(action.kind === "clear" ? "/memory clear --yes" : `/memory delete --yes ${action.id}`, false);
+      }} />}
 
       {manualCopy !== null && <div className="modal-backdrop"><div className="modal" role="dialog" aria-modal="true" aria-label="手动复制">
         <h2>复制代码</h2><p>当前浏览器无法自动复制，请选择下方文本后复制。</p>

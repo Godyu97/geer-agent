@@ -24,8 +24,8 @@ fn registry_rejects_duplicates_and_resolves_all_definitions() {
         .expect("序列化工具定义")
         .len();
     eprintln!("tool definition bytes: {bytes}");
-    assert!(bytes < 8_000, "工具定义过长：{bytes} 字节");
-    assert_eq!(definitions.len(), 11);
+    assert!(bytes < 10_000, "工具定义过长：{bytes} 字节");
+    assert_eq!(definitions.len(), 13);
     for spec in definitions {
         assert!(
             spec.description.chars().count() <= 160,
@@ -38,6 +38,76 @@ fn registry_rejects_duplicates_and_resolves_all_definitions() {
 }
 
 static NEXT: AtomicUsize = AtomicUsize::new(0);
+
+#[tokio::test]
+async fn memory_tools_are_automatic_ordered_bounded_and_filterable() {
+    use crate::{
+        config::{TraceDatabase, TraceDatabaseConfig},
+        dao::MemoryStore,
+        memory::MemoryService,
+    };
+    let memory = MemoryService::new(
+        MemoryStore::connect(&TraceDatabaseConfig {
+            kind: TraceDatabase::Sqlite,
+            url: "sqlite::memory:".into(),
+        })
+        .await
+        .unwrap(),
+    )
+    .await
+    .unwrap();
+    let mut tools = Tools::new(true, crate::config::default_bash_bin()).unwrap();
+    assert!(
+        !tools
+            .specs()
+            .iter()
+            .any(|spec| spec.name.starts_with("memory_"))
+    );
+    tools.set_memory(memory.clone());
+    tools.set_confirm(|_| panic!("记忆工具不应请求授权"));
+    assert_eq!(tools.specs().len(), 13);
+    let results = tools
+        .execute_batch(&[
+            ("memory_write", r#"{"content":"用户希望先给结论"}"#),
+            ("memory_search", r#"{"query":"结论"}"#),
+        ])
+        .await;
+    assert!(results.iter().all(|result| result.output.success));
+    assert!(results[0].output.changed);
+    assert!(results[1].output.text.contains("用户希望先给结论"));
+    assert_eq!(memory.status().count, Some(1));
+    assert!(
+        !tools
+            .execute_recorded("memory_write", r#"{"content":"用户希望先给结论"}"#)
+            .await
+            .changed
+    );
+    for args in [
+        r#"{"content":" "}"#,
+        r#"{"content":3}"#,
+        r#"{"content":"fact","extra":true}"#,
+    ] {
+        assert!(!tools.execute_recorded("memory_write", args).await.success);
+    }
+    memory
+        .write(&format!("超长记忆{}", "字".repeat(4000)))
+        .await
+        .unwrap();
+    let result = tools
+        .execute_recorded("memory_search", r#"{"query":"超长"}"#)
+        .await;
+    assert!(result.success && result.text.contains("记忆输出已截断"));
+    assert!(result.text.chars().count() <= super::bash::MAX_RESULT_CHARS);
+    let mut disabled = Tools::new(false, crate::config::default_bash_bin()).unwrap();
+    disabled.set_memory(memory);
+    assert!(disabled.specs().is_empty());
+    assert!(
+        !disabled
+            .execute_recorded("memory_write", r#"{"content":"not allowed"}"#)
+            .await
+            .success
+    );
+}
 
 #[tokio::test]
 async fn search_options_preserve_workspace_paths_original_lines_and_read_context() {

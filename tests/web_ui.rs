@@ -70,6 +70,15 @@ impl Fixture {
         model: &str,
         persistence: bool,
     ) -> thread::JoinHandle<Output> {
+        self.server(port, model, persistence, false)
+    }
+    fn server(
+        &self,
+        port: u16,
+        model: &str,
+        persistence: bool,
+        memory: bool,
+    ) -> thread::JoinHandle<Output> {
         let mut command = support::command("/usr/bin/timeout");
         command
             .args([
@@ -81,6 +90,7 @@ impl Fixture {
             ])
             .arg(&self.executable);
         self.configure(&mut command, port, model, persistence);
+        command.env("GEER_AGENT_MEMORY", if memory { "on" } else { "off" });
         thread::spawn(move || support::run(&mut command, &[]).unwrap())
     }
 }
@@ -287,6 +297,183 @@ fn read_body(stream: &mut TcpStream) -> Value {
 }
 fn revision(snapshot: &Value) -> u64 {
     snapshot["snapshot"]["revision"].as_u64().unwrap()
+}
+
+#[test]
+fn project_memory_web_syncs_full_crud_and_rejects_private_stale_or_wrong_confirmations() {
+    let fixture = Fixture::new();
+    fs::write(fixture.dir.join("AGENTS.md"), "WEB_ROOT_RULE").unwrap();
+    let port = port();
+    let server = fixture.server(port, "http://127.0.0.1:9/v1", true, true);
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap()
+        .block_on(async {
+            let base = format!("http://127.0.0.1:{port}");
+            let http = http_client();
+            wait_ready(&base, &http).await;
+            let cookie = login(&base, &http).await;
+            let mut desktop = connect(&base, Some(&cookie), &base).await.unwrap();
+            let mut phone = connect(&base, Some(&cookie), &base).await.unwrap();
+            let initial = next(&mut desktop, "sync").await;
+            next(&mut phone, "sync").await;
+            let mut rev = initial["state"]["snapshot"]["revision"].as_u64().unwrap();
+            let session_id = initial["state"]["snapshot"]["status"]["session_id"].clone();
+            assert_eq!(
+                initial["state"]["snapshot"]["status"]["memory"]["state"],
+                "ready"
+            );
+            assert_eq!(
+                initial["state"]["snapshot"]["status"]["instructions_loaded"],
+                true
+            );
+            assert!(
+                submit(&mut desktop, 1, "/memory clear --yes", rev).await["error"]
+                    .as_str()
+                    .unwrap()
+                    .contains("确认已过期")
+            );
+            assert!(
+                submit(&mut desktop, 2, "/memory add 用户偏好 Rust\n完整多行", rev).await["error"]
+                    .is_null()
+            );
+            let saved = snapshot_after(&mut desktop, rev).await;
+            rev = revision(&saved);
+            let target = saved["snapshot"]["memories"][0]["id"]
+                .as_str()
+                .unwrap()
+                .to_owned();
+            assert_eq!(saved["snapshot"]["status"]["memory"]["count"], 1);
+            let mirrored = snapshot_after(&mut phone, rev - 1).await;
+            assert_eq!(
+                mirrored["snapshot"]["memories"],
+                saved["snapshot"]["memories"]
+            );
+            assert_eq!(
+                mirrored["snapshot"]["memories"][0]["content"],
+                "用户偏好 Rust\n完整多行"
+            );
+            assert!(submit(&mut desktop, 3, "/memory clear", rev).await["error"].is_null());
+            rev = revision(&snapshot_after(&mut desktop, rev).await);
+            let preview = next(&mut desktop, "memory_confirmation").await;
+            assert_eq!(preview["preview"]["count"], 1);
+            assert_eq!(preview["preview"]["action"]["kind"], "clear");
+            assert_eq!(preview["revision"], rev);
+            let phone_preview = snapshot_after(&mut phone, rev - 1).await;
+            assert!(phone_preview.get("memory_confirmation").is_none());
+            assert!(
+                submit(&mut phone, 4, "/memory clear --yes", rev).await["error"]
+                    .as_str()
+                    .unwrap()
+                    .contains("确认已过期")
+            );
+            assert!(
+                submit(&mut phone, 5, "/memory add 新增的另一条", rev).await["error"].is_null()
+            );
+            rev = revision(&snapshot_after(&mut phone, rev).await);
+            assert!(
+                submit(&mut desktop, 6, "/memory clear --yes", rev - 1).await["error"]
+                    .as_str()
+                    .unwrap()
+                    .contains("状态已改变")
+            );
+            assert!(
+                submit(&mut desktop, 7, "/memory clear --yes", rev).await["error"]
+                    .as_str()
+                    .unwrap()
+                    .contains("确认已过期")
+            );
+            assert!(
+                submit(&mut desktop, 8, &format!("/memory delete {target}"), rev).await["error"]
+                    .is_null()
+            );
+            rev = revision(&snapshot_after(&mut desktop, rev).await);
+            let preview = next(&mut desktop, "memory_confirmation").await;
+            assert_eq!(preview["preview"]["entries"][0]["id"], target);
+            assert!(
+                submit(&mut desktop, 9, "/memory clear --yes", rev).await["error"]
+                    .as_str()
+                    .unwrap()
+                    .contains("确认已过期")
+            );
+            assert!(
+                submit(
+                    &mut desktop,
+                    10,
+                    &format!("/memory delete --yes {target}"),
+                    rev
+                )
+                .await["error"]
+                    .is_null()
+            );
+            let deleted = snapshot_after(&mut desktop, rev).await;
+            rev = revision(&deleted);
+            assert_eq!(deleted["snapshot"]["memories"].as_array().unwrap().len(), 1);
+            let remaining = deleted["snapshot"]["memories"][0]["id"].as_str().unwrap();
+            assert!(
+                submit(
+                    &mut desktop,
+                    11,
+                    &format!("/memory edit {remaining} 中文 RUST 新事实"),
+                    rev
+                )
+                .await["error"]
+                    .is_null()
+            );
+            let edited = snapshot_after(&mut desktop, rev).await;
+            rev = revision(&edited);
+            assert_eq!(edited["snapshot"]["memories"][0]["id"], remaining);
+            assert_eq!(
+                edited["snapshot"]["memories"][0]["content"],
+                "中文 RUST 新事实"
+            );
+            assert!(
+                submit(&mut desktop, 12, "/memory search rust 中文", rev).await["error"].is_null()
+            );
+            let searched = snapshot_after(&mut desktop, rev).await;
+            rev = revision(&searched);
+            assert!(
+                searched["notice"]
+                    .as_str()
+                    .unwrap()
+                    .contains("中文 RUST 新事实")
+            );
+            assert!(submit(&mut desktop, 13, "/memory clear", rev).await["error"].is_null());
+            rev = revision(&snapshot_after(&mut desktop, rev).await);
+            next(&mut desktop, "memory_confirmation").await;
+            assert!(submit(&mut desktop, 14, "/memory clear --yes", rev).await["error"].is_null());
+            let cleared = snapshot_after(&mut desktop, rev).await;
+            rev = revision(&cleared);
+            assert_eq!(cleared["snapshot"]["memories"], json!([]));
+            assert_eq!(cleared["snapshot"]["status"]["memory"]["count"], 0);
+            assert_eq!(cleared["snapshot"]["status"]["session_id"], session_id);
+            assert_eq!(cleared["snapshot"]["status"]["instructions_loaded"], true);
+            assert_eq!(cleared["snapshot"]["transcript"], json!([]));
+            let mirrored = snapshot_after(&mut phone, rev - 1).await;
+            assert_eq!(mirrored["snapshot"]["memories"], json!([]));
+            assert!(
+                !phone
+                    .pending
+                    .iter()
+                    .any(|event| event["type"] == "memory_confirmation")
+            );
+            let mut reconnected = connect(&base, Some(&cookie), &base).await.unwrap();
+            let restored = next(&mut reconnected, "sync").await;
+            assert_eq!(
+                restored["state"]["snapshot"]["status"]["memory"]["count"],
+                0
+            );
+            desktop.inner.close(None).await.unwrap();
+            phone.inner.close(None).await.unwrap();
+            reconnected.inner.close(None).await.unwrap();
+        });
+    let output = server.join().unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
 }
 
 #[test]

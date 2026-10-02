@@ -9,6 +9,7 @@ use uuid::Uuid;
 use super::commands::CommandResult;
 use crate::{
     interaction::{SessionStatus, Usage},
+    memory::{MemoryAction, MemoryPreview},
     prompt::TranscriptEntry,
     session::{DeletePreview, DeleteReport, SessionEntry},
 };
@@ -24,6 +25,7 @@ pub(crate) struct AppSnapshot {
     pub unsaved_ids: Vec<String>,
     pub authorization_id: Option<u64>,
     pub revision: u64,
+    pub memories: Vec<crate::memory::MemoryEntry>,
 }
 
 #[cfg(test)]
@@ -43,6 +45,8 @@ mod tests {
                 turn_tokens: 0,
                 total_tokens: 0,
                 usage_complete: true,
+                instructions_loaded: false,
+                memory: crate::memory::MemoryService::disabled().status(),
             },
             sessions: vec![],
             all_sessions: vec![],
@@ -50,6 +54,7 @@ mod tests {
             unsaved_ids: vec![],
             authorization_id: None,
             revision: 0,
+            memories: vec![],
         }
     }
     fn connect(hub: &EventHub) -> (String, mpsc::Receiver<AppEvent>) {
@@ -148,8 +153,13 @@ mod tests {
                 .any(|event| matches!(event, AppEvent::DeleteConfirmation { .. }))
         );
         assert!(
-            hub.begin(&second, "/delete --yes", Some(2), Some(&[]))
-                .is_err()
+            hub.begin(
+                &second,
+                "/delete --yes",
+                Some(2),
+                Some(&Confirmation::Sessions(vec![]))
+            )
+            .is_err()
         );
         let id = hub.begin(&second, "/save", Some(2), None).unwrap();
         hub.commit(
@@ -159,9 +169,14 @@ mod tests {
             CommandResult::default(),
         );
         assert!(
-            hub.begin(&first, "/delete --yes", Some(3), Some(&[]))
-                .unwrap_err()
-                .contains("过期")
+            hub.begin(
+                &first,
+                "/delete --yes",
+                Some(3),
+                Some(&Confirmation::Sessions(vec![]))
+            )
+            .unwrap_err()
+            .contains("过期")
         );
     }
 
@@ -184,6 +199,100 @@ mod tests {
         );
         assert!(matches!(next(&received), AppEvent::Sync { .. }));
         assert!(received.recv_timeout(Duration::from_millis(10)).is_err());
+    }
+
+    #[test]
+    fn memory_previews_are_private_typed_and_expire_on_state_change() {
+        let hub = EventHub::default();
+        hub.commit(snapshot(), None, None, CommandResult::default());
+        let (first, first_events) = connect(&hub);
+        let (second, second_events) = connect(&hub);
+        let request = hub.begin(&first, "/memory clear", Some(1), None).unwrap();
+        hub.commit(
+            snapshot(),
+            Some(request),
+            Some(&first),
+            CommandResult {
+                memory_confirmation: Some(MemoryPreview {
+                    action: MemoryAction::Clear,
+                    entries: vec![],
+                    count: 2,
+                }),
+                ..Default::default()
+            },
+        );
+        assert!(
+            first_events
+                .try_iter()
+                .any(|event| matches!(event, AppEvent::MemoryConfirmation { revision: 2, .. }))
+        );
+        assert!(
+            !second_events
+                .try_iter()
+                .any(|event| matches!(event, AppEvent::MemoryConfirmation { .. }))
+        );
+        assert!(
+            hub.begin(
+                &second,
+                "/memory clear --yes",
+                Some(2),
+                Some(&Confirmation::Memory(MemoryAction::Clear))
+            )
+            .is_err()
+        );
+        assert!(
+            hub.begin(
+                &first,
+                "/memory delete --yes other",
+                Some(2),
+                Some(&Confirmation::Memory(MemoryAction::Delete {
+                    id: "other".into()
+                }))
+            )
+            .is_err()
+        );
+        let request = hub
+            .begin(&second, "/memory add new", Some(2), None)
+            .unwrap();
+        hub.commit(
+            snapshot(),
+            Some(request),
+            Some(&second),
+            CommandResult::default(),
+        );
+        assert!(
+            hub.begin(
+                &first,
+                "/memory clear --yes",
+                Some(3),
+                Some(&Confirmation::Memory(MemoryAction::Clear))
+            )
+            .unwrap_err()
+            .contains("过期")
+        );
+        let request = hub.begin(&first, "/memory clear", Some(3), None).unwrap();
+        hub.commit(
+            snapshot(),
+            Some(request),
+            Some(&first),
+            CommandResult {
+                memory_confirmation: Some(MemoryPreview {
+                    action: MemoryAction::Clear,
+                    entries: vec![],
+                    count: 3,
+                }),
+                ..Default::default()
+            },
+        );
+        assert!(
+            hub.begin(
+                &first,
+                "/memory clear --yes",
+                Some(4),
+                Some(&Confirmation::Memory(MemoryAction::Clear))
+            )
+            .is_ok()
+        );
     }
 }
 
@@ -259,6 +368,10 @@ pub(crate) enum AppEvent {
         preview: DeletePreview,
         revision: u64,
     },
+    MemoryConfirmation {
+        preview: MemoryPreview,
+        revision: u64,
+    },
     Diagnostic {
         message: String,
     },
@@ -278,8 +391,14 @@ pub(crate) enum AppEvent {
 struct State {
     view: View,
     clients: HashMap<String, EventSink>,
-    previews: HashMap<String, (u64, Vec<String>)>,
+    previews: HashMap<String, (u64, Confirmation)>,
     next_request: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum Confirmation {
+    Sessions(Vec<String>),
+    Memory(MemoryAction),
 }
 
 #[derive(Default)]
@@ -334,7 +453,7 @@ impl EventHub {
         client: &str,
         line: &str,
         revision: Option<u64>,
-        confirmed: Option<&[String]>,
+        confirmed: Option<&Confirmation>,
     ) -> Result<u64, String> {
         let mut state = self.state.lock().expect("图形事件锁损坏");
         if !state.clients.contains_key(client) {
@@ -354,11 +473,11 @@ impl EventHub {
         if revision.is_some_and(|revision| revision != snapshot.revision) {
             return Err("会话状态已改变，请等待同步后重试；删除操作需要重新预览。".into());
         }
-        if let Some(ids) = confirmed {
+        if let Some(confirmation) = confirmed {
             let valid = state
                 .previews
                 .get(client)
-                .is_some_and(|(rev, targets)| *rev == snapshot.revision && targets == ids);
+                .is_some_and(|(rev, targets)| *rev == snapshot.revision && targets == confirmation);
             if !valid {
                 return Err("删除确认已过期，请重新预览。".into());
             }
@@ -486,12 +605,29 @@ impl EventHub {
             delete_report: result.delete_report,
         });
         if let (Some(client), Some(preview)) = (client, result.delete_confirmation) {
-            state
-                .previews
-                .insert(client.into(), (snapshot.revision, preview.ids()));
+            state.previews.insert(
+                client.into(),
+                (snapshot.revision, Confirmation::Sessions(preview.ids())),
+            );
             state.private(
                 client,
                 AppEvent::DeleteConfirmation {
+                    preview,
+                    revision: snapshot.revision,
+                },
+            );
+        }
+        if let (Some(client), Some(preview)) = (client, result.memory_confirmation) {
+            state.previews.insert(
+                client.into(),
+                (
+                    snapshot.revision,
+                    Confirmation::Memory(preview.action.clone()),
+                ),
+            );
+            state.private(
+                client,
+                AppEvent::MemoryConfirmation {
                     preview,
                     revision: snapshot.revision,
                 },

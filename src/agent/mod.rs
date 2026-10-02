@@ -14,8 +14,9 @@ use uuid::Uuid;
 
 use crate::{
     config::{CompactionConfig, Config, DEFAULT_RESOURCE_LIMITS, OpenAiApi, ResourceLimits},
-    dao::{SessionStore, TraceStore},
+    dao::{MemoryStore, SessionStore, TraceStore},
     interaction::{Session, SessionScope, SessionStatus, Usage, emit_diagnostic},
+    memory::{MemoryAction, MemoryEntry, MemoryPreview, MemoryService},
     prompt::{self, Prompt},
     provider::{ChatProvider, TokenUsage, ToolSpec, openai::Provider},
     session::{
@@ -356,6 +357,31 @@ pub(crate) async fn create() -> Result<Agent, Box<dyn Error>> {
         None
     };
     let workspace = Workspace::current().map_err(io::Error::other)?;
+    let memory = if let Some(database) = &config.memory_database {
+        let store = if config.session_database.as_ref() == Some(database) {
+            session_store.as_ref().map(SessionStore::memory_store)
+        } else if config.trace_database.as_ref() == Some(database) {
+            trace_store.as_ref().map(TraceStore::memory_store)
+        } else {
+            None
+        };
+        let result = match store {
+            Some(store) => MemoryService::new(store).await,
+            None => match MemoryStore::connect(database).await {
+                Ok(store) => MemoryService::new(store).await,
+                Err(error) => Err(error),
+            },
+        };
+        match result {
+            Ok(memory) => memory,
+            Err(error) => {
+                emit_diagnostic(format!("长期记忆初始化失败：{error}；本次聊天仍可继续。"));
+                MemoryService::unavailable(error.to_string())
+            }
+        }
+    } else {
+        MemoryService::disabled()
+    };
     let session_runtime = session_store.map(|store| {
         SessionRuntime::new(
             store,
@@ -376,16 +402,21 @@ pub(crate) async fn create() -> Result<Agent, Box<dyn Error>> {
         )
     });
     let prompt_context = prompt::PromptContext::load(&config.bash_bin).await?;
+    let mut sessions = SessionManager::new(config.api, prompt_context, workspace, session_runtime);
+    sessions.refresh_instructions().map_err(io::Error::other)?;
+    let mut tools = Tools::new(config.tools_enabled, config.bash_bin.clone())?;
+    tools.set_memory(memory.clone());
     let agent = Agent {
         chat: Provider::new(&config),
-        tools: Tools::new(config.tools_enabled, config.bash_bin.clone())?,
+        tools,
+        memory,
         budget: AgentBudget {
             limits: config.limits,
             ..DEFAULT_AGENT_BUDGET
         },
         compaction: config.compaction,
         model: config.model.clone(),
-        sessions: SessionManager::new(config.api, prompt_context, workspace, session_runtime),
+        sessions,
         trace_store,
         api: config.api,
         api_key: config.api_key.clone(),
@@ -408,6 +439,7 @@ pub(crate) async fn create() -> Result<Agent, Box<dyn Error>> {
 pub(crate) struct Agent {
     chat: Provider,
     tools: Tools,
+    memory: MemoryService,
     budget: AgentBudget,
     compaction: CompactionConfig,
     model: String,
@@ -462,6 +494,32 @@ struct TraceContext<'a> {
 }
 
 impl Session for Agent {
+    async fn memories(&self) -> Result<Vec<MemoryEntry>, Box<dyn Error>> {
+        Ok(self.memory.list().await?)
+    }
+    async fn search_memory(&self, query: &str) -> Result<Vec<MemoryEntry>, Box<dyn Error>> {
+        Ok(self.memory.search(query).await?)
+    }
+    async fn add_memory(&mut self, content: &str) -> Result<(MemoryEntry, bool), Box<dyn Error>> {
+        Ok(self.memory.write(content).await?)
+    }
+    async fn edit_memory(
+        &mut self,
+        id: &str,
+        content: &str,
+    ) -> Result<(MemoryEntry, bool), Box<dyn Error>> {
+        Ok(self.memory.edit(id, content).await?)
+    }
+    async fn preview_memory(&self, action: MemoryAction) -> Result<MemoryPreview, Box<dyn Error>> {
+        Ok(self.memory.preview(action).await?)
+    }
+    async fn delete_memory(&mut self, id: &str) -> Result<bool, Box<dyn Error>> {
+        Ok(self.memory.delete(id).await?)
+    }
+    async fn clear_memories(&mut self) -> Result<u64, Box<dyn Error>> {
+        Ok(self.memory.clear().await?)
+    }
+
     fn session_id(&self) -> &str {
         &self.sessions.active.id
     }
@@ -486,6 +544,8 @@ impl Session for Agent {
             turn_tokens: self.turn_tokens,
             total_tokens: self.total_tokens,
             usage_complete: self.usage_complete,
+            instructions_loaded: self.sessions.instructions_loaded(),
+            memory: self.memory.status(),
         }
     }
 
@@ -499,6 +559,14 @@ impl Session for Agent {
         F: FnMut(&str) -> io::Result<()>,
         U: FnMut(Option<Usage>) -> io::Result<()>,
     {
+        self.sessions
+            .refresh_instructions()
+            .map_err(io::Error::other)?;
+        if self.memory.status().state != crate::memory::MemoryState::Disabled
+            && let Err(error) = self.memory.list().await
+        {
+            emit_diagnostic(format!("长期记忆不可用：{error}"));
+        }
         self.turn_tokens = 0;
         let state = &mut self.sessions.active;
         state.prompt.begin_turn(input);
@@ -580,7 +648,12 @@ impl Session for Agent {
         let workspace =
             Workspace::parse(path, &self.sessions.active.workspace).map_err(io::Error::other)?;
         let display = workspace.as_str();
-        let Some(id) = self.sessions.set_workspace(workspace).await else {
+        let Some(id) = self
+            .sessions
+            .set_workspace(workspace)
+            .await
+            .map_err(io::Error::other)?
+        else {
             return Ok(format!("Workspace 未改变：{display}"));
         };
         self.tools.reset();
@@ -1763,6 +1836,7 @@ mod tests {
             limits: ResourceLimits::default(),
             trace_database: None,
             session_database: None,
+            memory_database: None,
             compaction: CompactionConfig::default(),
         };
         let mut tools = Tools::new(true, crate::config::default_bash_bin()).unwrap();
@@ -1770,6 +1844,7 @@ mod tests {
         let mut agent = Agent {
             chat: Provider::new(&config),
             tools,
+            memory: crate::memory::MemoryService::disabled(),
             budget: DEFAULT_AGENT_BUDGET,
             compaction: config.compaction,
             model: config.model.clone(),

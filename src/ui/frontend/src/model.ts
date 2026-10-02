@@ -1,5 +1,5 @@
-import type { Entry, Event, Snapshot, Connection, DeletePreview, DeleteReport } from "./protocol";
-export type { Entry, Event, Snapshot, Connection, Usage, Status, SessionEntry, DeletePreview, DeleteReport } from "./protocol";
+import type { Entry, Event, Snapshot, Connection, DeletePreview, DeleteReport, MemoryPreview } from "./protocol";
+export type { Entry, Event, Snapshot, Connection, Usage, Status, SessionEntry, DeletePreview, DeleteReport, MemoryEntry, MemoryAction, MemoryPreview, MemoryStatus } from "./protocol";
 
 export type Turn = { start: number; entries: Entry[] };
 
@@ -19,12 +19,15 @@ export type Action =
   | { type: "submit_failed"; request_id: number; message: string }
   | { type: "authorization_cleared"; id: number }
   | { type: "close_dismissed" }
-  | { type: "delete_dismissed" };
+  | { type: "delete_dismissed" }
+  | { type: "memory_dismissed" };
 
 export type Pending = { id: number; line: string; local?: boolean };
 export type ViewState = {
   connection: Connection;
   deleteRevision: number | null;
+  memoryRevision: number | null;
+  memoryConfirmation: MemoryPreview | null;
   snapshot: Snapshot | null;
   pending: Pending | null;
   live: string;
@@ -48,6 +51,8 @@ export type ViewState = {
 export const initialState: ViewState = {
   connection: "connected",
   deleteRevision: null,
+  memoryRevision: null,
+  memoryConfirmation: null,
   snapshot: null,
   pending: null,
   live: "",
@@ -68,18 +73,22 @@ export function applyEvent(state: ViewState, event: Action): ViewState {
   switch (event.type) {
     case "sync": {
       const run = event.state.running;
-      return { ...state, snapshot: event.state.snapshot, pending: run ? { id: run.request_id, line: run.line, local: false } : null, live: run?.text ?? "", liveTools: run?.tools ?? [], liveUsage: run?.usage ?? 0, authorization: event.state.authorization, diagnostics: event.state.diagnostics, startupError: event.state.startup_error, closing: event.state.closing, notice: event.state.notice, error: event.state.error, deleteReport: event.state.delete_report, deleteConfirmation: null, deleteRevision: null };
+      return { ...state, snapshot: event.state.snapshot, pending: run ? { id: run.request_id, line: run.line, local: false } : null, live: run?.text ?? "", liveTools: run?.tools ?? [], liveUsage: run?.usage ?? 0, authorization: event.state.authorization, diagnostics: event.state.diagnostics, startupError: event.state.startup_error, closing: event.state.closing, notice: event.state.notice, error: event.state.error, deleteReport: event.state.delete_report, deleteConfirmation: null, deleteRevision: null, memoryConfirmation: null, memoryRevision: null };
     }
     case "connection":
-      return { ...state, connection: event.status, authorization: event.status === "connected" ? state.authorization : null, deleteConfirmation: null };
+      return { ...state, connection: event.status, authorization: event.status === "connected" ? state.authorization : null, deleteConfirmation: null, memoryConfirmation: null, memoryRevision: null };
     case "client_exited":
-      return { ...state, connection: "exited", closing: false, pending: null, closeFailed: null, authorization: null };
+      return { ...state, connection: "exited", closing: false, pending: null, closeFailed: null, authorization: null, memoryConfirmation: null, memoryRevision: null };
     case "delete_confirmation":
       return { ...state, deleteConfirmation: event.preview, deleteRevision: event.revision };
+    case "memory_confirmation":
+      if (event.revision !== state.snapshot?.revision || state.connection !== "connected" || state.pending) return state;
+      return { ...state, memoryConfirmation: event.preview, memoryRevision: event.revision, deleteConfirmation: null };
     case "queued":
       return {
         ...state,
         pending: event.pending,
+        memoryConfirmation: null,
         live: "",
         liveTools: [],
         liveUsage: 0,
@@ -106,7 +115,9 @@ export function applyEvent(state: ViewState, event: Action): ViewState {
     case "close_dismissed":
       return { ...state, closeFailed: null };
     case "delete_dismissed":
-      return { ...state, deleteConfirmation: null };
+      return { ...state, deleteConfirmation: null, memoryConfirmation: null, memoryRevision: null };
+    case "memory_dismissed":
+      return { ...state, memoryConfirmation: null };
     case "snapshot":
       if (event.snapshot.revision === undefined && event.request_id !== null && state.pending?.id !== event.request_id)
         return state;
@@ -124,10 +135,12 @@ export function applyEvent(state: ViewState, event: Action): ViewState {
         notice: event.notice,
         error: event.error,
         deleteConfirmation: event.delete_confirmation ?? null,
+        memoryConfirmation: null,
+        memoryRevision: null,
         deleteReport: event.delete_report ?? null,
       };
     case "started":
-      return event.line === undefined ? state : { ...state, pending: { id: event.request_id, line: event.line, local: false }, live: "", liveTools: [], liveUsage: 0, notice: null, error: null, deleteConfirmation: null };
+      return event.line === undefined ? state : { ...state, pending: { id: event.request_id, line: event.line, local: false }, live: "", liveTools: [], liveUsage: 0, notice: null, error: null, deleteConfirmation: null, memoryConfirmation: null, memoryRevision: null };
     case "delta":
       return state.pending?.id === event.request_id
         ? { ...state, live: state.live + event.text }
@@ -163,7 +176,7 @@ export function applyEvent(state: ViewState, event: Action): ViewState {
     case "startup_error":
       return { ...state, startupError: event.message, pending: null };
     case "closing":
-      return { ...state, closing: true, authorization: null, deleteConfirmation: null };
+      return { ...state, closing: true, authorization: null, deleteConfirmation: null, memoryConfirmation: null, memoryRevision: null };
     case "close_failed":
       return {
         ...state,

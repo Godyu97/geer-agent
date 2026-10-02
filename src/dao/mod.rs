@@ -9,6 +9,7 @@ use std::collections::{HashMap, HashSet};
 
 use crate::{
     config::{TraceDatabase, TraceDatabaseConfig},
+    memory::MemoryEntry,
     session::{SessionEvent, SessionRecord, StoreDeletion},
     trace::{
         BatchWriteItem, TraceCursor, TraceError, TracePage, TraceReader, TraceRecord, TraceWriter,
@@ -22,6 +23,13 @@ pub(crate) enum SessionStore {
 }
 
 impl SessionStore {
+    pub(crate) fn memory_store(&self) -> MemoryStore {
+        match self {
+            Self::Sql(store) => MemoryStore::Sql(store.clone()),
+            Self::Mongo(store) => MemoryStore::Mongo(store.clone()),
+        }
+    }
+
     pub(crate) async fn delete(&self, id: &str) -> Result<StoreDeletion, TraceError> {
         match self {
             Self::Sql(store) => store.delete_session(id).await,
@@ -111,7 +119,63 @@ pub(crate) enum TraceStore {
     Mongo(mongo::MongoStore),
 }
 
+#[derive(Clone)]
+pub(crate) enum MemoryStore {
+    Sql(sql::SqlStore),
+    Mongo(mongo::MongoStore),
+}
+
+impl MemoryStore {
+    pub(crate) async fn connect(config: &TraceDatabaseConfig) -> Result<Self, TraceError> {
+        SessionStore::connect(config)
+            .await
+            .map(|store| store.memory_store())
+    }
+
+    pub(crate) async fn list(&self) -> Result<Vec<MemoryEntry>, TraceError> {
+        match self {
+            Self::Sql(store) => store.list_memories().await,
+            Self::Mongo(store) => store.list_memories().await,
+        }
+    }
+
+    pub(crate) async fn insert(&self, entry: &MemoryEntry) -> Result<(), TraceError> {
+        match self {
+            Self::Sql(store) => store.insert_memory(entry).await,
+            Self::Mongo(store) => store.insert_memory(entry).await,
+        }
+    }
+
+    pub(crate) async fn update(&self, entry: &MemoryEntry) -> Result<bool, TraceError> {
+        match self {
+            Self::Sql(store) => store.update_memory(entry).await,
+            Self::Mongo(store) => store.update_memory(entry).await,
+        }
+    }
+
+    pub(crate) async fn delete(&self, id: &str) -> Result<bool, TraceError> {
+        match self {
+            Self::Sql(store) => store.delete_memory(id).await,
+            Self::Mongo(store) => store.delete_memory(id).await,
+        }
+    }
+
+    pub(crate) async fn clear(&self) -> Result<u64, TraceError> {
+        match self {
+            Self::Sql(store) => store.clear_memories().await,
+            Self::Mongo(store) => store.clear_memories().await,
+        }
+    }
+}
+
 impl TraceStore {
+    pub(crate) fn memory_store(&self) -> MemoryStore {
+        match self {
+            Self::Sql(store) => MemoryStore::Sql(store.clone()),
+            Self::Mongo(store) => MemoryStore::Mongo(store.clone()),
+        }
+    }
+
     pub(crate) async fn connect(config: &TraceDatabaseConfig) -> Result<Self, TraceError> {
         match config.kind {
             TraceDatabase::Sqlite | TraceDatabase::Postgres | TraceDatabase::Mysql => {

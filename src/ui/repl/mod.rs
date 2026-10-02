@@ -8,7 +8,7 @@ pub(super) use authorization::confirm;
 use std::{error::Error, io, io::BufRead, io::IsTerminal, io::Write};
 
 use super::commands::error_text;
-use crate::interaction::{self, CommandOutcome, Input, Operation, Session};
+use crate::interaction::{self, CommandOutcome, Input, MemoryCommand, Operation, Session};
 use color::Color;
 
 pub(super) async fn run(session: &mut impl Session) -> Result<(), Box<dyn Error>> {
@@ -18,6 +18,7 @@ pub(super) async fn run(session: &mut impl Session) -> Result<(), Box<dyn Error>
     println!("GeekAgent —— 最简单的 Agent");
     println!("Workspace: {}", session.workspace());
     println!("Session ID: {}", session.session_id());
+    print_context_status(session);
     println!("输入 /help 查看命令。\n");
 
     loop {
@@ -36,19 +37,28 @@ pub(super) async fn run(session: &mut impl Session) -> Result<(), Box<dyn Error>
             InputLine::Eof => break,
         };
         let command = interaction::parse_input(&line);
-        if matches!(
+        if (matches!(
             &command,
             Input::Delete {
                 confirmed: false,
                 ..
             }
-        ) && (!stdin.is_terminal() || !io::stdout().is_terminal())
+        ) || matches!(&command, Input::Memory(memory) if memory.action().is_some() && !memory.confirmed()))
+            && (!stdin.is_terminal() || !io::stdout().is_terminal())
         {
             eprintln!(
-                "非交互输入删除会话需要 --yes。{}",
-                crate::session::DELETE_USAGE
+                "非交互输入删除或清空需要 --yes。{} {}",
+                crate::session::DELETE_USAGE,
+                interaction::MEMORY_USAGE,
             );
-            println!("已取消删除。");
+            println!(
+                "{}",
+                if matches!(command, Input::Memory(_)) {
+                    "已取消记忆操作。"
+                } else {
+                    "已取消删除。"
+                }
+            );
             continue;
         }
         let streaming = matches!(&command, Input::Message(_));
@@ -79,6 +89,22 @@ pub(super) async fn run(session: &mut impl Session) -> Result<(), Box<dyn Error>
         }
 
         match &result {
+            Ok(CommandOutcome::MemoryPreview(preview)) => {
+                println!("{}", preview.text());
+                print!("确认操作？[y/N] ");
+                io::stdout().flush()?;
+                if !read_delete_confirmation(&mut stdin.lock())? {
+                    println!("已取消记忆操作。");
+                    continue;
+                }
+                result = interaction::execute(
+                    session,
+                    Input::Memory(MemoryCommand::confirm(&preview.action)),
+                    |_| Ok(()),
+                    |_| Ok(()),
+                )
+                .await;
+            }
             Ok(CommandOutcome::DeletePreview(preview)) => {
                 println!("{}", preview.text());
                 print!("确认删除？[y/N] ");
@@ -108,8 +134,20 @@ pub(super) async fn run(session: &mut impl Session) -> Result<(), Box<dyn Error>
 
         match result {
             Ok(outcome) => {
+                let changed = matches!(
+                    &outcome,
+                    CommandOutcome::Memories { .. }
+                        | CommandOutcome::MemoryChanged(_)
+                        | CommandOutcome::WorkspaceChanged(_)
+                        | CommandOutcome::Opened { .. }
+                        | CommandOutcome::NewSession { .. }
+                        | CommandOutcome::Message
+                );
                 if render(outcome) {
                     break;
+                }
+                if changed {
+                    print_context_status(session);
                 }
             }
             Err(error) => eprintln!("{}", error_text(&error)),
@@ -124,14 +162,32 @@ pub(super) async fn run(session: &mut impl Session) -> Result<(), Box<dyn Error>
     Ok(())
 }
 
+fn print_context_status(session: &impl Session) {
+    let status = session.status();
+    println!(
+        "项目指令：{}；{}",
+        if status.instructions_loaded {
+            "已加载"
+        } else {
+            "无"
+        },
+        status.memory.label()
+    );
+}
+
 fn render(outcome: CommandOutcome) -> bool {
     match outcome {
         CommandOutcome::Empty | CommandOutcome::Message => {}
+        CommandOutcome::Memories { entries, query } => {
+            println!("{}", crate::memory::list_text(&entries, query.is_some()))
+        }
+        CommandOutcome::MemoryChanged(message) => println!("{message}"),
+        CommandOutcome::MemoryPreview(preview) => println!("{}", preview.text()),
         CommandOutcome::Exit => return true,
         CommandOutcome::Help => println!("{}", interaction::help_text()),
         CommandOutcome::NewSession { session_id, reset } => {
             if reset {
-                println!("（已清空对话记忆，开始新会话）");
+                println!("（已开始新会话，长期记忆保留）");
             } else {
                 println!("（已开始新会话）");
             }

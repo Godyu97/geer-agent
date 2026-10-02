@@ -107,6 +107,10 @@ pub(crate) struct CompactionPlan {
 }
 
 impl Prompt {
+    pub(crate) fn set_system(&mut self, system: String) {
+        self.system = system;
+    }
+
     pub(crate) fn new(api: OpenAiApi, system: String) -> Self {
         let state = match api {
             OpenAiApi::ChatCompletions => State::Chat {

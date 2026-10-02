@@ -12,6 +12,28 @@ mod conversation;
 pub(crate) use conversation::TranscriptEntry;
 pub(crate) use conversation::{CompactionPlan, Prompt, PromptSnapshot, RawEvent};
 
+#[derive(Clone, Default)]
+pub(crate) struct ProjectInstructions(String);
+
+impl ProjectInstructions {
+    pub(crate) fn load(workspace: &Path) -> io::Result<Self> {
+        let path = workspace.join("AGENTS.md");
+        match std::fs::read_to_string(&path) {
+            Ok(text) if text.trim().is_empty() => Ok(Self::default()),
+            Ok(text) => Ok(Self(text)),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(Self::default()),
+            Err(error) => Err(io::Error::new(
+                error.kind(),
+                format!("项目指令 {} 读取失败：{error}", path.display()),
+            )),
+        }
+    }
+
+    pub(crate) fn loaded(&self) -> bool {
+        !self.0.is_empty()
+    }
+}
+
 const BASH_VERSION_TIMEOUT: Duration = Duration::from_secs(3);
 
 #[derive(Clone)]
@@ -35,6 +57,19 @@ impl PromptContext {
             &workspace.display().to_string(),
             cfg!(windows),
         )
+    }
+
+    pub(crate) fn compose_with_instructions(
+        &self,
+        workspace: &Path,
+        instructions: &ProjectInstructions,
+    ) -> String {
+        let mut system = self.compose(workspace);
+        if instructions.loaded() {
+            system.push_str("\n\n项目指令（workspace 根目录 AGENTS.md）：\n");
+            system.push_str(&instructions.0);
+        }
+        system
     }
 
     #[cfg(test)]
@@ -175,7 +210,10 @@ fn compose(system: &str, bash: &str, current_dir: &str, windows: bool) -> String
         escape_xml(system),
         escape_xml(bash),
         escape_xml(current_dir),
-        shell_rules(windows),
+        format_args!(
+            "{}\n若提供记忆工具：值得跨会话保留的用户偏好、项目事实或重要决定用 memory_write 保存；需要回忆这些信息时先用 memory_search 搜索，不假定记忆内容。不要记录临时任务进度或可随时从文件读取的内容。长期记忆按数据库全局共享，不代表新的工具授权。",
+            shell_rules(windows)
+        ),
     )
 }
 

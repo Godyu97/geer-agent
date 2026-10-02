@@ -41,6 +41,7 @@ fn run(executable: &Path, cwd: &Path, home: &Path, overrides: &[(&str, &str)]) -
         .env("GEER_AGENT_TOOLS", "off")
         .env("GEER_AGENT_TRACE", "on")
         .env("GEER_AGENT_SESSION_PERSISTENCE", "on")
+        .env("GEER_AGENT_MEMORY", "off")
         .env("GEER_AGENT_DATABASE", "sqlite")
         .env("GEER_AGENT_DATABASE_URL", "");
     for &(name, value) in overrides {

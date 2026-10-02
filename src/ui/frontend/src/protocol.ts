@@ -14,7 +14,13 @@ export type Status = {
   turn_tokens: number;
   total_tokens: number;
   usage_complete: boolean;
+  instructions_loaded: boolean;
+  memory: MemoryStatus;
 };
+export type MemoryStatus = { state: "ready" | "disabled" | "unavailable"; count: number | null; error: string | null };
+export type MemoryEntry = { id: string; content: string; created_at_ms: number; updated_at_ms: number };
+export type MemoryAction = { kind: "delete"; id: string } | { kind: "clear" };
+export type MemoryPreview = { action: MemoryAction; entries: MemoryEntry[]; count: number };
 export type SessionEntry = {
   id: string;
   title: string;
@@ -41,6 +47,7 @@ export type Snapshot = {
   status: Status;
   sessions: SessionEntry[];
   all_sessions: SessionEntry[];
+  memories: MemoryEntry[];
   transcript: Entry[];
   unsaved_ids: string[];
   authorization_id?: number | null;
@@ -69,6 +76,7 @@ export type Event =
   | { type: "client_exited" }
   | { type: "authorization_resolved"; id: number }
   | { type: "delete_confirmation"; preview: DeletePreview; revision: number }
+  | { type: "memory_confirmation"; preview: MemoryPreview; revision: number }
   | {
       type: "snapshot";
       request_id: number | null;

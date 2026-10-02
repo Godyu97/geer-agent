@@ -12,6 +12,7 @@ pub(super) fn error_text(error: &CommandError) -> String {
         Operation::Delete => "会话删除失败",
         Operation::Workspace => "Workspace 切换失败",
         Operation::Open => "会话恢复失败",
+        Operation::Memory => "记忆操作失败",
     };
     format!("{prefix}：{}", error.message)
 }

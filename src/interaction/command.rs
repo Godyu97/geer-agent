@@ -2,14 +2,18 @@
 
 use std::io;
 
-use super::{Input, Session, Usage};
+use super::{Input, MemoryCommand, Session, Usage};
+use crate::memory::{MemoryEntry, MemoryPreview};
 use crate::session::{DeletePreview, DeleteReport, delete_ids};
 
 #[derive(Debug)]
 pub(crate) enum CommandOutcome {
     Empty,
     Help,
-    NewSession { session_id: String, reset: bool },
+    NewSession {
+        session_id: String,
+        reset: bool,
+    },
     Saved(String),
     Compacted(String),
     Sessions(Vec<String>),
@@ -17,10 +21,19 @@ pub(crate) enum CommandOutcome {
     Deleted(DeleteReport),
     Workspace(String),
     WorkspaceChanged(String),
-    Opened { message: String, session_id: String },
+    Opened {
+        message: String,
+        session_id: String,
+    },
     Exit,
     Unknown(String),
     Message,
+    Memories {
+        entries: Vec<MemoryEntry>,
+        query: Option<String>,
+    },
+    MemoryChanged(String),
+    MemoryPreview(MemoryPreview),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -33,6 +46,7 @@ pub(crate) enum Operation {
     Delete,
     Workspace,
     Open,
+    Memory,
 }
 
 #[derive(Debug)]
@@ -69,6 +83,67 @@ where
         Input::Empty => CommandOutcome::Empty,
         Input::Invalid(message) => return Err(CommandError::new(Operation::Input, message)),
         Input::Help => CommandOutcome::Help,
+        Input::Memory(command) => {
+            if !command.confirmed()
+                && let Some(action) = command.action()
+            {
+                return session
+                    .preview_memory(action)
+                    .await
+                    .map(CommandOutcome::MemoryPreview)
+                    .map_err(|error| CommandError::new(Operation::Memory, error));
+            }
+            let result = async {
+                Ok::<_, Box<dyn std::error::Error>>(match command {
+                    MemoryCommand::List => CommandOutcome::Memories {
+                        entries: session.memories().await?,
+                        query: None,
+                    },
+                    MemoryCommand::Search(query) => CommandOutcome::Memories {
+                        entries: session.search_memory(&query).await?,
+                        query: Some(query),
+                    },
+                    MemoryCommand::Add(content) => {
+                        let (entry, changed) = session.add_memory(&content).await?;
+                        CommandOutcome::MemoryChanged(format!(
+                            "{}：{}",
+                            if changed {
+                                "已添加记忆"
+                            } else {
+                                "记忆已存在"
+                            },
+                            entry.id
+                        ))
+                    }
+                    MemoryCommand::Edit { id, content } => {
+                        let (entry, changed) = session.edit_memory(&id, &content).await?;
+                        CommandOutcome::MemoryChanged(format!(
+                            "{}：{}",
+                            if changed {
+                                "已更新记忆"
+                            } else {
+                                "记忆未改变"
+                            },
+                            entry.id
+                        ))
+                    }
+                    MemoryCommand::Delete { id, .. } => CommandOutcome::MemoryChanged(format!(
+                        "{}：{id}",
+                        if session.delete_memory(&id).await? {
+                            "已删除全局记忆"
+                        } else {
+                            "记忆已不存在"
+                        }
+                    )),
+                    MemoryCommand::Clear { .. } => CommandOutcome::MemoryChanged(format!(
+                        "已清空 {} 条全局长期记忆。会话与 Trace 保留。",
+                        session.clear_memories().await?
+                    )),
+                })
+            }
+            .await;
+            result.map_err(|error| CommandError::new(Operation::Memory, error))?
+        }
         command @ (Input::Reset | Input::New) => CommandOutcome::NewSession {
             reset: matches!(command, Input::Reset),
             session_id: session.new_session().await,

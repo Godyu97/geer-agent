@@ -60,6 +60,7 @@ fn run_repl_with_trace(
 
     let mut command = support::command(env!("CARGO_BIN_EXE_geer-agent"));
     command
+        .current_dir(std::env::temp_dir())
         .env("OPENAI_API_KEY", "test-key")
         .env("OPENAI_MODEL", "test-model")
         .env("OPENAI_BASE_URL", url)

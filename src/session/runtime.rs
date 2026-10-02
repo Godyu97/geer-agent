@@ -11,7 +11,7 @@ use crate::{
     config::OpenAiApi,
     dao::{SESSION_REVISION_CONFLICT, SessionStore},
     interaction::emit_diagnostic,
-    prompt::{Prompt, PromptContext, PromptSnapshot, RawEvent},
+    prompt::{ProjectInstructions, Prompt, PromptContext, PromptSnapshot, RawEvent},
     session::{
         DeleteItem, DeletePreview, DeleteReport, DeleteState, DeleteTarget, SessionEvent,
         SessionRecord, StoreDeletion, Workspace, delete_ids, session_title, short_id,
@@ -290,6 +290,7 @@ pub(crate) struct SessionState {
     pub(crate) prompt: Prompt,
     pub(crate) context_token_bias: u64,
     pub(crate) runtime: Option<SessionRuntime>,
+    instructions: ProjectInstructions,
     updated_at_ms: i64,
     dirty: bool,
 }
@@ -308,6 +309,7 @@ impl SessionState {
             prompt: Prompt::new(api, system),
             context_token_bias: 0,
             runtime,
+            instructions: ProjectInstructions::default(),
             updated_at_ms: now_unix_ms(),
             dirty: true,
         }
@@ -374,6 +376,21 @@ pub(crate) struct SessionEntry {
 }
 
 impl SessionManager {
+    pub(crate) fn instructions_loaded(&self) -> bool {
+        self.active.instructions.loaded()
+    }
+
+    pub(crate) fn refresh_instructions(&mut self) -> Result<(), String> {
+        let instructions = ProjectInstructions::load(self.active.workspace.as_path())
+            .map_err(|error| error.to_string())?;
+        self.active.prompt.set_system(
+            self.prompt_context
+                .compose_with_instructions(self.active.workspace.as_path(), &instructions),
+        );
+        self.active.instructions = instructions;
+        Ok(())
+    }
+
     pub(crate) fn new(
         api: OpenAiApi,
         prompt_context: PromptContext,
@@ -397,12 +414,23 @@ impl SessionManager {
     }
 
     fn fresh(&self, workspace: Workspace) -> SessionState {
-        SessionState::new(
+        let instructions = if workspace == self.active.workspace {
+            self.active.instructions.clone()
+        } else {
+            ProjectInstructions::default()
+        };
+        let mut state = SessionState::new(
             self.api,
             &self.prompt_context,
             workspace,
             self.runtime_template.as_ref().map(SessionRuntime::fresh),
-        )
+        );
+        state.prompt.set_system(
+            self.prompt_context
+                .compose_with_instructions(state.workspace.as_path(), &instructions),
+        );
+        state.instructions = instructions;
+        state
     }
 
     pub(crate) async fn new_session(&mut self) -> String {
@@ -413,23 +441,37 @@ impl SessionManager {
         self.active.id.clone()
     }
 
-    pub(crate) async fn set_workspace(&mut self, workspace: Workspace) -> Option<String> {
+    pub(crate) async fn set_workspace(
+        &mut self,
+        workspace: Workspace,
+    ) -> Result<Option<String>, String> {
         if self.active.workspace == workspace {
-            return None;
+            return Ok(None);
         }
-        let next = self.fresh(workspace);
+        let instructions =
+            ProjectInstructions::load(workspace.as_path()).map_err(|error| error.to_string())?;
+        let mut next = self.fresh(workspace);
+        next.prompt.set_system(
+            self.prompt_context
+                .compose_with_instructions(next.workspace.as_path(), &instructions),
+        );
+        next.instructions = instructions;
         self.active.save().await;
         let previous = std::mem::replace(&mut self.active, next);
         self.parked.insert(previous.id.clone(), previous);
-        Some(self.active.id.clone())
+        Ok(Some(self.active.id.clone()))
     }
 
     pub(crate) async fn open(&mut self, id: &str) -> Result<Option<bool>, String> {
         if self.active.id == id {
+            self.refresh_instructions()?;
             return Ok(None);
         }
+        let instructions;
         let target = if let Some(state) = self.parked.get(id) {
             Workspace::from_stored(&state.workspace.as_str())?;
+            instructions = ProjectInstructions::load(state.workspace.as_path())
+                .map_err(|error| error.to_string())?;
             None
         } else {
             let runtime = self
@@ -437,6 +479,8 @@ impl SessionManager {
                 .as_ref()
                 .ok_or_else(|| "未配置会话数据库，无法恢复。".to_owned())?;
             let (record, workspace, snapshot, display_events) = runtime.load(id).await?;
+            instructions = ProjectInstructions::load(workspace.as_path())
+                .map_err(|error| error.to_string())?;
             let mut prompt =
                 Prompt::new(self.api, self.prompt_context.compose(workspace.as_path()));
             prompt.restore(snapshot.prompt)?;
@@ -449,15 +493,21 @@ impl SessionManager {
                 prompt,
                 context_token_bias: snapshot.context_token_bias,
                 runtime: Some(runtime),
+                instructions: instructions.clone(),
                 updated_at_ms: record.updated_at_ms,
                 dirty: false,
             })
         };
         self.active.save().await;
-        let next = match target {
+        let mut next = match target {
             Some(state) => state,
             None => self.parked.remove(id).expect("已检查缓存会话存在"),
         };
+        next.prompt.set_system(
+            self.prompt_context
+                .compose_with_instructions(next.workspace.as_path(), &instructions),
+        );
+        next.instructions = instructions;
         let interrupted = next
             .runtime
             .as_ref()
@@ -903,6 +953,95 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn project_instructions_refresh_root_only_and_restore_without_snapshot_rules() {
+        for api in [OpenAiApi::ChatCompletions, OpenAiApi::Responses] {
+            let (root, _, store, mut manager) = history_manager(api).await;
+            let other = root.join("child");
+            std::fs::create_dir(&other).unwrap();
+            std::fs::write(root.join("AGENTS.md"), "root-rule-v1").unwrap();
+            std::fs::write(other.join("AGENTS.md"), "child-rule").unwrap();
+            manager.refresh_instructions().unwrap();
+            assert!(manager.instructions_loaded());
+            assert!(system_prompt(&manager.active.prompt).contains("root-rule-v1"));
+            assert!(!system_prompt(&manager.active.prompt).contains("child-rule"));
+            let saved = manager.active.id.clone();
+            manager.active.prompt.begin_turn("conversation fact");
+            manager.active.prompt.finish_turn(reply("answer"));
+            let plan = manager.active.prompt.prepare_compaction(0, true).unwrap();
+            assert!(!plan.source.contains("root-rule-v1"));
+            let compaction = manager.active.prompt.compaction_messages(&plan);
+            let compaction_text = match compaction {
+                crate::provider::Messages::Chat(messages) => {
+                    serde_json::to_string(&messages).unwrap()
+                }
+                crate::provider::Messages::Responses {
+                    instructions,
+                    input,
+                } => format!("{instructions}{}", serde_json::to_string(&input).unwrap()),
+            };
+            assert!(!compaction_text.contains("root-rule-v1"));
+            manager
+                .active
+                .prompt
+                .apply_compaction(plan, "conversation summary".into())
+                .unwrap();
+            assert!(system_prompt(&manager.active.prompt).contains("root-rule-v1"));
+            manager.active.changed();
+            manager.active.save().await;
+            assert!(
+                !store
+                    .load(&saved)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .snapshot
+                    .to_string()
+                    .contains("root-rule-v1")
+            );
+            std::fs::write(root.join("AGENTS.md"), "root-rule-v2").unwrap();
+            manager.refresh_instructions().unwrap();
+            assert!(system_prompt(&manager.active.prompt).contains("root-rule-v2"));
+            assert!(!system_prompt(&manager.active.prompt).contains("root-rule-v1"));
+            manager
+                .set_workspace(Workspace::from_stored(other.to_str().unwrap()).unwrap())
+                .await
+                .unwrap();
+            assert!(system_prompt(&manager.active.prompt).contains("child-rule"));
+            assert!(!system_prompt(&manager.active.prompt).contains("root-rule-v2"));
+            std::fs::write(root.join("AGENTS.md"), "root-rule-v3").unwrap();
+            manager.open(&saved).await.unwrap();
+            assert!(system_prompt(&manager.active.prompt).contains("root-rule-v3"));
+            let mut restarted = SessionManager::new(
+                api,
+                context("fresh environment"),
+                manager.active.workspace.clone(),
+                manager.runtime_template.as_ref().map(SessionRuntime::fresh),
+            );
+            restarted.open(&saved).await.unwrap();
+            assert!(system_prompt(&restarted.active.prompt).contains("root-rule-v3"));
+            let before_id = manager.active.id.clone();
+            let before_prompt = system_prompt(&manager.active.prompt);
+            std::fs::write(other.join("AGENTS.md"), [0xff]).unwrap();
+            assert!(
+                manager
+                    .set_workspace(Workspace::from_stored(other.to_str().unwrap()).unwrap())
+                    .await
+                    .is_err()
+            );
+            assert_eq!(manager.active.id, before_id);
+            assert_eq!(system_prompt(&manager.active.prompt), before_prompt);
+            std::fs::remove_file(root.join("AGENTS.md")).unwrap();
+            manager.refresh_instructions().unwrap();
+            assert!(!manager.instructions_loaded());
+            std::fs::create_dir(root.join("AGENTS.md")).unwrap();
+            assert!(manager.refresh_instructions().is_err());
+            assert!(!manager.instructions_loaded());
+            drop((restarted, manager, store));
+            std::fs::remove_dir_all(root).unwrap();
+        }
+    }
+
+    #[tokio::test]
     async fn disk_restore_defaults_legacy_bias_and_rejects_invalid_bias_without_switching() {
         for api in [OpenAiApi::ChatCompletions, OpenAiApi::Responses] {
             let (root, _, store, mut manager) = history_manager(api).await;
@@ -1204,7 +1343,11 @@ mod tests {
             manager.active.prompt.finish_turn(reply("A answer"));
             assert!(system_prompt(&manager.active.prompt).contains(&workspace_a.as_str()));
 
-            let id_b = manager.set_workspace(workspace_b.clone()).await.unwrap();
+            let id_b = manager
+                .set_workspace(workspace_b.clone())
+                .await
+                .unwrap()
+                .unwrap();
             assert_ne!(id_a, id_b);
             assert!(manager.active.prompt.transcript().is_empty());
             let prompt_b = system_prompt(&manager.active.prompt);
@@ -1422,7 +1565,11 @@ mod tests {
         manager.active.changed();
         manager.active.runtime.as_mut().unwrap().fail_next_save = true;
 
-        let b = manager.set_workspace(workspace_b.clone()).await.unwrap();
+        let b = manager
+            .set_workspace(workspace_b.clone())
+            .await
+            .unwrap()
+            .unwrap();
         assert!(store.load(&a).await.unwrap().is_none());
         assert!(manager.unsaved_ids().contains(&a));
         assert_eq!(manager.parked[&a].workspace, workspace_a);

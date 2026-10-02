@@ -72,6 +72,7 @@ fn run(api: &str, base_url: &str, db_url: &str, input: &str) -> Output {
 fn run_with_model(api: &str, base_url: &str, db_url: &str, model: &str, input: &str) -> Output {
     let mut command = support::command(env!("CARGO_BIN_EXE_geer-agent"));
     command
+        .current_dir(std::env::temp_dir())
         .env("OPENAI_API_KEY", "mock-key")
         .env("OPENAI_MODEL", model)
         .env("OPENAI_BASE_URL", base_url)
@@ -472,7 +473,10 @@ async fn cross_process(api: &str) {
     );
     let second_stdout = String::from_utf8_lossy(&second.stdout);
     assert!(second_stdout.contains("已恢复会话"), "{second_stdout}");
-    assert!(second_stdout.contains("已清空对话记忆"), "{second_stdout}");
+    assert!(
+        second_stdout.contains("已开始新会话，长期记忆保留"),
+        "{second_stdout}"
+    );
     assert_eq!(second_stdout.matches("已恢复会话").count(), 2);
     assert!(second_stdout.contains("状态未确认"), "{second_stdout}");
     assert!(

@@ -5,6 +5,7 @@ use mongodb::{Client, Collection, IndexModel, bson::doc, options::ClientOptions}
 use serde::{Deserialize, Serialize};
 
 use crate::{
+    memory::MemoryEntry,
     session::{SessionEvent, SessionRecord, StoreDeletion},
     trace::{TraceCursor, TraceError, TracePage, TraceRecord},
 };
@@ -40,14 +41,74 @@ struct SessionEventDocument {
     event: SessionEvent,
 }
 
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct MemoryDocument {
+    #[serde(rename = "_id")]
+    id: String,
+    #[serde(flatten)]
+    entry: MemoryEntry,
+}
+
 #[derive(Clone)]
 pub(crate) struct MongoStore {
     collection: Collection<TraceDocument>,
     sessions: Collection<SessionDocument>,
     session_events: Collection<SessionEventDocument>,
+    memories: Collection<MemoryDocument>,
 }
 
 impl MongoStore {
+    pub(super) async fn list_memories(&self) -> Result<Vec<MemoryEntry>, TraceError> {
+        self.memories
+            .find(doc! {})
+            .await
+            .map_err(|_| TraceError("MongoDB 记忆读取失败".into()))?
+            .try_collect::<Vec<_>>()
+            .await
+            .map(|rows| rows.into_iter().map(|row| row.entry).collect())
+            .map_err(|_| TraceError("MongoDB 记忆读取失败".into()))
+    }
+
+    pub(super) async fn insert_memory(&self, entry: &MemoryEntry) -> Result<(), TraceError> {
+        self.memories
+            .insert_one(MemoryDocument {
+                id: entry.id.clone(),
+                entry: entry.clone(),
+            })
+            .await
+            .map(|_| ())
+            .map_err(|_| TraceError("MongoDB 记忆写入失败".into()))
+    }
+
+    pub(super) async fn update_memory(&self, entry: &MemoryEntry) -> Result<bool, TraceError> {
+        self.memories
+            .update_one(
+                doc! {"_id": &entry.id},
+                doc! {"$set": {
+                    "content": &entry.content, "updated_at_ms": entry.updated_at_ms,
+                }},
+            )
+            .await
+            .map(|result| result.matched_count > 0)
+            .map_err(|_| TraceError("MongoDB 记忆更新失败".into()))
+    }
+
+    pub(super) async fn delete_memory(&self, id: &str) -> Result<bool, TraceError> {
+        self.memories
+            .delete_one(doc! {"_id": id})
+            .await
+            .map(|result| result.deleted_count > 0)
+            .map_err(|_| TraceError("MongoDB 记忆删除失败".into()))
+    }
+
+    pub(super) async fn clear_memories(&self) -> Result<u64, TraceError> {
+        self.memories
+            .delete_many(doc! {})
+            .await
+            .map(|result| result.deleted_count)
+            .map_err(|_| TraceError("MongoDB 记忆清空失败".into()))
+    }
+
     pub(super) async fn connect(url: &str) -> Result<Self, TraceError> {
         let mut options = ClientOptions::parse(url)
             .await
@@ -93,6 +154,7 @@ impl MongoStore {
             collection,
             sessions,
             session_events,
+            memories: database.collection("agent_memories"),
         })
     }
 

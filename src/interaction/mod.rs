@@ -2,16 +2,19 @@
 
 mod command;
 mod diagnostic;
+mod memory;
 
 #[cfg(test)]
 mod tests;
 
+use crate::memory::{MemoryAction, MemoryEntry, MemoryPreview, MemoryStatus};
 use crate::session::{DELETE_USAGE, DeletePreview, DeleteReport, SessionEntry, delete_ids};
 use serde::Serialize;
 use std::{error::Error, io};
 
 pub(crate) use command::{CommandError, CommandOutcome, Operation, execute, save};
 pub(crate) use diagnostic::{DiagnosticBuffer, emit_diagnostic};
+pub(crate) use memory::{MEMORY_USAGE, MemoryCommand};
 
 #[cfg(test)]
 pub(crate) mod test_support;
@@ -27,6 +30,8 @@ pub(crate) struct SessionStatus {
     pub(crate) turn_tokens: u64,
     pub(crate) total_tokens: u64,
     pub(crate) usage_complete: bool,
+    pub(crate) instructions_loaded: bool,
+    pub(crate) memory: MemoryStatus,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
@@ -36,6 +41,18 @@ pub(crate) struct Usage {
 }
 
 pub(crate) trait Session {
+    async fn memories(&self) -> Result<Vec<MemoryEntry>, Box<dyn Error>>;
+    async fn search_memory(&self, query: &str) -> Result<Vec<MemoryEntry>, Box<dyn Error>>;
+    async fn add_memory(&mut self, content: &str) -> Result<(MemoryEntry, bool), Box<dyn Error>>;
+    async fn edit_memory(
+        &mut self,
+        id: &str,
+        content: &str,
+    ) -> Result<(MemoryEntry, bool), Box<dyn Error>>;
+    async fn preview_memory(&self, action: MemoryAction) -> Result<MemoryPreview, Box<dyn Error>>;
+    async fn delete_memory(&mut self, id: &str) -> Result<bool, Box<dyn Error>>;
+    async fn clear_memories(&mut self) -> Result<u64, Box<dyn Error>>;
+
     fn session_id(&self) -> &str;
 
     fn workspace(&self) -> String;
@@ -75,7 +92,7 @@ pub(crate) trait Session {
 }
 
 pub(crate) fn help_text() -> &'static str {
-    "可用命令：\n  /help                 显示帮助\n  /workspace            显示当前 workspace\n  /workspace <path>     切换 workspace 并新建会话\n  /compact              压缩旧对话\n  /sessions             列出当前 workspace 的近期会话\n  /sessions --all       列出全部 workspace 的近期会话\n  /delete [--yes] <id> [id...]  删除会话（保留 Trace）\n  /open <session-id>    打开会话及其 workspace\n  /resume <session-id>  打开会话（兼容命令）\n  /new                  在当前 workspace 开始新会话\n  /reset                在当前 workspace 开始新会话\n  /save                 保存所有待写会话\n  /exit                 退出程序"
+    "可用命令：\n  /help                 显示帮助\n  /workspace            显示当前 workspace\n  /workspace <path>     切换 workspace 并新建会话\n  /compact              压缩旧对话\n  /sessions             列出当前 workspace 的近期会话\n  /sessions --all       列出全部 workspace 的近期会话\n  /delete [--yes] <id> [id...]  删除会话（保留 Trace）\n  /open <session-id>    打开会话及其 workspace\n  /resume <session-id>  打开会话（兼容命令）\n  /memory               列出全局长期记忆\n  /memory search <关键词>  搜索记忆\n  /memory add <正文>     新增记忆\n  /memory edit <完整 UUID> <正文>  编辑记忆\n  /memory delete [--yes] <完整 UUID>  删除记忆\n  /memory clear [--yes]  清空全局记忆（保留会话与 Trace）\n  /new                  在当前 workspace 开始新会话\n  /reset                在当前 workspace 开始新会话\n  /save                 保存所有待写会话\n  /exit                 退出程序"
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -93,6 +110,7 @@ pub(crate) enum Input {
     Compact,
     Sessions(SessionScope),
     Delete { ids: Vec<String>, confirmed: bool },
+    Memory(MemoryCommand),
     Invalid(String),
     Workspace(Option<String>),
     Open(String),
@@ -110,6 +128,12 @@ pub(crate) fn parse_input(line: &str) -> Input {
         "/new" => Input::New,
         "/save" => Input::Save,
         "/compact" => Input::Compact,
+        input if input.split_whitespace().next() == Some("/memory") => {
+            match MemoryCommand::parse(input.strip_prefix("/memory").unwrap_or_default().trim()) {
+                Ok(command) => Input::Memory(command),
+                Err(message) => Input::Invalid(message),
+            }
+        }
         "/sessions" => Input::Sessions(SessionScope::Current),
         "/sessions --all" => Input::Sessions(SessionScope::All),
         input if input.split_whitespace().next() == Some("/delete") => {

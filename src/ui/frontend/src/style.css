@@ -919,3 +919,26 @@ label.session-item { cursor: pointer; }
 .drawer-close { align-self: flex-end; padding: 6px 9px; color: var(--ctp-subtext1); background: var(--ctp-surface0); border: 1px solid var(--ctp-surface1); border-radius: 6px; font-size: 12px; }
 .connection-banner { padding: 8px 16px; color: var(--ctp-peach); background: var(--ctp-mantle); font-size: 12px; }
 @media (max-width: 640px) { .workspace-editor input { font-size: 16px; } }
+
+.memory-backdrop { z-index: 10; }
+.memory-confirmation { z-index: 12; }
+.memory-panel { width: min(760px, 100%); max-height: 90dvh; overflow: auto; }
+.memory-heading { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
+.memory-heading h2 { margin: 0; }
+.memory-actions { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; margin: 12px 0; }
+.memory-actions input { flex: 1 1 220px; min-width: 0; }
+.memory-actions input, .memory-editor textarea { padding: 10px; border: 1px solid var(--ctp-surface2); border-radius: 8px; color: var(--ctp-text); background: var(--ctp-mantle); }
+.memory-editor { padding: 16px; border: 1px solid var(--ctp-mauve); border-radius: 10px; margin: 16px 0; }
+.memory-editor label, .memory-editor code { display: block; margin-bottom: 10px; }
+.memory-editor textarea { display: block; width: 100%; min-height: 140px; resize: vertical; font: inherit; }
+.memory-entry { padding: 16px 0; border-top: 1px solid var(--ctp-surface1); }
+.memory-entry small { color: var(--ctp-subtext1); }
+.memory-entry code, .memory-editor code, .memory-id { overflow-wrap: anywhere; word-break: break-all; }
+.memory-entry pre { max-height: none; }
+.memory-error { color: var(--ctp-red) !important; }
+.memory-notice { color: var(--ctp-teal) !important; }
+@media (max-width: 640px) {
+  .memory-panel { width: 100%; padding: 16px; }
+  .memory-actions input, .memory-editor textarea { font-size: 16px; }
+  .memory-heading { align-items: flex-start; }
+}

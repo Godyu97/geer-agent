@@ -168,7 +168,14 @@ struct DatabaseInputs {
     common_url: Option<String>,
     trace_enabled: Option<String>,
     session_enabled: Option<String>,
+    memory_enabled: Option<String>,
 }
+
+type DatabaseConfigs = (
+    Option<TraceDatabaseConfig>,
+    Option<TraceDatabaseConfig>,
+    Option<TraceDatabaseConfig>,
+);
 
 impl DatabaseInputs {
     fn from_env() -> Self {
@@ -177,19 +184,18 @@ impl DatabaseInputs {
             common_url: std::env::var("GEER_AGENT_DATABASE_URL").ok(),
             trace_enabled: std::env::var("GEER_AGENT_TRACE").ok(),
             session_enabled: std::env::var("GEER_AGENT_SESSION_PERSISTENCE").ok(),
+            memory_enabled: std::env::var("GEER_AGENT_MEMORY").ok(),
         }
     }
 
-    fn resolve(
-        self,
-        program_dir: &Path,
-    ) -> Result<(Option<TraceDatabaseConfig>, Option<TraceDatabaseConfig>), String> {
+    fn resolve(self, program_dir: &Path) -> Result<DatabaseConfigs, String> {
         let database =
             TraceDatabaseConfig::from_values(self.common_kind, self.common_url, program_dir)?;
         Ok((
             parse_on_off(self.trace_enabled, "GEER_AGENT_TRACE")?.then(|| database.clone()),
             parse_on_off(self.session_enabled, "GEER_AGENT_SESSION_PERSISTENCE")?
-                .then_some(database),
+                .then(|| database.clone()),
+            parse_on_off(self.memory_enabled, "GEER_AGENT_MEMORY")?.then_some(database),
         ))
     }
 }
@@ -259,6 +265,7 @@ pub(crate) struct Config {
     pub(crate) limits: ResourceLimits,
     pub(crate) trace_database: Option<TraceDatabaseConfig>,
     pub(crate) session_database: Option<TraceDatabaseConfig>,
+    pub(crate) memory_database: Option<TraceDatabaseConfig>,
     pub(crate) compaction: CompactionConfig,
 }
 
@@ -497,7 +504,11 @@ impl Config {
             std::env::var("GEER_AGENT_MAX_DURATION_SECONDS").ok(),
         ])
         .map_err(|message| io::Error::new(io::ErrorKind::InvalidInput, message))?;
-        (config.trace_database, config.session_database) = DatabaseInputs::from_env()
+        (
+            config.trace_database,
+            config.session_database,
+            config.memory_database,
+        ) = DatabaseInputs::from_env()
             .resolve(&program_dir)
             .map_err(|message| io::Error::new(io::ErrorKind::InvalidInput, message))?;
         config.compaction = CompactionConfig::from_values(
@@ -567,6 +578,7 @@ impl Config {
             limits: ResourceLimits::default(),
             trace_database: None,
             session_database: None,
+            memory_database: None,
             compaction: CompactionConfig::default(),
         })
     }
@@ -656,14 +668,15 @@ mod tests {
 
     #[test]
     fn database_defaults_and_shared_override() {
-        let (trace, session) = DatabaseInputs::default().resolve(&program_dir()).unwrap();
+        let (trace, session, memory) = DatabaseInputs::default().resolve(&program_dir()).unwrap();
         assert_eq!(trace, session);
+        assert_eq!(trace, memory);
         assert_eq!(
             trace.unwrap().url,
             default_database_url(&program_dir()).unwrap()
         );
 
-        let (trace, session) = DatabaseInputs {
+        let (trace, session, memory) = DatabaseInputs {
             common_kind: Some("sqlite".into()),
             common_url: Some("sqlite://custom.sqlite?mode=rwc".into()),
             ..Default::default()
@@ -671,6 +684,7 @@ mod tests {
         .resolve(&program_dir())
         .unwrap();
         assert_eq!(trace, session);
+        assert_eq!(trace, memory);
         assert_eq!(trace.unwrap().url, "sqlite://custom.sqlite?mode=rwc");
     }
 
@@ -684,24 +698,48 @@ mod tests {
 
     #[test]
     fn database_independent_switches() {
-        let (trace, session) = DatabaseInputs {
+        let (trace, session, memory) = DatabaseInputs {
             trace_enabled: Some("off".into()),
-            ..Default::default()
-        }
-        .resolve(&program_dir())
-        .unwrap();
-        assert!(trace.is_none() && session.is_some());
-        let (trace, session) = DatabaseInputs {
             session_enabled: Some("off".into()),
             ..Default::default()
         }
         .resolve(&program_dir())
         .unwrap();
-        assert!(trace.is_some() && session.is_none());
+        assert!(trace.is_none() && session.is_none() && memory.is_some());
+        let (trace, session, memory) = DatabaseInputs {
+            memory_enabled: Some("off".into()),
+            ..Default::default()
+        }
+        .resolve(&program_dir())
+        .unwrap();
+        assert!(trace.is_some() && session.is_some() && memory.is_none());
+        let (trace, session, memory) = DatabaseInputs {
+            trace_enabled: Some("off".into()),
+            ..Default::default()
+        }
+        .resolve(&program_dir())
+        .unwrap();
+        assert!(trace.is_none() && session.is_some() && memory.is_some());
+        let (trace, session, memory) = DatabaseInputs {
+            session_enabled: Some("off".into()),
+            ..Default::default()
+        }
+        .resolve(&program_dir())
+        .unwrap();
+        assert!(trace.is_some() && session.is_none() && memory.is_some());
     }
 
     #[test]
     fn database_rejects_invalid_explicit_values() {
+        assert!(
+            DatabaseInputs {
+                memory_enabled: Some("yes".into()),
+                ..Default::default()
+            }
+            .resolve(&program_dir())
+            .unwrap_err()
+            .contains("GEER_AGENT_MEMORY")
+        );
         assert!(
             DatabaseInputs {
                 common_kind: Some("postgres".into()),

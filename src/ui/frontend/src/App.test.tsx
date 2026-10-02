@@ -44,9 +44,10 @@ const snapshot: Snapshot = {
     turn_tokens: 0,
     total_tokens: 0,
     usage_complete: true,
+    instructions_loaded: false, memory: { state: "ready", count: 0, error: null },
   },
   sessions: [],
-  all_sessions: [],
+  all_sessions: [], memories: [],
   transcript: [],
   unsaved_ids: [],
 };

@@ -16,6 +16,11 @@ mod support;
 
 #[derive(Clone)]
 enum Reply {
+    UpdateRules {
+        path: std::path::PathBuf,
+        content: Option<String>,
+        reply: Box<Reply>,
+    },
     ResponsesCalls,
     ResponsesFinal,
     ChatCalls(usize),
@@ -79,6 +84,7 @@ fn run_repl_with_env(
 
     let mut command = support::command(env!("CARGO_BIN_EXE_geer-agent"));
     command
+        .current_dir(std::env::temp_dir())
         .env("OPENAI_API_KEY", "test-key")
         .env("OPENAI_MODEL", "test-model")
         .env("OPENAI_BASE_URL", url)
@@ -218,6 +224,21 @@ fn read_body(stream: &mut TcpStream) -> Value {
 }
 
 fn write_reply(stream: &mut TcpStream, reply: Reply) {
+    let reply = if let Reply::UpdateRules {
+        path,
+        content,
+        reply,
+    } = reply
+    {
+        if let Some(content) = content {
+            std::fs::write(path, content).unwrap();
+        } else {
+            std::fs::remove_file(path).unwrap();
+        }
+        *reply
+    } else {
+        reply
+    };
     if let Reply::ChatFinalDropTrace(path) = &reply {
         let path = path.clone();
         let runtime = tokio::runtime::Builder::new_current_thread()
@@ -234,6 +255,7 @@ fn write_reply(stream: &mut TcpStream, reply: Reply) {
         });
     }
     let (status, kind, body) = match reply {
+        Reply::UpdateRules { .. } => unreachable!("测试只包一层规则更新"),
         Reply::Error => (
             "400 Bad Request",
             "application/json",
@@ -771,6 +793,7 @@ fn chat_failure_before_tools_discards_failed_user_message() {
 fn invalid_bash_path_fails_before_repl() {
     let mut command = support::command(env!("CARGO_BIN_EXE_geer-agent"));
     command
+        .current_dir(std::env::temp_dir())
         .env("OPENAI_API_KEY", "test-key")
         .env("OPENAI_MODEL", "test-model")
         .env("GEER_AGENT_BASH_BIN", "/definitely/missing/geer-agent-bash");
@@ -1335,6 +1358,7 @@ fn trace_write_failure_warns_and_preserves_model_answer() {
 fn invalid_database_selection_fails_before_repl() {
     let mut command = support::command(env!("CARGO_BIN_EXE_geer-agent"));
     command
+        .current_dir(std::env::temp_dir())
         .env("OPENAI_API_KEY", "test-key")
         .env("OPENAI_MODEL", "test-model")
         .env("GEER_AGENT_DATABASE", "unknown")
@@ -1457,4 +1481,245 @@ fn context_overflow_compacts_and_retries_only_the_current_model_request() {
     assert!(bodies[1].to_string().contains("old-context-"));
     assert!(!bodies[3].to_string().contains("old-context-"));
     assert!(bodies[3].to_string().contains("latest question"));
+}
+
+#[tokio::test]
+async fn project_memory_rules_refresh_between_turns_and_memory_survives_restart_and_clear() {
+    for api in ["chat-completions", "responses"] {
+        let root = std::env::temp_dir().join(format!("geer-project-memory-{}", Uuid::new_v4()));
+        let workspace = root.join("workspace");
+        let child = workspace.join("child");
+        std::fs::create_dir_all(&child).unwrap();
+        std::fs::write(root.join("AGENTS.md"), "PARENT_RULE_MUST_NOT_LOAD").unwrap();
+        std::fs::write(child.join("AGENTS.md"), "CHILD_RULE_MUST_NOT_LOAD").unwrap();
+        let rules = workspace.join("AGENTS.md");
+        std::fs::write(&rules, "ROOT_RULE_V1\n完整的中文规则").unwrap();
+        let database_url = format!("sqlite://{}?mode=rwc", root.join("data.sqlite").display());
+        let settings = [
+            ("GEER_AGENT_DATABASE", "sqlite"),
+            ("GEER_AGENT_DATABASE_URL", database_url.as_str()),
+            ("GEER_AGENT_SESSION_PERSISTENCE", "on"),
+            ("GEER_AGENT_MEMORY", "on"),
+        ];
+        let final_reply = if api == "responses" {
+            Reply::ResponsesFinal
+        } else {
+            Reply::ChatFinal
+        };
+        let (output, bodies) = run_repl_with_env(
+            api,
+            vec![
+                Reply::UpdateRules {
+                    path: rules.clone(),
+                    content: Some("ROOT_RULE_V2".into()),
+                    reply: Box::new(named(
+                        api,
+                        "memory_write",
+                        r#"{"content":"用户偏好 Rust examples"}"#,
+                        1,
+                        false,
+                    )),
+                },
+                named(api, "memory_search", r#"{"query":"rust 用户"}"#, 2, false),
+                final_reply.clone(),
+                Reply::UpdateRules {
+                    path: rules,
+                    content: None,
+                    reply: Box::new(final_reply.clone()),
+                },
+                final_reply,
+            ],
+            &format!(
+                "/workspace {}\nremember-and-search\nnext-turn\nmissing-rules\n/exit\n",
+                workspace.display()
+            ),
+            &settings,
+        );
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(bodies.len(), 5);
+        let system = |body: &Value| {
+            if api == "responses" {
+                body["instructions"].as_str().unwrap().to_owned()
+            } else {
+                body["messages"][0]["content"].as_str().unwrap().to_owned()
+            }
+        };
+        for body in &bodies[..3] {
+            let rules = system(body);
+            assert!(rules.contains("ROOT_RULE_V1"));
+            assert!(rules.contains("完整的中文规则"));
+            assert!(!rules.contains("ROOT_RULE_V2"));
+            assert!(!rules.contains("MUST_NOT_LOAD"));
+        }
+        assert!(system(&bodies[3]).contains("ROOT_RULE_V2"));
+        assert!(!system(&bodies[4]).contains("ROOT_RULE_"));
+        assert!(bodies[2].to_string().contains("用户偏好 Rust examples"));
+        let tools = bodies[0]["tools"].as_array().unwrap();
+        let names: Vec<_> = tools
+            .iter()
+            .filter_map(|tool| {
+                if api == "responses" {
+                    tool["name"].as_str()
+                } else {
+                    tool["function"]["name"].as_str()
+                }
+            })
+            .collect();
+        assert!(names.contains(&"memory_write") && names.contains(&"memory_search"));
+        assert!(!String::from_utf8_lossy(&output.stdout).contains("请求授权"));
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let saved_id = stdout
+            .lines()
+            .filter_map(|line| line.strip_prefix("Session ID: "))
+            .next_back()
+            .unwrap();
+        let db = Database::connect(&database_url).await.unwrap();
+        let rows = db
+            .query_all_raw(Statement::from_string(
+                DbBackend::Sqlite,
+                "SELECT id, content FROM agent_memories".to_owned(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        let id: String = rows[0].try_get("", "id").unwrap();
+        let session_count = db
+            .query_one_raw(Statement::from_string(
+                DbBackend::Sqlite,
+                "SELECT COUNT(*) AS count FROM agent_sessions".to_owned(),
+            ))
+            .await
+            .unwrap()
+            .unwrap()
+            .try_get::<i64>("", "count")
+            .unwrap();
+        let trace_count = db
+            .query_one_raw(Statement::from_string(
+                DbBackend::Sqlite,
+                "SELECT COUNT(*) AS count FROM llm_traces".to_owned(),
+            ))
+            .await
+            .unwrap()
+            .unwrap()
+            .try_get::<i64>("", "count")
+            .unwrap();
+        assert!(session_count > 0 && trace_count == 5);
+        let (managed, calls) = run_repl_with_env(
+            api,
+            vec![],
+            &format!(
+                "/memory\n/new\n/delete --yes {saved_id}\n/workspace {}\n/memory search RUST\n/memory edit {id} 修改后的事实\n/memory delete {id}\n/memory search 修改\n/memory clear\n/memory search 修改\n/memory clear --yes\n/exit\n",
+                child.display()
+            ),
+            &settings
+                .iter()
+                .copied()
+                .chain([("GEER_AGENT_TOOLS", "off")])
+                .collect::<Vec<_>>(),
+        );
+        assert!(managed.status.success());
+        assert!(calls.is_empty());
+        let text = String::from_utf8_lossy(&managed.stdout);
+        assert!(text.contains("用户偏好 Rust examples"));
+        assert!(text.contains("已更新记忆"));
+        assert_eq!(text.matches("修改后的事实").count(), 2, "{text}");
+        assert!(text.contains("已清空 1 条全局长期记忆"));
+        let after = db
+            .query_one_raw(Statement::from_string(
+                DbBackend::Sqlite,
+                "SELECT COUNT(*) AS count FROM agent_memories".to_owned(),
+            ))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(after.try_get::<i64>("", "count").unwrap(), 0);
+        let after_sessions = db
+            .query_one_raw(Statement::from_string(
+                DbBackend::Sqlite,
+                "SELECT COUNT(*) AS count FROM agent_sessions".to_owned(),
+            ))
+            .await
+            .unwrap()
+            .unwrap()
+            .try_get::<i64>("", "count")
+            .unwrap();
+        let after_traces = db
+            .query_one_raw(Statement::from_string(
+                DbBackend::Sqlite,
+                "SELECT COUNT(*) AS count FROM llm_traces".to_owned(),
+            ))
+            .await
+            .unwrap()
+            .unwrap()
+            .try_get::<i64>("", "count")
+            .unwrap();
+        assert!(after_sessions >= session_count);
+        assert_eq!(after_traces, trace_count);
+        let (restarted, _) = run_repl_with_env(
+            api,
+            vec![],
+            "/memory\n/memory search Rust\n/memory delete --yes 11111111-1111-4111-8111-111111111111\n/memory clear --yes\n/exit\n",
+            &settings,
+        );
+        let text = String::from_utf8_lossy(&restarted.stdout);
+        assert!(text.contains("全局记忆 0 条"));
+        assert!(text.contains("没有找到相关记忆。"));
+        assert!(text.contains("记忆已不存在"));
+        drop(db);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+}
+
+#[test]
+fn project_memory_works_with_only_memory_enabled_and_failed_storage_does_not_stop_chat() {
+    let root = std::env::temp_dir().join(format!("geer-memory-only-{}", Uuid::new_v4()));
+    std::fs::create_dir_all(&root).unwrap();
+    let database_url = format!("sqlite://{}?mode=rwc", root.join("data.sqlite").display());
+    let settings = [
+        ("GEER_AGENT_DATABASE", "sqlite"),
+        ("GEER_AGENT_DATABASE_URL", database_url.as_str()),
+        ("GEER_AGENT_SESSION_PERSISTENCE", "off"),
+        ("GEER_AGENT_TRACE", "off"),
+        ("GEER_AGENT_MEMORY", "on"),
+        ("GEER_AGENT_TOOLS", "off"),
+    ];
+    let (first, calls) = run_repl_with_env(
+        "chat-completions",
+        vec![],
+        "/memory add 独立的长期事实\n/exit\n",
+        &settings,
+    );
+    assert!(first.status.success() && calls.is_empty());
+    let (second, calls) = run_repl_with_env(
+        "chat-completions",
+        vec![],
+        "/memory search 长期\n/exit\n",
+        &settings,
+    );
+    assert!(second.status.success() && calls.is_empty());
+    assert!(String::from_utf8_lossy(&second.stdout).contains("独立的长期事实"));
+    let bad_url = format!("sqlite://{}?mode=rwc", root.display());
+    let (failed, bodies) = run_repl_with_env(
+        "chat-completions",
+        vec![Reply::ChatFinal],
+        "/memory add 不应伪装成功\nchat-despite-memory-error\n/exit\n",
+        &[
+            ("GEER_AGENT_DATABASE", "sqlite"),
+            ("GEER_AGENT_DATABASE_URL", &bad_url),
+            ("GEER_AGENT_SESSION_PERSISTENCE", "off"),
+            ("GEER_AGENT_TRACE", "off"),
+            ("GEER_AGENT_MEMORY", "on"),
+        ],
+    );
+    assert!(failed.status.success());
+    assert!(String::from_utf8_lossy(&failed.stdout).contains("长期记忆不可用"));
+    assert!(!String::from_utf8_lossy(&failed.stdout).contains("已添加记忆"));
+    assert!(String::from_utf8_lossy(&failed.stderr).contains("记忆操作失败"));
+    assert_eq!(bodies.len(), 1);
+    assert!(!bodies[0]["tools"].to_string().contains("memory_write"));
+    std::fs::remove_dir_all(root).unwrap();
 }

@@ -12,6 +12,38 @@ impl Input {
         self.cursor = self.chars.len();
     }
 
+    pub(super) fn set_multiline(&mut self, value: &str) {
+        self.clear();
+        self.paste_multiline(value);
+    }
+
+    pub(super) fn paste_multiline(&mut self, value: &str) {
+        for ch in value.chars() {
+            if ch == '\n' {
+                self.newline();
+            } else {
+                self.insert(if ch == '\t' { ' ' } else { ch });
+            }
+        }
+    }
+
+    pub(super) fn newline(&mut self) {
+        self.chars.insert(self.cursor, '\n');
+        self.cursor += 1;
+    }
+
+    pub(super) fn position(&self) -> (usize, usize) {
+        let row = self.chars[..self.cursor]
+            .iter()
+            .filter(|ch| **ch == '\n')
+            .count();
+        let start = self.chars[..self.cursor]
+            .iter()
+            .rposition(|ch| *ch == '\n')
+            .map_or(0, |index| index + 1);
+        (row, self.width(start, self.cursor))
+    }
+
     pub(super) fn text(&self) -> String {
         self.chars.iter().collect()
     }
