@@ -78,7 +78,7 @@ make test
 make clippy
 ```
 
-根目录 `Makefile` 是这些命令的入口：`make help` 查看目标；收工用 `make check`（`fmt` → `test-safety` → `test` → `clippy`，顺序执行）。`test-safety` 需要 Python 3 标准库。测试与 clippy 使用独立受限服务，详见下节与 `README.md`。Make 的 `build` / `release` / `run` 默认编入 `gui,web` 并准备两种静态前端，启动时通过 `GEER_AGENT_UI` 选择 GUI/Web/TUI/REPL；前两者只构建 debug/release。直接 Cargo 默认仍是轻量终端配置，test/clippy 默认同样不加 feature。特殊 `embed-env` / `desktop-gui` 构建直接使用 Cargo，不维护旧 GUI/Web Make 别名。
+根目录 `Makefile` 是这些命令的入口：`make help` 查看目标；收工用 `make check`（`fmt` → `test-safety` → `test` → `clippy`，顺序执行）。`test-safety` 需要 Python 3 标准库。测试与 clippy 使用独立受限服务，详见下节与 `README.md`。Make 的 `build` / `release` / `run` 默认编入 `gui,web` 并准备两种静态前端，通用程序启动时通过 `GEER_AGENT_UI` 选择 GUI/Web/TUI/REPL；前两者只构建 debug/release。Windows 的 `build` / `release` 默认额外编译 `desktop-gui`，在对应 profile 目录交付只支持 GUI、无额外控制台的 `geer-agent-desktop.exe`，与通用 `geer-agent.exe` 并存；桌面缓存隔离在 `target/desktop-gui`，根目录跟随 `CARGO_TARGET_DIR`。Linux 构建与 `run` 保持单个通用程序。直接 Cargo 默认仍是轻量终端配置，test/clippy 默认同样不加 feature。特殊 `embed-env` 构建直接使用 Cargo，不维护旧 GUI/Web Make 别名，也不添加 `make debug`。
 
 改了代码再收工时：先 `fmt`，再相关 `test`，再 `clippy`。学习项目不要开 `-D warnings` 当门禁，但新引入的 clippy 警告要处理，不要留 `todo!()` / 无故 `unwrap`。
 

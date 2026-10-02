@@ -1,10 +1,13 @@
-# Make 构建包含全部界面的通用程序；启动时由 GEER_AGENT_UI 选择。
+# Make 构建通用程序；Windows 的 build/release 额外交付无控制台桌面程序。
 .DEFAULT_GOAL := help
 
 CARGO ?= cargo
 BUN ?= bun
 PYTHON ?= python3
 FRONTEND := src/ui/frontend
+TARGET_DIR := $(if $(CARGO_TARGET_DIR),$(CARGO_TARGET_DIR),target)
+# 两类程序使用不同 feature 和子系统，隔离输出避免桌面编译覆盖通用产物。
+DESKTOP_TARGET_DIR := $(TARGET_DIR)/desktop-gui
 SAFE_RUN := $(abspath scripts/test-safe.sh)
 # 间接引用避免 make -n 执行受限服务的准备命令。
 MAKE_IN_SERVICE := $(MAKE)
@@ -28,6 +31,9 @@ help:
 	@echo "                      debug 产物：target/debug/geer-agent[.exe]，不启动"
 	@echo "  make release        cargo build --release --features gui,web"
 	@echo "                      release 产物：target/release/geer-agent[.exe]，不启动"
+	@echo "  Windows build/release 默认另生成同目录的 geer-agent-desktop.exe"
+	@echo "                      桌面版只支持 GUI，默认打开窗口，无额外控制台"
+	@echo "                      桌面编译缓存：target/desktop-gui；CARGO_TARGET_DIR 可覆盖根目录"
 	@echo "  make run            cargo run --features gui,web（debug 构建并启动）"
 	@echo "  Cargo 的 release 构建是 cargo build --release，没有 cargo release 命令"
 	@echo
@@ -59,9 +65,17 @@ help:
 
 build: frontend-build
 	$(CARGO) build --features gui,web
+ifeq ($(OS),Windows_NT)
+	$(CARGO) build --features desktop-gui --target-dir "$(DESKTOP_TARGET_DIR)"
+	cp "$(DESKTOP_TARGET_DIR)/debug/geer-agent.exe" "$(TARGET_DIR)/debug/geer-agent-desktop.exe"
+endif
 
 release: frontend-build
 	$(CARGO) build --release --features gui,web
+ifeq ($(OS),Windows_NT)
+	$(CARGO) build --release --features desktop-gui --target-dir "$(DESKTOP_TARGET_DIR)"
+	cp "$(DESKTOP_TARGET_DIR)/release/geer-agent.exe" "$(TARGET_DIR)/release/geer-agent-desktop.exe"
+endif
 
 run: frontend-build
 	$(CARGO) run --features gui,web $(RUN_ARGS)
