@@ -10,6 +10,7 @@ Windows 通用构建保留控制台能力，双击以 GUI 启动时会出现控�
 - Windows 下 `make release` 默认同时生成上述两个 release 程序，输出到对应 profile 目录，无需额外命令或参数。
 - 桌面程序沿用现有只支持 GUI、默认进入 GUI、无额外控制台、启动错误在窗口显示的行为；通用程序继续通过环境配置选择四种界面。
 - Linux 等非 Windows 环境的构建与 `make run` 保持现状。
+- 修复 Windows 原生 Make 的兼容性：构建与清理不依赖 PATH 中的 Unix 命令，工具和输出目录支持空格；需要 Linux 隔离设施的检查入口在 Windows 明确失败。
 
 ## Capabilities
 

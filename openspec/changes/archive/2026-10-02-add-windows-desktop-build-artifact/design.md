@@ -18,7 +18,7 @@
 
 ### 2. 分离 Cargo 输出，保持两份产物可靠
 
-桌面构建使用独立的 Cargo target 目录，默认为 target/desktop-gui，避免后续编译或失败覆盖通用的 target/debug 或 target/release 产物。桌面编译只启用 desktop-gui，不启用 web、embed-env；成功后把对应 profile 的 geer-agent.exe 复制为通用 profile 目录中的 geer-agent-desktop.exe。沿用项目 Windows Git Bash 所提供的目录/复制命令，路径均加引号。若用户通过 CARGO_TARGET_DIR 调整根输出目录，两份输出与桌面缓存同步跟随该目录；默认无额外配置即使用 target。
+桌面构建使用独立的 Cargo target 目录，默认为 target/desktop-gui，避免后续编译或失败覆盖通用的 target/debug 或 target/release 产物。桌面编译只启用 desktop-gui，不启用 web、embed-env；成功后把对应 profile 的 geer-agent.exe 复制为通用 profile 目录中的 geer-agent-desktop.exe。Windows 原生 Make 明确使用 cmd.exe，禁用 AutoRun；复制使用内建 copy /Y，并将路径分隔符转换为反斜杠，不依赖 Git Bash 的 cp 或 PowerShell 别名。路径均加引号。若用户通过 CARGO_TARGET_DIR 调整根输出目录，两份输出与桌面缓存同步跟随该目录；默认无额外配置即使用 target。
 
 按现有 Make 每个目标的配方顺序执行 Cargo 与复制，任何失败终止该目标。build/release 可共享前端依赖，但不让同一个 profile 的通用与桌面程序写入同名 Cargo 产物。旧桌面文件若仍存在，不代表当前失败构建成功，文档应明确以 Make 退出状态为准。
 
@@ -34,11 +34,19 @@ help、README、AGENTS 与架构文档说明 Windows 双产物及两种界面的
 
 在 Linux 用 make -n 分别检查默认分支与 OS=Windows_NT 分支的 build/release 配方，并确认 run 不增加桌面编译。真实 Windows 验收核对双产物及 PE 子系统，分别双击两份桌面程序、检查配置失败可见性，再验证通用程序的终端和 GUI 选择。
 
+### 5. 原生 Windows 与 Linux 的配方兼容性修复
+
+Windows 使用 cmd 的 cd /D、空行输出和存在性检查后的 rmdir /S /Q；Linux 保留 POSIX 的 cd、echo 与 rm -rf。清理只处理 Cargo 产物和前端 dist。Cargo、Bun、Python 与递归 Make 的可执行路径统一加引号，支持安装目录带空格；参数仍由各配方独立传递。
+
+测试、前端测试、Web 测试、隔离探针、clippy 和完整检查依赖 Linux systemd/cgroup；Windows 在入口返回明确错误，不尝试执行 .sh 或 POSIX 环境变量赋值，不提供无约束回退。fmt、fmt-check、doc 与构建入口仍可在两个平台运行。本次不新增 Windows 测试隔离实现。
+
+验证使用 Windows 原生 Make 实际构建、双产物哈希与 PE 子系统检查，以及两平台命令展开检查；覆盖带空格的工具路径与输出目录、run 不增加桌面产物和 clean 的平台命令。Linux 通过原受限入口运行 make check；不能执行的检查明确记录，不用模拟 OS 的 dry-run 代替真实构建。
+
 ## Risks / Trade-offs
 
 - [Windows 首次构建时间和缓存占用增加] → 独立缓存支持后续增量构建，前端仍仅准备一次。
 - [错误 feature 或复制路径导致两份文件实际相同] → dry-run 核对 feature/profile，Windows 核对 PE 子系统与双击行为。
-- [当前环境是 Linux，无法完成 Windows 原生构建与窗口验收] → 明确报告验收限制，不把模拟 OS 的 dry-run 当成真实 Windows 验证。
+- [构建与窗口验收需要对应平台] → 分别记录原生构建、命令展开和窗口验收结果，不把模拟 OS 的 dry-run 当成真实 Windows 验证。
 - [项目治理仍描述 desktop-gui 仅走直接 Cargo] → 同步日常构建约定，同时保留直接 Cargo 构建能力。
 
 ## Migration Plan

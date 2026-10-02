@@ -26,7 +26,7 @@ cargo run
 
 Cargo 没有 `cargo release` 命令，release 构建使用 `cargo build --release`。两种 profile 的通用程序都名为 `geer-agent`（Windows 为 `geer-agent.exe`），支持同样的四种界面。
 
-Windows 下，`make build` / `make release` 还会自动编译 `desktop-gui`，在 `target/debug/` / `target/release/` 同时交付 `geer-agent.exe` 和 `geer-agent-desktop.exe`，无需额外命令或参数。桌面版默认打开 GUI，只支持 GUI，双击时不创建额外控制台。桌面版使用独立编译缓存 `target/desktop-gui/`，不会覆盖通用程序；首次构建耗时与缓存占用会增加。设置 `CARGO_TARGET_DIR` 时，上述产物与缓存均跟随该根目录。以 Make 成功退出为构建成功依据，失败时可能仍保留上一轮的产物。Windows Make 配方需要 Git Bash 的 `sh`、`cp` 可通过 PATH 使用。Linux 等非 Windows 环境仍只生成通用程序，`make run` 仍只构建并启动通用程序。
+Windows 下，`make build` / `make release` 还会自动编译 `desktop-gui`，在 `target/debug/` / `target/release/` 同时交付 `geer-agent.exe` 和 `geer-agent-desktop.exe`，无需额外命令或参数。桌面版默认打开 GUI，只支持 GUI，双击时不创建额外控制台。桌面版使用独立编译缓存 `target/desktop-gui/`，不会覆盖通用程序；首次构建耗时与缓存占用会增加。设置 `CARGO_TARGET_DIR` 时，上述产物与缓存均跟随该根目录。以 Make 成功退出为构建成功依据，失败时可能仍保留上一轮的产物。Windows 原生 GNU Make 使用系统 `cmd.exe` 执行配方，复制与清理使用内建命令，无需把 Git Bash 的 `sh`、`cp`、`rm` 加入 PATH；程序运行时的 Bash 工具仍需要 Git for Windows。Linux 等非 Windows 环境仍只生成通用程序，`make run` 仍只构建并启动通用程序。
 
 **通用程序的启动界面由 ENV 决定，构建时不固定 UI。** 可以在程序选用的 `.env` 中设置 `GEER_AGENT_UI=gui|web|tui|repl|auto`；进程环境优先，同一个通用产物切换 UI 无需重新编译。
 
@@ -229,6 +229,8 @@ cargo build --release --features embed-env
 ## 开发命令
 
 根目录 `Makefile` 包装了常用 Cargo / 前端命令（需要 GNU Make）：
+
+`build`、`release`、`run`、前端构建/类型检查、`fmt`、`fmt-check`、`doc` 和 `clean` 支持 Linux 与原生 Windows。工具路径可通过 `CARGO`、`BUN` 等 Make 变量覆盖，路径带空格时将整个赋值作为一个参数传入，例如 PowerShell 中的 `make release 'CARGO=C:/Program Files/Rust/bin/cargo.exe' 'CARGO_TARGET_DIR=target with spaces'`。这些工具变量只填写可执行文件路径，不附加参数。Windows 的测试、clippy 和完整检查入口会明确提示需要 Linux 隔离环境并失败退出；其余检查约束见下节。
 
 ```sh
 make help      # 列出目标
