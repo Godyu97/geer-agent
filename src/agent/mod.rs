@@ -410,6 +410,7 @@ pub(crate) async fn create() -> Result<Agent, Box<dyn Error>> {
         chat: Provider::new(&config),
         tools,
         memory,
+        memory_recall: config.memory_recall,
         budget: AgentBudget {
             limits: config.limits,
             ..DEFAULT_AGENT_BUDGET
@@ -440,6 +441,7 @@ pub(crate) struct Agent {
     chat: Provider,
     tools: Tools,
     memory: MemoryService,
+    memory_recall: bool,
     budget: AgentBudget,
     compaction: CompactionConfig,
     model: String,
@@ -562,14 +564,29 @@ impl Session for Agent {
         self.sessions
             .refresh_instructions()
             .map_err(io::Error::other)?;
-        if self.memory.status().state != crate::memory::MemoryState::Disabled
-            && let Err(error) = self.memory.list().await
+        let recalled_memory = if self.memory.status().state == crate::memory::MemoryState::Disabled
         {
-            emit_diagnostic(format!("长期记忆不可用：{error}"));
-        }
+            None
+        } else {
+            let result = if self.memory_recall {
+                self.memory
+                    .recall(input, (self.compaction.context_window_tokens / 8).min(2048))
+                    .await
+            } else {
+                self.memory.list().await.map(|_| None)
+            };
+            match result {
+                Ok(recalled) => recalled,
+                Err(error) => {
+                    emit_diagnostic(format!("长期记忆不可用：{error}"));
+                    None
+                }
+            }
+        };
         self.turn_tokens = 0;
         let state = &mut self.sessions.active;
         state.prompt.begin_turn(input);
+        state.prompt.set_recalled_memory(recalled_memory);
         state.changed();
         if let Some(session) = state.runtime.as_mut() {
             session
@@ -1837,6 +1854,7 @@ mod tests {
             trace_database: None,
             session_database: None,
             memory_database: None,
+            memory_recall: true,
             compaction: CompactionConfig::default(),
         };
         let mut tools = Tools::new(true, crate::config::default_bash_bin()).unwrap();
@@ -1845,6 +1863,7 @@ mod tests {
             chat: Provider::new(&config),
             tools,
             memory: crate::memory::MemoryService::disabled(),
+            memory_recall: true,
             budget: DEFAULT_AGENT_BUDGET,
             compaction: config.compaction,
             model: config.model.clone(),

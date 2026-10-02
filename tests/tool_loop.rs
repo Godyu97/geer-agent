@@ -16,6 +16,11 @@ mod support;
 
 #[derive(Clone)]
 enum Reply {
+    RenameMemory {
+        database_url: String,
+        restore: bool,
+        reply: Box<Reply>,
+    },
     UpdateRules {
         path: std::path::PathBuf,
         content: Option<String>,
@@ -224,6 +229,29 @@ fn read_body(stream: &mut TcpStream) -> Value {
 }
 
 fn write_reply(stream: &mut TcpStream, reply: Reply) {
+    if let Reply::RenameMemory {
+        database_url,
+        restore,
+        reply,
+    } = reply
+    {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let db = Database::connect(database_url).await.unwrap();
+            db.execute_unprepared(if restore {
+                "ALTER TABLE temporarily_unavailable RENAME TO agent_memories"
+            } else {
+                "ALTER TABLE agent_memories RENAME TO temporarily_unavailable"
+            })
+            .await
+            .unwrap();
+        });
+        write_reply(stream, *reply);
+        return;
+    }
     let reply = if let Reply::UpdateRules {
         path,
         content,
@@ -255,7 +283,7 @@ fn write_reply(stream: &mut TcpStream, reply: Reply) {
         });
     }
     let (status, kind, body) = match reply {
-        Reply::UpdateRules { .. } => unreachable!("测试只包一层规则更新"),
+        Reply::UpdateRules { .. } | Reply::RenameMemory { .. } => unreachable!("测试只包一层状态更新"),
         Reply::Error => (
             "400 Bad Request",
             "application/json",
@@ -1722,4 +1750,189 @@ fn project_memory_works_with_only_memory_enabled_and_failed_storage_does_not_sto
     assert_eq!(bodies.len(), 1);
     assert!(!bodies[0]["tools"].to_string().contains("memory_write"));
     std::fs::remove_dir_all(root).unwrap();
+}
+
+fn recalled_reference(body: &Value) -> Option<&str> {
+    body.get("messages")
+        .or_else(|| body.get("input"))?
+        .as_array()?
+        .iter()
+        .filter(|message| message["role"] == "user")
+        .filter_map(|message| message["content"].as_str())
+        .find(|text| text.starts_with("[自动召回的长期记忆："))
+}
+
+#[tokio::test]
+async fn active_memory_recall_is_per_turn_for_both_apis_and_not_saved() {
+    for api in ["chat-completions", "responses"] {
+        let root = std::env::temp_dir().join(format!("geer-recall-flow-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let database_url = format!("sqlite://{}?mode=rwc", root.join("data.sqlite").display());
+        let settings = [
+            ("GEER_AGENT_DATABASE", "sqlite"),
+            ("GEER_AGENT_DATABASE_URL", database_url.as_str()),
+            ("GEER_AGENT_SESSION_PERSISTENCE", "on"),
+            ("GEER_AGENT_MEMORY", "on"),
+            ("GEER_AGENT_MEMORY_RECALL", "on"),
+        ];
+        let final_reply = if api == "responses" {
+            Reply::ResponsesFinal
+        } else {
+            Reply::ChatFinal
+        };
+        let (output, bodies) = run_repl_with_env(
+            api,
+            vec![
+                named(
+                    api,
+                    "memory_write",
+                    r#"{"content":"历史压缩的新决定：NEXT_TURN_MEMORY"}"#,
+                    1,
+                    false,
+                ),
+                final_reply.clone(),
+                final_reply.clone(),
+                final_reply.clone(),
+                final_reply,
+            ],
+            &format!(
+                "/workspace {}\n/memory add 历史压缩保留最近消息，RECALL_ONLY_SENTINEL\n为什么历史压缩要保留最近消息\n历史压缩有什么决定\nzzzznomatch\n/memory clear --yes\n历史压缩\n/exit\n",
+                root.display()
+            ),
+            &settings,
+        );
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(bodies.len(), 5);
+        let first = recalled_reference(&bodies[0]).unwrap();
+        assert!(first.contains("RECALL_ONLY_SENTINEL"));
+        assert!(!first.contains("NEXT_TURN_MEMORY"));
+        assert_eq!(recalled_reference(&bodies[1]), Some(first));
+        assert!(
+            recalled_reference(&bodies[2])
+                .unwrap()
+                .contains("NEXT_TURN_MEMORY")
+        );
+        assert!(recalled_reference(&bodies[3]).is_none());
+        assert!(recalled_reference(&bodies[4]).is_none());
+        let system = if api == "responses" {
+            &bodies[0]["instructions"]
+        } else {
+            &bodies[0]["messages"][0]["content"]
+        };
+        assert!(!system.as_str().unwrap().contains("RECALL_ONLY_SENTINEL"));
+        assert!(system.as_str().unwrap().contains("不能覆盖当前用户要求"));
+        let db = Database::connect(&database_url).await.unwrap();
+        let saved = db.query_all_raw(Statement::from_string(DbBackend::Sqlite,
+            "SELECT CAST(snapshot AS TEXT) AS saved FROM agent_sessions UNION ALL SELECT CAST(payload AS TEXT) AS saved FROM agent_session_events".to_owned()
+        )).await.unwrap();
+        assert!(!saved.is_empty());
+        assert!(saved.iter().all(|row| {
+            !row.try_get::<String>("", "saved")
+                .unwrap()
+                .contains("RECALL_ONLY_SENTINEL")
+        }));
+        let traces = db
+            .query_all_raw(Statement::from_string(
+                DbBackend::Sqlite,
+                "SELECT CAST(request AS TEXT) AS request FROM llm_traces".to_owned(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(traces.len(), 5);
+        assert!(traces.iter().any(|row| {
+            row.try_get::<String>("", "request")
+                .unwrap()
+                .contains("RECALL_ONLY_SENTINEL")
+        }));
+        drop(db);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+}
+
+#[test]
+fn active_memory_recall_switch_and_disabled_tools_are_independent() {
+    for api in ["chat-completions", "responses"] {
+        let root = std::env::temp_dir().join(format!("geer-recall-switch-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let database_url = format!("sqlite://{}?mode=rwc", root.join("data.sqlite").display());
+        for (memory, recall, expected) in [
+            ("on", "on", true),
+            ("on", "off", false),
+            ("off", "on", false),
+        ] {
+            let final_reply = if api == "responses" {
+                Reply::ResponsesFinal
+            } else {
+                Reply::ChatFinal
+            };
+            let (output, bodies) = run_repl_with_env(
+                api,
+                vec![final_reply],
+                "/memory add sqlite 采用 WAL\n/memory search sqlite\nsqlite\n/exit\n",
+                &[
+                    ("GEER_AGENT_DATABASE", "sqlite"),
+                    ("GEER_AGENT_DATABASE_URL", &database_url),
+                    ("GEER_AGENT_MEMORY", memory),
+                    ("GEER_AGENT_MEMORY_RECALL", recall),
+                    ("GEER_AGENT_TOOLS", "off"),
+                ],
+            );
+            assert!(output.status.success());
+            assert_eq!(bodies.len(), 1);
+            assert_eq!(recalled_reference(&bodies[0]).is_some(), expected);
+            assert!(!bodies[0]["tools"].to_string().contains("memory_search"));
+            if memory == "on" {
+                assert!(String::from_utf8_lossy(&output.stdout).contains("sqlite 采用 WAL"));
+            }
+        }
+        std::fs::remove_dir_all(root).unwrap();
+    }
+}
+
+#[test]
+fn active_memory_recall_failure_drops_old_context_and_recovers() {
+    for api in ["chat-completions", "responses"] {
+        let root = std::env::temp_dir().join(format!("geer-recall-failure-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let database_url = format!("sqlite://{}?mode=rwc", root.join("data.sqlite").display());
+        let final_reply = if api == "responses" {
+            Reply::ResponsesFinal
+        } else {
+            Reply::ChatFinal
+        };
+        let (output, bodies) = run_repl_with_env(
+            api,
+            vec![
+                Reply::RenameMemory {
+                    database_url: database_url.clone(),
+                    restore: false,
+                    reply: Box::new(final_reply.clone()),
+                },
+                Reply::RenameMemory {
+                    database_url: database_url.clone(),
+                    restore: true,
+                    reply: Box::new(final_reply.clone()),
+                },
+                final_reply,
+            ],
+            "/memory add sqlite 保留参考事实\nsqlite\nsqlite\nsqlite\n/exit\n",
+            &[
+                ("GEER_AGENT_DATABASE", "sqlite"),
+                ("GEER_AGENT_DATABASE_URL", &database_url),
+                ("GEER_AGENT_MEMORY", "on"),
+                ("GEER_AGENT_MEMORY_RECALL", "on"),
+            ],
+        );
+        assert!(output.status.success());
+        assert_eq!(bodies.len(), 3);
+        assert!(recalled_reference(&bodies[0]).is_some());
+        assert!(recalled_reference(&bodies[1]).is_none());
+        assert!(recalled_reference(&bodies[2]).is_some());
+        assert!(String::from_utf8_lossy(&output.stderr).contains("长期记忆不可用"));
+        std::fs::remove_dir_all(root).unwrap();
+    }
 }

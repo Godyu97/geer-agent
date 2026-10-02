@@ -266,6 +266,7 @@ pub(crate) struct Config {
     pub(crate) trace_database: Option<TraceDatabaseConfig>,
     pub(crate) session_database: Option<TraceDatabaseConfig>,
     pub(crate) memory_database: Option<TraceDatabaseConfig>,
+    pub(crate) memory_recall: bool,
     pub(crate) compaction: CompactionConfig,
 }
 
@@ -511,6 +512,11 @@ impl Config {
         ) = DatabaseInputs::from_env()
             .resolve(&program_dir)
             .map_err(|message| io::Error::new(io::ErrorKind::InvalidInput, message))?;
+        config.memory_recall = parse_on_off(
+            std::env::var("GEER_AGENT_MEMORY_RECALL").ok(),
+            "GEER_AGENT_MEMORY_RECALL",
+        )
+        .map_err(|message| io::Error::new(io::ErrorKind::InvalidInput, message))?;
         config.compaction = CompactionConfig::from_values(
             std::env::var("GEER_AGENT_CONTEXT_WINDOW_TOKENS").ok(),
             std::env::var("GEER_AGENT_AUTO_COMPACT").ok(),
@@ -579,6 +585,7 @@ impl Config {
             trace_database: None,
             session_database: None,
             memory_database: None,
+            memory_recall: true,
             compaction: CompactionConfig::default(),
         })
     }
@@ -593,6 +600,18 @@ fn required_value(value: Option<String>, name: &str) -> Result<String, String> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn memory_recall_switch_defaults_on_and_rejects_invalid_values() {
+        use super::parse_on_off;
+        assert!(parse_on_off(None, "GEER_AGENT_MEMORY_RECALL").unwrap());
+        assert!(parse_on_off(Some("on".into()), "GEER_AGENT_MEMORY_RECALL").unwrap());
+        assert!(!parse_on_off(Some("off".into()), "GEER_AGENT_MEMORY_RECALL").unwrap());
+        assert!(
+            parse_on_off(Some("yes".into()), "GEER_AGENT_MEMORY_RECALL")
+                .unwrap_err()
+                .contains("GEER_AGENT_MEMORY_RECALL")
+        );
+    }
     use super::{
         CompactionConfig, Config, DEFAULT_BASE_URL, DatabaseInputs, OpenAiApi, ResourceLimits,
         TraceDatabase, TraceDatabaseConfig, UiMode, default_database_url, local_project_dir,

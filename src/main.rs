@@ -8,6 +8,7 @@ mod interaction;
 mod memory;
 mod prompt;
 mod provider;
+mod retrieval;
 mod session;
 mod tools;
 mod trace;

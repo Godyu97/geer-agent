@@ -88,7 +88,9 @@ WebConfig 仅在选中 Web 时解析：固定 IPv4 全接口、默认 8827，`GE
 
 `memory::MemoryService` 由 Agent 和 Tools 共享单线程 Rc，提供列表、关键词搜索、去重添加、编辑、单条删除及清空。记录在 `agent_memories` 独立表/集合中，不含 workspace/session 外键；SQL 用新增版本化迁移，MongoDB 按需建立集合。三个持久化开关独立，同配置复用连接。操作直接读取或写入数据库，只缓存状态和最近成功数量，失败显示 unavailable，不将旧列表重新 flush 回数据库。精确去重与搜索在 Rust 处理，保证 SQL collation 和 MongoDB 下行为一致。
 
-两个记忆工具自动授权、串行执行，沿用预算和 ToolOutput；`GEER_AGENT_TOOLS=off` 或记忆不可用时不声明。界面通过 `interaction::execute` 执行公共记忆命令；TUI 的 F4 面板和共用 React MemoryPanel 保留独立编辑状态与聊天草稿。图形快照增加完整记忆列表、状态和根指令加载标识；前端搜索复用同样的评分、排序与十条上限。列表仅传给 UI，模型按需搜索。
+两个记忆工具自动授权、串行执行，沿用预算和 ToolOutput；`GEER_AGENT_TOOLS=off` 或记忆不可用时不声明。界面通过 `interaction::execute` 执行公共记忆命令；TUI 的 F4 面板和共用 React MemoryPanel 保留独立编辑状态与聊天草稿。图形快照增加完整记忆列表、状态和根指令加载标识；前端搜索复用同样的评分、排序与十条上限。完整列表仅传给 UI，模型可按需搜索，也能接收本轮受限召回。
+
+[主动召回](memory-retrieval.md) 在每条消息前复用数据库读取，由独立 `retrieval` 模块按 Unicode 分块和 BM25-lite 排序。`MemoryService::recall` 选择最多五个不相交片段，携带 UUID、更新时间与字符范围，并限制为 `min(窗口 / 8, 2048)` 估算 Token。`Prompt::recalled_memory` 是独立于快照、原始事件和压缩输入的临时字段，两种 API 都将其组成 user-role 参考消息；其开销仍进入上下文估算。begin_turn、恢复和替换系统上下文会清除旧召回。`GEER_AGENT_MEMORY_RECALL` 单独控制此路径，工具开关不影响；数据库错误诊断后继续聊天，下轮重试读取。
 
 EventHub 的预览现在区分会话删除、记忆单条删除和全局清空，绑定来源端、准确目标与 revision。GUI/Web 的记忆确认均必须匹配预览，任何后续提交或断线使旧预览失效；其他 Web 客户端只同步列表和总数。清空只删除长期记忆记录，现有会话、Trace 和提示文件保持独立生命周期。
 
