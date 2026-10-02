@@ -24,9 +24,11 @@ cargo run
 | `make release` | `cargo build --release --features gui,web` | 仅构建 release，产物在 `target/release/` |
 | `make run` | `cargo run --features gui,web` | 构建 debug 并启动 |
 
-Cargo 没有 `cargo release` 命令，release 构建使用 `cargo build --release`。两种 profile 的程序都名为 `geer-agent`（Windows 为 `geer-agent.exe`），支持同样的四种界面。
+Cargo 没有 `cargo release` 命令，release 构建使用 `cargo build --release`。两种 profile 的通用程序都名为 `geer-agent`（Windows 为 `geer-agent.exe`），支持同样的四种界面。
 
-**启动界面由 ENV 决定，构建时不固定 UI。** 可以在程序选用的 `.env` 中设置 `GEER_AGENT_UI=gui|web|tui|repl|auto`；进程环境优先，同一个产物切换 UI 无需重新编译。
+Windows 下，`make build` / `make release` 还会自动编译 `desktop-gui`，在 `target/debug/` / `target/release/` 同时交付 `geer-agent.exe` 和 `geer-agent-desktop.exe`，无需额外命令或参数。桌面版默认打开 GUI，只支持 GUI，双击时不创建额外控制台。桌面版使用独立编译缓存 `target/desktop-gui/`，不会覆盖通用程序；首次构建耗时与缓存占用会增加。设置 `CARGO_TARGET_DIR` 时，上述产物与缓存均跟随该根目录。以 Make 成功退出为构建成功依据，失败时可能仍保留上一轮的产物。Windows Make 配方需要 Git Bash 的 `sh`、`cp` 可通过 PATH 使用。Linux 等非 Windows 环境仍只生成通用程序，`make run` 仍只构建并启动通用程序。
+
+**通用程序的启动界面由 ENV 决定，构建时不固定 UI。** 可以在程序选用的 `.env` 中设置 `GEER_AGENT_UI=gui|web|tui|repl|auto`；进程环境优先，同一个通用产物切换 UI 无需重新编译。
 
 ```sh
 GEER_AGENT_UI=gui make run
@@ -60,7 +62,15 @@ cargo run --features gui
 
 通用程序通过 `GEER_AGENT_UI=gui` 启动桌面窗口，并保留 TUI/REPL 和 Web 选择。Windows 通用程序保留控制台子系统，从已有终端运行时终端会保留；双击通用程序可能出现控制台窗口。
 
-如需 Windows 双击完全无控制台，可在 `make frontend-build` 后执行 `cargo build --release --features desktop-gui`，再打开对应 release 产物。这个专用构建默认进入 GUI，只支持 GUI，配置错误在窗口显示；后台工具执行不弹出控制台。它会替换同一路径的通用 release 程序，切回通用版本需要重新 `make release`。
+如需 Windows 双击完全无控制台，执行 `make build` 或 `make release`，再打开对应目录的 `geer-agent-desktop.exe`。它默认进入 GUI，仅接受 `GEER_AGENT_UI=auto` 或 `gui`；配置错误在窗口显示，后台工具执行不弹出控制台。仍可在 `make frontend-build` 后直接执行 `cargo build --release --features desktop-gui`，但这条直接 Cargo 命令会替换 `target/release/geer-agent.exe`，切回通用程序需重新 `make release`。
+
+Windows 手工验收（在安装原生构建依赖的 Windows 环境执行）：
+
+1. 分别运行 `make build` 和 `make release`，确认 `target/debug/`、`target/release/` 各有两份 exe；若设置了 `CARGO_TARGET_DIR`，检查对应目录。
+2. 在 Visual Studio 开发者终端用 `dumpbin /headers` 检查两种 profile 的两份 exe：通用版 Subsystem 应为 Windows CUI，桌面版应为 Windows GUI。
+3. 配置有效的模型参数，将 `GEER_AGENT_UI` 留空或设为 `auto`，分别双击 debug/release 的 `geer-agent-desktop.exe`，确认默认打开 GUI 且无额外控制台；在 GUI 中授权执行一个有限命令，确认后台工具也不弹窗。
+4. 临时将 `GEER_AGENT_UI` 设为无效值，再启动桌面版，确认窗口显示配置错误；验收后恢复原配置。
+5. 从 PowerShell 启动通用版，先设 `$env:GEER_AGENT_UI = 'tui'` 验证终端界面，再设为 `gui` 验证窗口界面；完成后恢复原进程环境。两种 profile 都应保持通用入口的模式选择能力。
 
 Linux 桌面入口模板位于 `src/ui/gui/geer-agent.desktop`：把 `Exec` 改为桌面可执行文件的实际绝对路径，保留双引号及 `Terminal=false`，然后保存到 `~/.local/share/applications/geer-agent.desktop`，从应用菜单打开。启动器直接运行二进制，不调用 Cargo 或终端模拟器。配置仍按既有 `.env` 查找顺序加载，无需以项目目录作为启动工作目录。原因、技术方案及验收步骤见 [GUI 启动优化方案](doc/plan/2026-10-01-gui-launch.md)。
 
@@ -132,6 +142,29 @@ Bash、目录查询、文件工具和 `search` 各自在当前会话首次使用
 
 网页搜索网络超时 25 秒，抓取网络总耗时 15 秒（用户确认等待不计入），响应体上限 1 MiB，单次结果上限 12000 字符。客户端复用 HTTP/TLS 与环境代理配置，不携带模型 API key、Cookie 或用户认证头。网页摘要和正文作为不可信数据交给模型。首版只提供静态文本访问；PDF、JavaScript 渲染、缓存及抓取回退暂未实现。
 
+## 项目指令与长期记忆
+
+项目指令只读取当前 workspace 根目录的 `AGENTS.md`，不读取父目录、子目录或用户目录中的规则，也不读取 `CLAUDE.md`。启动、切换 workspace、打开会话和每条用户消息前重新读取全文；同一条消息的工具循环使用同一份指令，修改在下一条消息生效。根文件缺失或为空时正常运行并显示无指令；其他读取错误会明确报告，失败的切换保留原会话。指令独立于历史和摘要，恢复旧会话使用当前文件，压缩后仍完整提供给模型。
+
+长期记忆默认启用，保存在公共数据库的独立 `agent_memories` 表（MongoDB 为同名集合），同一数据库下所有 workspace 和会话共享。每条记录包含完整 UUID、正文、创建和更新时间。正文去除首尾空白，重复添加返回已有记录；编辑保留 UUID 和创建时间，不能覆盖成另一条已有正文。数据库写入成功才显示成功，不回退为临时记忆。
+
+Agent 自动执行 `memory_write(content)` 保存用户偏好、项目事实和重要决定，使用 `memory_search(query)` 按需回忆，不会将全部记忆自动注入提示。搜索按空白拆词、不区分大小写，命中任意词即可；命中词数越多越靠前，同分按创建时间和 UUID 排序，最多十条。工具结果最多 2000 字符，界面可以查看全文。
+
+四种界面都可直接管理记忆，不触发模型调用：TUI 按 F4 或输入 `/memory`，GUI/Web 点击顶部“记忆”。TUI 中 `/` 搜索、`a` 新增、`e` 编辑、Enter 查看全文、Delete 删除、`c` 清空，Esc 返回；编辑支持粘贴多行与 Shift+Enter 换行，失败时保留正文。图形面板支持窄屏、全文、多行编辑和搜索，管理操作保留聊天草稿。状态面板显示根指令是否加载、记忆状态及总数。
+
+| 公共命令 | 功能 |
+| --- | --- |
+| `/memory` | 查看全部全局记忆 |
+| `/memory search Rust 中文` | 按关键词搜索 |
+| `/memory add 回答使用 Rust 示例` | 添加正文 |
+| `/memory edit <完整 UUID> <正文>` | 编辑指定记忆 |
+| `/memory delete [--yes] <完整 UUID>` | 删除指定记忆 |
+| `/memory clear [--yes]` | 清空全部长期记忆 |
+
+删除与清空默认取消。管道输入必须带 `--yes`，未确认的命令不会消耗后续输入；GUI/Web 即使手动输入 `--yes` 也需要先预览并确认，确认只属于发起端，目标或状态改变、断线后需要重新预览。清空影响所有 workspace 的长期记忆，保留会话、Trace、项目指令和历史中已经引用的内容；空库清空和重复删除可以安全重试。
+
+`GEER_AGENT_MEMORY=off` 独立关闭记忆，保留已存数据。`GEER_AGENT_TOOLS=off` 只关闭模型工具，UI 仍能管理记忆。关闭会话持久化与 Trace 后，记忆仍可跨重启保存；初始化或读取失败会显示不可用，普通聊天可继续，记忆操作会报告错误。
+
 ## 上下文压缩与会话恢复
 
 `Prompt` 保留当前系统环境提示、历史摘要和近期原文。每次模型请求前估算上下文用量；默认窗口为 272,000 tokens，到 90% 时自动请求同一模型生成摘要。摘要保留任务目标、约束、进展和待办，并以普通历史背景交给模型；完整工具调用与结果不会在中间切开。估算依据消息的序列化体积和服务端报告的实际输入用量，可能与所用模型的 tokenizer 不同。
@@ -152,13 +185,13 @@ Bash、目录查询、文件工具和 `search` 各自在当前会话首次使用
 
 会话存储将脱敏后的用户输入、模型输出、工具结果和摘要事件追加保存，并发布可恢复的检查点；压缩不会删除原始事件。恢复要求相同工作目录、模型、API 类型和端点，重新生成系统环境提示并清空工具授权。工具执行中断后会提示副作用未确认，不自动重跑工具。已知 API key、数据库 URL 和认证头在保存前脱敏；会话记录仍可能含其他敏感业务内容，请保护数据库及备份。本版不自动清理会话。
 
-会话和 Trace 默认共用所选配置目录的 `.db/geer.sqlite`，目录会自动创建：普通 `cargo run` 使用项目根目录时写入项目的 `.db/`；可执行文件旁有 `.env` 时写入其同级 `.db/`；使用 `~/.geer-agent/.env`，或仅使用进程变量、内嵌配置时写入 `~/.geer-agent/.db/`。项目根目录的 `.db/` 已加入 Git 忽略。可用公共配置改用其他数据库或指定旧文件：
+会话、Trace 和长期记忆默认共用所选配置目录的 `.db/geer.sqlite`，目录会自动创建：普通 `cargo run` 使用项目根目录时写入项目的 `.db/`；可执行文件旁有 `.env` 时写入其同级 `.db/`；使用 `~/.geer-agent/.env`，或仅使用进程变量、内嵌配置时写入 `~/.geer-agent/.db/`。项目根目录的 `.db/` 已加入 Git 忽略。可用公共配置改用其他数据库或指定旧文件：
 
 ```sh
 GEER_AGENT_DATABASE_URL='sqlite:///absolute/path/to/previous/.db/geer.sqlite?mode=rwc'
 ```
 
-`GEER_AGENT_DATABASE` 默认为 `sqlite`；选择其他后端时必须设置对应 URL。省略 `GEER_AGENT_DATABASE_URL` 才会使用上述同目录默认路径。Trace 和会话共用这组数据库配置，可分别通过 `GEER_AGENT_TRACE` 和 `GEER_AGENT_SESSION_PERSISTENCE` 关闭。已有数据库可以通过公共配置指定原地址，无需迁移数据。
+`GEER_AGENT_DATABASE` 默认为 `sqlite`；选择其他后端时必须设置对应 URL。省略 `GEER_AGENT_DATABASE_URL` 才会使用上述同目录默认路径。Trace、会话和长期记忆共用这组数据库配置，可分别通过 `GEER_AGENT_TRACE`、`GEER_AGENT_SESSION_PERSISTENCE` 和 `GEER_AGENT_MEMORY` 关闭。已有数据库可以通过公共配置指定原地址，无需迁移数据。
 
 ## 执行预算
 

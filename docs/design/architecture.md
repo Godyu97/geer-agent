@@ -27,7 +27,7 @@
 | 桌面界面 | 可选 Tauri 2 | 窗口、IPC、目录选择和剪贴板 |
 | 浏览器界面 | 可选 Axum 0.8、include_dir、WebSocket | HTTP 监听、口令与凭证、同源校验、资源与事件传输 |
 | 共用图形前端 | React/TypeScript、Vite/tsc/Vitest，Bun 1.4.2 管理 | 一套交互、状态、协议、Mocha 样式，构建时选择宿主 |
-| 数据持久化 | SeaORM 与 MongoDB driver | SQLite、PostgreSQL、MySQL、MongoDB 的会话与 Trace 适配 |
+| 数据持久化 | SeaORM 与 MongoDB driver | SQLite、PostgreSQL、MySQL、MongoDB 的会话、Trace 与长期记忆适配 |
 | 配置与数据 | dotenvy、Serde、serde_json、UUID | 环境配置、快照、事件与标识符 |
 
 依赖依据见 [Cargo.toml](/home/lihongyu/projects/geer-agent/Cargo.toml) 与 [共用前端依赖清单](/home/lihongyu/projects/geer-agent/src/ui/frontend/package.json)。GUI 依赖由 `gui` feature 控制；`embed-env` 在编译时内嵌配置。数据库驱动目前属于默认 Rust 依赖，运行时关闭持久化不会移除它们的编译成本。
@@ -76,11 +76,21 @@ Agent 含非 Send 确认回调，只在工作线程创建和使用。UI/网络�
 
 Web 是单用户多浏览器：所有端共用当前会话/workspace，第一份有效授权回复生效；120 秒或全部端断线默认拒绝。每端 256 项有界队列，最多 16 个连接；慢端关闭后通过完整状态重连。输入限制 65536 字节，WS 消息/帧限制 512 KiB，Ping/Pong 15/45 秒。`/exit` 共用保存判定后只退出来源页面；Ctrl+C/SIGTERM 停接新命令、取消授权并等待当前操作和保存，失败非零退出。
 
-Make 的 build/release/run 统一启用 gui,web，并先构建两种静态前端；构建不固定 UI，运行时由 GEER_AGENT_UI 选择。直接 Cargo 默认仍是终端构建。Windows 通用程序保留控制台能力，desktop-gui 专用 feature 仍仅用于无控制台桌面构建。
+Make 的 build/release/run 统一启用 gui,web，并先构建两种静态前端；通用程序运行时由 GEER_AGENT_UI 选择界面。Windows 的 build/release 额外启用 desktop-gui 在独立 target/desktop-gui 缓存目录编译，成功后将桌面程序复制为对应 debug/release 目录的 geer-agent-desktop.exe；通用 geer-agent.exe 保留控制台与四种界面，桌面程序默认进入 GUI 且无额外控制台。设置 CARGO_TARGET_DIR 时两类产物与桌面缓存跟随该根目录。Linux 构建和 make run 仍只生成通用程序。直接 Cargo 默认仍是终端构建，不新增 Rust 入口或运行期控制台管理。
 
 WebConfig 仅在选中 Web 时解析：固定 IPv4 全接口、默认 8827，`GEER_AGENT_WEB_PORT` 可改。`GEER_AGENT_WEB_TOKEN` 非空时固定，否则生成随机口令并只打印一次。登录换取内存随机凭证，Cookie 为 HttpOnly/SameSite=Strict；重启失效，POST 和 WS 核对 Origin/Host。模型密钥不传给浏览器。静态页面由 include_dir 嵌入二进制，可独立分发。
 
 **前端管理建议已落地：** [src/ui/frontend](/home/lihongyu/projects/geer-agent/src/ui/frontend/package.json) 是唯一包，只提交 bun.lock，Bun 冻结安装和 bun run 统一脚本。Vite 模式把 `@host` 编译为桌面或浏览器适配器，输出 dist/gui 与 dist/web；浏览器包没有 Tauri IPC。协议在 protocol.ts，纯 reducer 在 model.ts，App 与 CSS 共用；WebGate 只负责登录，宿主适配器只负责连接、提交、授权、复制和关闭。后续按交互能力拆组件即可，不建立两个 React 工程或提前抽发布库。草稿按会话 UUID 保留；375px 布局使用会话/状态抽屉，HTTP 剪贴板失败提供手动复制。
+
+## 项目指令与长期记忆（2026-10-02）
+
+[add-project-memory 设计](../../openspec/changes/add-project-memory/design.md) 在现有 Prompt、Session、DAO 和公共命令路径上增加能力，无新增 crate。`ProjectInstructions` 只读取 workspace 根 `AGENTS.md`；SessionManager 在切换或恢复前读取目标规则，成功后替换独立系统提示。Agent 每条用户消息前刷新一次，同一工具循环共享快照；规则计入上下文估算，不写入会话快照或压缩输入。
+
+`memory::MemoryService` 由 Agent 和 Tools 共享单线程 Rc，提供列表、关键词搜索、去重添加、编辑、单条删除及清空。记录在 `agent_memories` 独立表/集合中，不含 workspace/session 外键；SQL 用新增版本化迁移，MongoDB 按需建立集合。三个持久化开关独立，同配置复用连接。操作直接读取或写入数据库，只缓存状态和最近成功数量，失败显示 unavailable，不将旧列表重新 flush 回数据库。精确去重与搜索在 Rust 处理，保证 SQL collation 和 MongoDB 下行为一致。
+
+两个记忆工具自动授权、串行执行，沿用预算和 ToolOutput；`GEER_AGENT_TOOLS=off` 或记忆不可用时不声明。界面通过 `interaction::execute` 执行公共记忆命令；TUI 的 F4 面板和共用 React MemoryPanel 保留独立编辑状态与聊天草稿。图形快照增加完整记忆列表、状态和根指令加载标识；前端搜索复用同样的评分、排序与十条上限。列表仅传给 UI，模型按需搜索。
+
+EventHub 的预览现在区分会话删除、记忆单条删除和全局清空，绑定来源端、准确目标与 revision。GUI/Web 的记忆确认均必须匹配预览，任何后续提交或断线使旧预览失效；其他 Web 客户端只同步列表和总数。清空只删除长期记忆记录，现有会话、Trace 和提示文件保持独立生命周期。
 
 ## 当前模块职责与协作关系
 
@@ -101,6 +111,7 @@ WebConfig 仅在选中 Web 时解析：固定 IPv4 全接口、默认 8827，`GE
 | [tools](/home/lihongyu/projects/geer-agent/src/tools/mod.rs:152) | 内置工具注册、参数验证、授权缓存、批次执行、有限输出 | 不依赖模型协议或 UI；未注入确认回调时默认拒绝 |
 | [session](/home/lihongyu/projects/geer-agent/src/session/runtime.rs:350) | workspace、活动与停放会话、检查点、存档恢复、删除与保存状态 | 每个会话拥有自己的 Prompt；存储失败时保留内存状态与补写信息 |
 | [trace](/home/lihongyu/projects/geer-agent/src/trace/mod.rs) | 模型调用记录契约、流式捕获、状态、用量和脱敏 | 记录单次调用，不代替会话历史 |
+| [memory](../../src/memory/mod.rs) | 全局长期记忆的校验、搜索、状态与持久化操作 | 不依赖模型或 UI；数据库成功后更新数量，与会话历史分离 |
 | [dao](/home/lihongyu/projects/geer-agent/src/dao/mod.rs) | SQL/MongoDB 适配、会话记录与事件链存取、Trace 读写 | 对上层隐藏后端差异；会话和 Trace 可共享连接 |
 
 ### 主要运行时协作
@@ -118,7 +129,7 @@ flowchart TD
     Web --> App
     UI -->|"终端路径创建"| Agent["agent::Agent"]
     App -->|"工作线程创建"| Agent
-    Repl --> Execute["interaction::execute<br/>消息与会话命令"]
+    Repl --> Execute["interaction::execute<br/>消息、会话与记忆命令"]
     Tui --> Execute
     App --> Execute
     Execute -->|"interaction::Session"| Agent
@@ -130,10 +141,13 @@ flowchart TD
     Provider --> LLM["配置的模型端点"]
     Tools --> Local["文件与 Bash 子进程"]
     Sessions --> DAO["dao<br/>SQL 与 MongoDB"]
+    Agent --> Memory["memory::MemoryService<br/>全局长期记忆"]
+    Tools --> Memory
+    Memory --> DAO
     Agent --> Trace["trace<br/>调用捕获与脱敏"]
     Provider --> Trace
     Agent -->|"写入 Trace"| DAO
-    DAO --> DB["会话与 Trace 数据库"]
+    DAO --> DB["会话、Trace 与独立记忆表"]
 ```
 
 `interaction::Session` 是接口，`agent::Agent` 是它的实现。`execute` 到 Agent 的箭头表示运行时通过接口调用，不表示 interaction 导入具体 Agent。REPL/TUI 借用 Session；`ui/app` 在工作线程中持有 Agent，GUI/Web bridge 只传输命令和事件，并读取历史与未保存状态。UI 需要的 status/session_entries 等只读数据仍可直接通过 Session 获取，写操作则共用 execute。
