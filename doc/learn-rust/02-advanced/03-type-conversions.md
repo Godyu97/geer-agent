@@ -43,7 +43,7 @@ fn main() {
 }
 ```
 
-`RequestId` 可防止把模型名当成请求 ID 传入，也可承载自己的 trait 实现。`Label` 只是更好读的名字，仍完全等价于 `String`。[TraceError(pub(crate) String)](/home/lihongyu/projects/geer-agent/src/trace/mod.rs) 是项目现有的 newtype；`ConfirmFn` 是给复杂闭包类型起别名。
+`RequestId` 可防止把模型名当成请求 ID 传入，也可承载自己的 trait 实现。`Label` 只是更好读的名字，仍完全等价于 `String`。[TraceError(pub(crate) String)](../../../src/trace/mod.rs) 是项目现有的 newtype；`ConfirmFn` 是给复杂闭包类型起别名。
 
 ## 动态大小类型必须隔着合适的指针使用
 

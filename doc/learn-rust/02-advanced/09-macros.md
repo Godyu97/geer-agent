@@ -12,7 +12,7 @@
 | --- | --- | --- |
 | 函数式宏调用 | `format!`、`json!`、`include_str!` | 生成表达式或其他语法 |
 | derive 宏 | `#[derive(Serialize, Deserialize)]` | 按类型结构生成实现 |
-| 属性宏 | `#[tokio::main]`、`#[tokio::test]` | 转换被标记的项 |
+| 属性宏 | `#[tokio::test]`、`#[tauri::command]` | 转换被标记的测试或命令项 |
 | 条件编译属性 | `#[cfg(test)]` | 决定是否编译某部分；不是运行时 if |
 
 并非所有带 `!` 的宏都属于同一种实现机制；使用时先知道生成什么、需要哪些 trait。
@@ -35,12 +35,14 @@ fn main() {
 
 ## 本项目三个值得阅读的展开点
 
-[main.rs](/home/lihongyu/projects/geer-agent/src/main.rs) 的 `#[tokio::main(flavor = "current_thread")]` 建立运行时驱动 async 主体，宏本身不会让所有同步操作都变成异步。
+[prompt/mod.rs](../../../src/prompt/mod.rs) 等模块的 tokio::test 建立测试运行时；[gui/bridge.rs](../../../src/ui/gui/bridge.rs) 的 tauri::command 生成 IPC 适配。独立练习常用 tokio::main，当前项目 main 仅调用 ui::run，运行时由 UI 组合点显式创建。宏本身不会让同步操作自动变成异步。
 
-[TraceRecord](/home/lihongyu/projects/geer-agent/src/trace/mod.rs) 的 Serde derive 生成序列化与反序列化实现；字段命名和缺省规则通过 Serde 属性控制。`derive(Debug)` 则可能直接输出字段内容，不能对含密钥结构体随意使用调试打印。
+[TraceRecord](../../../src/trace/mod.rs) 的 Serde derive 生成序列化与反序列化实现；字段命名和缺省规则通过 Serde 属性控制。`derive(Debug)` 则可能直接输出字段内容，不能对含密钥结构体随意使用调试打印。
 
-[config](/home/lihongyu/projects/geer-agent/src/config/mod.rs) 中 `include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/.env"))` 在启用 feature 时于**编译期**读文件，之后是二进制内容的一部分。这和程序启动时读文件完全不同。
+[config](../../../src/config/mod.rs) 中 `include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/.env"))` 在启用 feature 时于**编译期**读文件，之后是二进制内容的一部分。这和程序启动时读文件完全不同。
 
 自定义过程宏通常需要单独的 proc-macro crate，复杂度明显高于普通函数。本项目目前不需要为了封装几行重复代码创建这样的工程。
 
 来源：[教程宏](https://beatai.org/rust-course/advance/macro)、[Rust Reference 宏](https://doc.rust-lang.org/reference/macros.html)、[include_str!](https://doc.rust-lang.org/std/macro.include_str.html)。
+
+进一步实践见 [宏展开、求值与 cfg](17-macro-and-cfg-workshop.md)。

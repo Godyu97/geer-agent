@@ -38,7 +38,7 @@ flowchart TD
 
 ## 当前线程运行时不表示没有其他线程
 
-[main.rs](/home/lihongyu/projects/geer-agent/src/main.rs) 使用 `current_thread`：普通异步任务主要由当前线程驱动。但 [文件批量读取](/home/lihongyu/projects/geer-agent/src/tools/mod.rs) 会通过 `spawn_blocking` 使用阻塞线程池，所以不能说整个进程绝对只有一个线程。
+[ui/mod.rs](../../../src/ui/mod.rs) 的终端路径和 [ui/app/runtime.rs](../../../src/ui/app/runtime.rs) 的 Agent 工作线程分别创建 current-thread runtime：该运行时的普通异步任务由所属线程驱动。[文件批量读取](../../../src/tools/mod.rs) 通过 spawn_blocking 使用阻塞线程池，所以不能说整个进程绝对只有一个线程。
 
 `async fn` 内部直接 `std::thread::sleep` 或执行同步文件读，不会因为外层标了 async 就不阻塞。短期、简单的 CLI 输入也可能仍是同步实现；本项目的终端读行就是如此。要理解实际调度边界，而不是只看函数关键字。
 
@@ -62,8 +62,10 @@ Pin 不是“任何内容都不可修改”，也不是“对象必须永久存�
 
 ## 读项目签名就能看到要求
 
-[collect_reply](/home/lihongyu/projects/geer-agent/src/provider/openai/responses.rs) 要求 `S: Stream<...> + Unpin`，这样可对流使用这里的 `next()` 调用方式。若某个新流类型不满足 Unpin，先核对是否需要固定它，再把 `Pin<&mut S>` 或适合的包装传入；不是给原类型随便补 `impl Unpin`。
+[collect_reply](../../../src/provider/openai/responses.rs) 要求 `S: Stream<...> + Unpin`，这样可对流使用这里的 `next()` 调用方式。若某个新流类型不满足 Unpin，先核对是否需要固定它，再把 `Pin<&mut S>` 或适合的包装传入；不是给原类型随便补 `impl Unpin`。
 
 异步块里的 `?` 还可能需要明确错误类型，例如 `Ok::<_, std::io::Error>(value)`。递归 async 需要用间接存储打破无限大小的 Future；原生 trait async 已稳定，动态分派限制见 [Trait 篇](../01-basics/06-methods-and-traits.md)。
 
 来源：[教程异步](https://beatai.org/rust-course/advance/async/intro)、[Future](https://doc.rust-lang.org/std/future/trait.Future.html)、[std::pin](https://doc.rust-lang.org/std/pin/)、[Tokio async 原理](https://tokio.rs/tokio/tutorial/async)。
+
+继续做 [手动推进 Future 的有限实验](15-future-send-and-pin-workshop.md)，再读 [Tokio 深讲](../08-ecosystem/03-tokio-runtime.md)。

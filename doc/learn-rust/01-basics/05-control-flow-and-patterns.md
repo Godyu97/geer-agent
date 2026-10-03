@@ -21,7 +21,7 @@ fn main() {
 }
 ```
 
-本项目 [REPL 循环](/home/lihongyu/projects/geer-agent/src/ui/repl/mod.rs) 读到 EOF 或 `/exit` 时 `break`；非法 UTF-8 用 `continue` 只跳过这一行，不退出程序。
+本项目 [REPL 循环](../../../src/ui/repl/mod.rs) 读到 EOF 或 `/exit` 时 `break`；非法 UTF-8 用 `continue` 只跳过这一行，不退出程序。
 
 ## `match` 同时检查形状并取出数据
 
@@ -90,7 +90,7 @@ fn main() {
 
 `let`、函数参数、`for` 里也使用模式。普通 `let` 需要不可反驳模式，即一定匹配成功；`let Some(x) = option;` 单独这样写不行。
 
-匹配 `value` 可能移动字段，匹配 `&value` 通常得到字段引用，匹配 `&mut value` 可用于修改。[Prompt](/home/lihongyu/projects/geer-agent/src/prompt/conversation.rs) 中的 `match &mut self.state` 就是借用内部状态，不把整个状态搬出 `self`。edition 2024 对部分显式 `ref`/`mut` 组合有更严格规则，先写自然的引用模式，不照抄旧教程里的冗余标记。
+匹配 `value` 可能移动字段，匹配 `&value` 通常得到字段引用，匹配 `&mut value` 可用于修改。[Prompt](../../../src/prompt/conversation.rs) 中的 `match &mut self.state` 就是借用内部状态，不把整个状态搬出 `self`。edition 2024 对部分显式 `ref`/`mut` 组合有更严格规则，先写自然的引用模式，不照抄旧教程里的冗余标记。
 
 练习：给 `classify` 增加 `/help`，应放在“未知命令”的守卫前面，否则会先被守卫接住。
 

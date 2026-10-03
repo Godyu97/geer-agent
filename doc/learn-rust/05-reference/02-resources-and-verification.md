@@ -1,10 +1,12 @@
-# 36 来源、学习资料与验证说明
+# 来源、学习资料与验证说明
 
 [返回总目录](../README.md) · [章节对照](../00-course-map.md)
 
-## 本次采用的来源
+2026-10-03 扩充的调研依据见 [调研记录](03-research-log.md)，学习路线见 [工程师路线](../00-engineer-roadmap.md)。下面先保留初版来源与历史结果，避免将早期统计误当本轮验证。
 
-1. 用户指定的 [BeatAI 教程入口](https://beatai.org/rust-course/about-book)。本次直接读取返回 403，未取得网页正文。
+## 初版采用的来源（2026-09-26 历史记录）
+
+1. 用户指定的 [BeatAI 教程入口](https://beatai.org/rust-course/about-book)。当时直接读取返回 403，未取得网页正文。
 2. 作者维护的 [rust-course 源码](https://github.com/sunface/rust-course)，固定提交 `ebe2d82437f621085b0cb6895edbd1283ed63cb1`。[关于本书源码](https://github.com/sunface/rust-course/blob/ebe2d82437f621085b0cb6895edbd1283ed63cb1/src/about-book.md) 内指向 BeatAI，确认是该教程的来源。按该提交下载了公开目录中全部 300 个 Markdown 条目，用于核对目录、章节主题及占位状态；正文学习笔记按知识主题归纳，不声称每个小节都有独立实现。
 3. geer-agent 提交 `4f6a0a2` 的 Cargo.toml、src 与 tests，作为项目现状依据；未读取或引用真实 `.env` 内容。
 4. Rust/Tokio 等作者或维护方文档，用于补充当前语言规则和实用技巧；各篇提供主题链接。
@@ -35,12 +37,27 @@
 标准库独立例子可以直接交给 rustdoc：
 
 ```bash
-rustdoc --test --edition 2024 doc/learn-rust/01-basics/03-ownership.md
+scripts/test-safe.sh rustdoc --test --edition 2024 doc/learn-rust/01-basics/03-ownership.md
 ```
 
-需要从仓库根目录执行。普通 Rust 代码块应编译运行；`compile_fail` 代码块应被编译器拒绝；项目摘录使用 `ignore`，不会谎称它能脱离内部类型独立运行。包含 Cargo/网络命令的 shell 围栏是操作说明，不由 rustdoc 执行。
+需要从仓库根目录执行并确认隔离有效。普通 Rust 代码块应编译运行；compile_fail 应被拒绝；should_panic 是有意运行失败的例子；ignore 是项目片段或需要第三方练习包的框架示例，不能作为已验证成功的独立程序计数。Shell 围栏不由 rustdoc 执行。
 
-## 本次实际检查结果（2026-09-26）
+可重复的全部文档检查：
+
+```bash
+python3 doc/learn-rust/verify.py
+scripts/test-safe.sh python3 doc/learn-rust/verify.py --examples
+scripts/test-safe.sh python3 doc/learn-rust/verify.py --frameworks
+scripts/test-safe.sh python3 doc/learn-rust/verify.py --run-frameworks
+scripts/test-safe.sh python3 doc/learn-rust/verify.py --tauri-commands
+scripts/test-safe.sh python3 doc/learn-rust/verify.py --diagrams
+```
+
+verify.py 使用 Python 3.11+ 标准库。默认仅检查本地文件链接、代码围栏和数量；examples 先核对实际 cgroup/私有临时目录，再顺序执行文档测试；frameworks 在本轮私有目录生成十个练习 binary，直接依赖取当前 Cargo.lock 的精确版本，再离线解析并生成练习包自己的临时 lock；不声称全部传递依赖图与主项目完全相同。run-frameworks 运行八个有限、无需外部服务的完整程序。tauri-commands 单独编译长任务命令和 handler 注册模块，关闭 Tauri 默认 Wry feature，不创建窗口。共享 target 仅用于复用编译缓存，不修改主项目依赖。
+
+diagrams 需要 Bun/Node，在私有目录安装 Mermaid 11 和 jsdom 并解析图，工具依赖不加入主项目。所有阶段顺序执行，不叠加多个完整测试组；依赖缓存缺失或隔离失败时先查明原因，不绕过。图解析只能证明语法，不等于具体 Markdown 预览器的视觉验收。
+
+## 初版实际检查结果（2026-09-26 历史记录）
 
 | 检查 | 结果 |
 | --- | --- |
@@ -53,6 +70,43 @@ rustdoc --test --edition 2024 doc/learn-rust/01-basics/03-ownership.md
 | Mermaid | 21 张图，均通过 Mermaid 11 的语法解析 |
 
 Rust 示例使用本机 `rustc/rustdoc 1.98.1`、edition 2024；Mermaid 校验依赖放在临时目录，没有加入项目 Cargo 或前端依赖。语法解析不等于已经在用户的具体 Markdown 预览器中逐图目测。
+
+## 本轮实际检查结果（2026-10-03）
+
+本轮新增 42 篇 Markdown，学习目录从 38 篇扩展为 80 篇；保留原 300 项章节映射。另增加可重复执行的 verify.py，更新导航、入口现状与测试安全命令，并将 94 个仓库源码链接改为相对路径。
+
+| 检查 | 本轮实际结果 |
+| --- | --- |
+| 本地文件链接与代码围栏 | 80 篇、889 个本地链接全部通过；无未闭合围栏 |
+| 普通 Rust 代码块 | 90 个，通过 rustdoc 编译与执行 main |
+| 预期编译失败 | 8 个，均按预期被拒绝 |
+| 预期 panic | 1 个，按预期触发 |
+| Rust 文档检查文件 | 43 篇包含上述可执行或编译失败块，全部通过 |
+| 框架完整程序编译 | 10 个，通过 Cargo check |
+| 框架有限程序执行 | 8 个，通过 Cargo run 和内置行为断言 |
+| Tauri 长任务命令 | 1 个完整命令/状态/handler 注册模块，独立 library 编译通过 |
+| Mermaid | 53 张，通过 Mermaid 11.17.2 语法解析 |
+| 差异与空白 | git diff --check 通过；所有 Markdown 无行尾空白 |
+
+普通 Rust 块中有明确说明“只构造并丢弃 Future”的类型实验；执行它们的 main 不表示推进了 async 块。compile_fail 验证被拒绝，不钉死每个版本完全相同的报错文本。
+
+框架程序验证分别为：
+
+| 练习 | 编译 | 实际运行范围 |
+| --- | --- | --- |
+| Tokio actor、JoinSet 上限 | 通过 | 两个有限完整程序通过 |
+| Tokio 分帧与关闭 | 通过 | 分片、空帧、EOF、截断、超限、取消与 Drop 回收通过 |
+| Axum 本机服务、请求契约 | 通过 | 请求契约程序运行通过；400/413/405/504 和正常 JSON 响应通过 |
+| Serde、Reqwest | 通过 | Serde round-trip 运行通过；Reqwest 客户端仅编译，不请求真实上游 |
+| SQLx SQLite | 通过 | 私有内存数据库的事务、找到/未找到与关闭通过 |
+| thiserror/anyhow/tracing | 通过 | 类型分类、原因链、context、subscriber 和 async span 示例通过 |
+| Tauri 长任务模块 | 通过 | 命令宏、状态类型、序列化与注册编译；不启动 WebView |
+
+Axum 的长期运行服务未在本轮启动，端口/TCP 行为不由内存请求实验代替。SQLx 示例也不证明 Postgres/MySQL/SeaORM 全部契约。Tauri 计数器模板入口、前端片段、SeaORM 上下文片段、clap/Rayon 方向例子等仍按所在围栏声明其上下文，不能把 18 个 ignore 块全计为自动运行通过；其中 10 个完整程序和 1 个命令模块由单独框架流程验证。
+
+本机 rustc/rustdoc 1.98.1，edition 2024，host 为 x86_64-unknown-linux-gnu。所有执行均通过 scripts/test-safe.sh，实际核对有限 cgroup 内存/进程/运行时限、禁止 swap 与私有 tmpfs；多个阶段顺序执行。框架最终编译/运行组耗时约 18.7 秒；最后的文档/Tauri/图解析组约 25.8 秒，均正常结束。本轮 Tauri 首次依赖编译的最高观测峰值约 2.1G，未超过 4G 额度，swap 为 0。
+
+这些统计描述本次检查快照；文档或工具链更新后应重新运行适用阶段，以 verify.py 当前输出为准。
 
 ## 验证范围的限制
 

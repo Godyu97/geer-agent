@@ -4,6 +4,8 @@
 
 对应原教程：企业落地/AWS 案例、常用三方库、命名规范、面试经验、代码开发实践。面试与部分实践条目未形成完整教材，这里提供项目相关补充。
 
+2026-10-03 增加了 [社区教程调研](../08-ecosystem/01-learning-resources.md)、[技术栈选型](../08-ecosystem/02-stack-decisions.md) 和 [API/状态设计](09-api-design-and-state.md)。下面保留基础技巧，框架细节从新专题进入。
+
 ## 企业案例提取方法，不背宣传结论
 
 读 AWS 等案例时，关注它在解决内存、延迟、资源成本还是服务稳定性，以及如何测量。不能把单个场景的改善比例直接套到 Agent 项目；本项目很可能主要等待网络和模型生成，改写一个循环未必改善用户等待时间。
@@ -34,7 +36,7 @@
 
 ## Serde：类型与 JSON 的桥梁
 
-项目 [TraceRecord](/home/lihongyu/projects/geer-agent/src/trace/mod.rs) 使用 `Serialize` / `Deserialize`；工具参数先作为 `serde_json::Value` 读取，再验证必须字段和类型。
+项目 [TraceRecord](../../../src/trace/mod.rs) 使用 `Serialize` / `Deserialize`；工具参数先作为 `serde_json::Value` 读取，再验证必须字段和类型。
 
 `Value` 适合协议形态不固定的边界，业务形态稳定时具名结构体更容易维护。`Option<T>` 表示字段可缺少/可空的具体行为，还会受 Serde 属性影响；不要只看 Rust 字段类型就推断所有 JSON 兼容规则。
 
@@ -49,7 +51,7 @@
 | 文档数据库适配 | mongodb | 文档转换、批量结果边界 |
 | 唯一标识与时间 | uuid、chrono、std::time | 标识用途、时区与耗时分开 |
 
-后续真要做 Web，再从候选框架的官方文档核对当前 API 和维护情况；不为一份学习笔记向 Cargo.toml 添加框架。
+当前项目已经有可选 Axum Web 与 Tauri GUI，见 [Axum/Tower](../08-ecosystem/05-axum-and-tower.md)、[Tauri](../08-ecosystem/08-tauri-architecture.md)。学习其他方案仍在独立练习中比较，不为笔记增加主项目依赖。
 
 ## 把面试题改成能解释的源码题
 

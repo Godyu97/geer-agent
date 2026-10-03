@@ -37,7 +37,7 @@ fn main() {
 
 先写三个验收条件：正常匹配、不匹配、大小写规则。再实现代码让它满足这些条件。如果要增加忽略大小写，明确当前练习只做什么范围的文本比较；简单 `to_lowercase` 不等于完整语言学意义上的大小写折叠。
 
-测试环境配置时，优先给解析函数传入值，不通过改变整个进程的环境变量互相影响。edition 2024 中 `std::env::set_var` / `remove_var` 是 unsafe 接口；子进程测试可用 `Command::env` 设置新进程环境。[本项目集成测试](/home/lihongyu/projects/geer-agent/tests/tool_loop.rs) 就这样注入本地模拟服务地址。
+测试环境配置时，优先给解析函数传入值，不通过改变整个进程的环境变量互相影响。edition 2024 中 `std::env::set_var` / `remove_var` 是 unsafe 接口；子进程测试可用 `Command::env` 设置新进程环境。[本项目集成测试](../../../tests/tool_loop.rs) 就这样注入本地模拟服务地址。
 
 ## stdout 与 stderr 的价值
 

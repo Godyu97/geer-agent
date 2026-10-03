@@ -35,7 +35,7 @@ fn main() {
 
 `Box::leak` 会主动放弃正常回收以获得长寿命引用；它可以有特定用途，但不是生命周期报错的通用修复。`'static` 约束也不要求每个拥有型对象永久存活。
 
-项目 [NEXT_RUN_ID](/home/lihongyu/projects/geer-agent/src/agent/mod.rs) 是用途明确的原子计数器；[默认资源限制](/home/lihongyu/projects/geer-agent/src/config/mod.rs) 是 `const ResourceLimits`。二者的区别是一个需要共享的可变实例，另一个提供可复制的默认值。
+项目 [NEXT_RUN_ID](../../../src/agent/mod.rs) 是用途明确的原子计数器；[默认资源限制](../../../src/config/mod.rs) 是 `const ResourceLimits`。二者的区别是一个需要共享的可变实例，另一个提供可复制的默认值。
 
 练习：把配置读取函数设计成接收 `Option<String>` 的纯函数，再比较“修改全局环境后测试”的复杂度。只有真需要唯一实例时，才让全局初始化进入设计。
 

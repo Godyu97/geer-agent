@@ -67,7 +67,7 @@ fn main() {
 
 ## 对照项目
 
-[AgentRuntime](/home/lihongyu/projects/geer-agent/src/agent/mod.rs) 的 `remaining_turns` 用 `saturating_sub` 计算剩余预算，避免无符号减法下溢；`ResourceLimits` 用 `Option<u64>` 表示可能未配置的上限。[配置解析](/home/lihongyu/projects/geer-agent/src/config/mod.rs) 对浮点值调用 `is_finite()`，因为成功解析成 `f64` 还不代表它适合作为费用或单价。
+[AgentRuntime](../../../src/agent/mod.rs) 的 `remaining_turns` 用 `saturating_sub` 计算剩余预算，避免无符号减法下溢；`ResourceLimits` 用 `Option<u64>` 表示可能未配置的上限。[配置解析](../../../src/config/mod.rs) 对浮点值调用 `is_finite()`，因为成功解析成 `f64` 还不代表它适合作为费用或单价。
 
 练习：用函数返回“剩余工具调用数”，分别测试已用数量小于、等于、大于上限。参考实现就是上面的 `remaining`；关键是确定“超过上限返回 0”这一规则。
 

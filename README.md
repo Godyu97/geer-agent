@@ -2,6 +2,8 @@
 
 GeekAgent 教程的 Rust 学习实现。
 
+系统学习入口：[从资深工程师到合格 Rust 开发者](doc/learn-rust/README.md)。包含 Go 对照、工具链、标准库、Tokio/Tauri 等框架原理与实战，以及工程实践和毕业验收；建议从 [学习路线](doc/learn-rust/00-engineer-roadmap.md) 开始。
+
 ## 配置与运行
 
 普通 `cargo run` 可使用项目根目录的 `.env`：复制 `.env.example` 为 `.env`，填写 `OPENAI_API_KEY` 和 `OPENAI_MODEL`，然后运行：

@@ -18,7 +18,7 @@
 
 ## 本项目的 trace 模块不是 tracing crate
 
-[Cargo.toml](/home/lihongyu/projects/geer-agent/Cargo.toml) 没有直接声明 `tracing` 依赖。本仓库 [trace 模块](/home/lihongyu/projects/geer-agent/src/trace/mod.rs) 自己定义模型调用记录、采集器和读写 trait；运行指标与工具记录也有 JSON 文本输出。不要把同名概念混为已接入 OpenTelemetry 的分布式链路系统。
+[Cargo.toml](../../../Cargo.toml) 没有直接声明 `tracing` 依赖。本仓库 [trace 模块](../../../src/trace/mod.rs) 自己定义模型调用记录、采集器和读写 trait；运行指标与工具记录也有 JSON 文本输出。不要把同名概念混为已接入 OpenTelemetry 的分布式链路系统。
 
 ```mermaid
 flowchart LR
@@ -40,7 +40,7 @@ flowchart LR
 
 ## DAO 里值得学习的 Rust 技巧
 
-[TraceStore](/home/lihongyu/projects/geer-agent/src/dao/mod.rs) 用枚举在 SQL 与 Mongo 两类实现间转发，SQL 再支持 SQLite/Postgres/MySQL。`TraceWriter` / `TraceReader` 定义行为契约，业务层不必掌握所有后端查询类型。
+[TraceStore](../../../src/dao/mod.rs) 用枚举在 SQL 与 Mongo 两类实现间转发，SQL 再支持 SQLite/Postgres/MySQL。`TraceWriter` / `TraceReader` 定义行为契约，业务层不必掌握所有后端查询类型。
 
 | 接口形状 | 表达的行为 |
 | --- | --- |

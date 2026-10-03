@@ -50,7 +50,7 @@ flowchart TD
 
 ## 对照本项目
 
-[tools::execute_batch](/home/lihongyu/projects/geer-agent/src/tools/mod.rs) 先把准备好的文件操作移动到 `spawn_blocking`；[Bash 工具](/home/lihongyu/projects/geer-agent/src/tools/bash.rs) 用两个异步任务分别排空 stdout/stderr，避免只读一边而另一边管道塞满。
+[tools::execute_batch](../../../src/tools/mod.rs) 先把准备好的文件操作移动到 `spawn_blocking`；[Bash 工具](../../../src/tools/bash.rs) 用两个异步任务分别排空 stdout/stderr，避免只读一边而另一边管道塞满。
 
 项目当前没有 Redis 服务，也没有基于消息的数据库 actor；这些是教程的独立实践，不应当作为源码现状描述。
 

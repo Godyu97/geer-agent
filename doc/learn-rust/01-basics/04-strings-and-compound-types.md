@@ -46,7 +46,7 @@ fn main() {
 }
 ```
 
-本项目 [Bash 工具](/home/lihongyu/projects/geer-agent/src/tools/bash.rs) 返回 `(String, bool)`，依次表达文本与成功状态。字段更多或容易搞混时，用命名结构体通常更易读。
+本项目 [Bash 工具](../../../src/tools/bash.rs) 返回 `(String, bool)`，依次表达文本与成功状态。字段更多或容易搞混时，用命名结构体通常更易读。
 
 ## 结构体表达“同时拥有这些字段”
 
@@ -65,7 +65,7 @@ fn main() {
 }
 ```
 
-`ToolCall { name, ... }` 是字段简写；`..other` 是结构体更新语法，可能移动 `other` 的非 `Copy` 字段。不要以为它自动克隆原对象。[provider::ToolCall](/home/lihongyu/projects/geer-agent/src/provider/mod.rs) 的实际版本还包括调用 ID。
+`ToolCall { name, ... }` 是字段简写；`..other` 是结构体更新语法，可能移动 `other` 的非 `Copy` 字段。不要以为它自动克隆原对象。[provider::ToolCall](../../../src/provider/mod.rs) 的实际版本还包括调用 ID。
 
 ## 枚举表达“处于其中一种形态”
 
@@ -88,7 +88,7 @@ fn main() {
 
 枚举变体可以带不同字段，因此比“几个 bool 组合状态”更容易保证合法性。`Option<T>` 就是 `Some(T)` 或 `None`；`Result<T, E>` 是 `Ok(T)` 或 `Err(E)`。
 
-[interaction::Input](/home/lihongyu/projects/geer-agent/src/interaction/mod.rs) 区分退出、帮助、消息等输入；[Prompt::State](/home/lihongyu/projects/geer-agent/src/prompt/conversation.rs) 区分两种协议的历史结构。它们比字符串标记更方便让编译器检查分支遗漏。
+[interaction::Input](../../../src/interaction/mod.rs) 区分退出、帮助、消息等输入；[Prompt::State](../../../src/prompt/conversation.rs) 区分两种协议的历史结构。它们比字符串标记更方便让编译器检查分支遗漏。
 
 ## 数组与切片的关系
 

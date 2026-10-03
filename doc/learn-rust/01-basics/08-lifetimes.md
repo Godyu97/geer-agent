@@ -71,7 +71,7 @@ fn main() {
 }
 ```
 
-结构体保存引用，就要表达它不能比被引用数据的有效范围更长。[TraceContext<'a>](/home/lihongyu/projects/geer-agent/src/agent/mod.rs) 借用模型名、会话 ID、配置和存储，不再克隆成一份独立的长期对象。相反，`TraceRecord` 拥有 `String`，适合被存储或传递。
+结构体保存引用，就要表达它不能比被引用数据的有效范围更长。[TraceContext<'a>](../../../src/agent/mod.rs) 借用模型名、会话 ID、配置和存储，不再克隆成一份独立的长期对象。相反，`TraceRecord` 拥有 `String`，适合被存储或传递。
 
 阅读规则：先找数据的所有者，再找引用保存到哪里、最后用到哪里，最后才考虑要不要写 `'a`。只要拥有型字段更符合需求，就不必强迫每个结构体都借用字符串。
 

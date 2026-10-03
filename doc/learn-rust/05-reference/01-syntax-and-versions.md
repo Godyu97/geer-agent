@@ -94,4 +94,6 @@
 
 ## 项目最相关的迁移提醒
 
-原生 trait async 已可用于静态分派，但 `ChatProvider` 仍不能直接构造成 dyn 对象；edition 2024 的环境修改 API 有新的 unsafe 边界；let chains 需要支持该特性的编译器。不要仅凭“用了 2024”就推断所有工具链版本都可构建项目。
+原生 trait async 已可用于静态分派，但 ChatProvider 仍不能直接构造成 dyn 对象；edition 2024 的环境修改 API 有新的 unsafe 边界。async 闭包随 [Rust 1.85](https://blog.rust-lang.org/2025/02/20/Rust-1.85.0.html) 稳定；let chains 随 [Rust 1.88](https://blog.rust-lang.org/2025/06/26/Rust-1.88.0/) 稳定且需要 edition 2024。不要仅凭“用了 2024”推断所有工具链都能构建项目，配置测试优先注入纯参数而非修改全局环境。
+
+具体应用继续阅读 [Go 语法索引](../06-go-to-rust/06-syntax-reference.md)、[类型系统进阶](../02-advanced/14-type-system-and-layout.md) 与 [工具链](../03-engineering/08-toolchain-and-compilation.md)。

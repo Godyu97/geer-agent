@@ -76,9 +76,9 @@ fn main() {
 
 ## 项目里最有价值的两个例子
 
-[Prompt::apply_tool_results](/home/lihongyu/projects/geer-agent/src/prompt/conversation.rs) 接收 `step: ModelStep`，因为要把 `step.output` 的内容转入会话；`results: &[(ToolCall, String)]` 则只借用一段结果列表。参数签名已经说明了两者的所有权策略。
+[Prompt::apply_tool_results](../../../src/prompt/conversation.rs) 接收 `step: ModelStep`，因为要把 `step.output` 的内容转入会话；`results: &[(ToolCall, String)]` 则只借用一段结果列表。参数签名已经说明了两者的所有权策略。
 
-[Prompt::commit_turn](/home/lihongyu/projects/geer-agent/src/prompt/conversation.rs) 使用 `std::mem::take(pending)`：把原来的 `Vec` 取出来，同时给字段放入默认的空 `Vec`。这样不会从 `&mut` 背后硬搬走字段后留下空洞。
+[Prompt::commit_turn](../../../src/prompt/conversation.rs) 使用 `std::mem::take(pending)`：把原来的 `Vec` 取出来，同时给字段放入默认的空 `Vec`。这样不会从 `&mut` 背后硬搬走字段后留下空洞。
 
 ```rust
 fn main() {

@@ -37,13 +37,15 @@ cargo run
 
 ## Cargo 命令的区别
 
+下面从 geer-agent 仓库根目录执行；测试与 lint 使用本项目受限入口。独立练习的测试也通过仓库 scripts/test-safe.sh，以 manifest-path 指向练习包。
+
 ```bash
 cargo check
 cargo build
 cargo run
-cargo test
+make test
 cargo fmt --all -- --check
-cargo clippy --all-targets --all-features
+make clippy
 ```
 
 `check` 检查代码而省去通常的最终机器码生成/链接，适合频繁迭代；`build` 生成可执行文件；`run` 先构建再执行；`test` 构建并运行测试。格式检查不保证逻辑正确，Clippy 也不能替代测试。
@@ -52,9 +54,9 @@ cargo clippy --all-targets --all-features
 
 ## 在本项目中读什么
 
-打开 [Cargo.toml](/home/lihongyu/projects/geer-agent/Cargo.toml) 和 [main.rs](/home/lihongyu/projects/geer-agent/src/main.rs)。入口很短：声明模块，建立 Tokio 运行时，再调用 `agent::run().await`。暂时只记住“初始化运行环境后启动业务”，异步细节后面再读。
+打开 [Cargo.toml](../../../Cargo.toml) 和 [main.rs](../../../src/main.rs)。当前入口声明模块并调用 ui::run；[ui/mod.rs](../../../src/ui/mod.rs) 选择界面，终端路径建立 current-thread Tokio runtime，再初始化 Agent 并执行界面。GUI/Web 使用共用工作线程。入口、运行时和业务是不同职责，后面分别阅读。
 
-`cargo run` 会进入真实应用，需要配置 `OPENAI_API_KEY` 和 `OPENAI_MODEL`；模型地址、协议等由 [Config::load](/home/lihongyu/projects/geer-agent/src/config/mod.rs) 解析。学习语法和运行笔记里的标准库例子不需要 API key。
+`cargo run` 会进入真实应用，需要配置 `OPENAI_API_KEY` 和 `OPENAI_MODEL`；模型地址、协议等由 [Config::load](../../../src/config/mod.rs) 解析。学习语法和运行笔记里的标准库例子不需要 API key。
 
 本仓库 `--all-features` 会启用 `embed-env`，它在编译时读取 `.env`。缺少文件时构建会失败；生成的程序也可能包含配置明文。这个 feature 的具体边界见 [Cargo 工程篇](../03-engineering/02-cargo.md)。
 

@@ -46,7 +46,7 @@ fn main() {
 }
 ```
 
-对照 [配置解析](/home/lihongyu/projects/geer-agent/src/config/mod.rs)；解释 transpose 前后的完整类型。
+对照 [配置解析](../../../src/config/mod.rs)；解释 transpose 前后的完整类型。
 
 ## 练习四：不破坏 UTF-8 的前缀
 
@@ -62,7 +62,7 @@ fn main() {
 }
 ```
 
-边界：这是标量值前缀，不是所有 Unicode 字素簇的截断算法。对照 [Bash 输出截断](/home/lihongyu/projects/geer-agent/src/tools/bash.rs)。
+边界：这是标量值前缀，不是所有 Unicode 字素簇的截断算法。对照 [Bash 输出截断](../../../src/tools/bash.rs)。
 
 ## 练习五：按输入顺序返回查询结果
 
@@ -79,7 +79,7 @@ fn main() {
 }
 ```
 
-验收：不能直接遍历 HashMap，也不能 filter_map 丢失位置。对照 [DAO 批量查询](/home/lihongyu/projects/geer-agent/src/dao/sql.rs)。
+验收：不能直接遍历 HashMap，也不能 filter_map 丢失位置。对照 [DAO 批量查询](../../../src/dao/sql.rs)。
 
 ## 练习六：把 pending 一次移动进 history
 
@@ -99,13 +99,13 @@ fn main() {
 }
 ```
 
-验收：不克隆每个 String，提交后 pending 为空，再提交不会重复追加。对照 [Prompt::commit_turn](/home/lihongyu/projects/geer-agent/src/prompt/conversation.rs)。
+验收：不克隆每个 String，提交后 pending 为空，再提交不会重复追加。对照 [Prompt::commit_turn](../../../src/prompt/conversation.rs)。
 
 ## 练习七：辨别并发与取消
 
 题目：对 `JoinHandle` 的等待超时，后台任务一定停了吗？`join_all` 会按完成先后返回吗？
 
-答案：超时取消哪一层要看传入的 Future，丢弃 JoinHandle 通常让任务继续；需要明确中止与等待策略，阻塞任务另有局限。`join_all` 按输入顺序给结果，不是完成顺序。阅读 [工具批次](/home/lihongyu/projects/geer-agent/src/tools/mod.rs) 并画出 read/read/write/read 的执行阶段。
+答案：超时取消哪一层要看传入的 Future，丢弃 JoinHandle 通常让任务继续；需要明确中止与等待策略，阻塞任务另有局限。`join_all` 按输入顺序给结果，不是完成顺序。阅读 [工具批次](../../../src/tools/mod.rs) 并画出 read/read/write/read 的执行阶段。
 
 ## 练习八：选择验证层次
 
@@ -116,11 +116,11 @@ fn main() {
 可阅读并自行运行现有定向测试：
 
 ```bash
-cargo test parses_supported_commands
-cargo test --test responses_retry
+scripts/test-safe.sh cargo test parses_supported_commands
+scripts/test-safe.sh cargo test --test responses_retry
 ```
 
-这些命令会编译当前项目；本次笔记验证没有把它们当成已执行结果。外部数据库和真实上游验证也需单独说明。
+这些命令经隔离后编译并运行当前项目的定向测试；本次笔记验证没有把它们当成已执行结果。外部数据库和真实上游验证也需单独说明。
 
 ## 自评
 

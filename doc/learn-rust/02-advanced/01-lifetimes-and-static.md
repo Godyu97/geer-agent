@@ -52,7 +52,7 @@ fn main() {
 
 普通类型位置的 `Box<dyn Trait>` 经常默认要求内部对象满足 `'static`。若它要借用调用者的数据，可能需要 `Box<dyn Trait + 'a>`；引用和具体表达式上下文也会影响默认推导，不能把“所有 dyn 永远默认 static”当作统一规则。
 
-项目 [ConfirmFn](/home/lihongyu/projects/geer-agent/src/tools/mod.rs) 保存一个拥有型的授权回调。另一个例子 [TraceContext<'a>](/home/lihongyu/projects/geer-agent/src/agent/mod.rs) 明确借用 Agent 字段，生命周期标注是为短期使用服务的，不应该强改成 static。
+项目 [ConfirmFn](../../../src/tools/mod.rs) 保存一个拥有型的授权回调。另一个例子 [TraceContext<'a>](../../../src/agent/mod.rs) 明确借用 Agent 字段，生命周期标注是为短期使用服务的，不应该强改成 static。
 
 ## 多个层次的引用怎么读
 

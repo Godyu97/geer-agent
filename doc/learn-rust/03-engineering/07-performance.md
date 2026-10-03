@@ -4,6 +4,8 @@
 
 对应原教程：深入内存、性能调优、编译优化及其全部子项。这一部分在源目录中大量标 TODO，有些正文只是外链，有些已经有内容；以下明确作为入门补充，不当成已完结原文摘要。
 
+工程诊断与工具实践继续阅读 [调试、性能与验证工具](12-debugging-and-profiling.md)，其中说明 profiler、Criterion、coverage、Miri/Loom 的适用范围。
+
 ## 先分四类时间
 
 编译耗时、程序 CPU 执行耗时、I/O 等待、外部模型服务耗时是不同问题。比如 Agent 首字延迟很长，先看请求发送、网络和模型，而不是先把一个 Vec 换成链表。
@@ -63,7 +65,7 @@ cargo build --release
 
 ## 对照项目的三个例子
 
-[Tools::execute_batch](/home/lihongyu/projects/geer-agent/src/tools/mod.rs) 提前为结果 Vec 预留调用数量；[Bash 截断](/home/lihongyu/projects/geer-agent/src/tools/bash.rs) 为捕获字节和显示字符分别设限，限制输出带来的资源消耗；[Prompt 请求构造](/home/lihongyu/projects/geer-agent/src/prompt/conversation.rs) 有历史 clone，初学阶段先理解独立请求需要的所有权，不能看到 clone 就删除。
+[Tools::execute_batch](../../../src/tools/mod.rs) 提前为结果 Vec 预留调用数量；[Bash 截断](../../../src/tools/bash.rs) 为捕获字节和显示字符分别设限，限制输出带来的资源消耗；[Prompt 请求构造](../../../src/prompt/conversation.rs) 有历史 clone，初学阶段先理解独立请求需要的所有权，不能看到 clone 就删除。
 
 练习：对逐渐增大的文本比较“一次 chars 遍历”和“循环调用 chars().nth(i)”；记录输入长度及趋势。结果用于理解复杂度，不宣称代表生产服务性能。
 

@@ -52,7 +52,7 @@ fn main() {
 
 `AtomicU64::fetch_add` 对这个整数执行不可分割的更新；并不表示实现时“暂停所有 CPU”。`Relaxed` 提供该原子对象上的原子性，不建立其他数据的发布/获取顺序。Acquire/Release 等顺序解决跨操作可见性，不能只凭“看起来更快”选择。
 
-[AgentRuntime::new](/home/lihongyu/projects/geer-agent/src/agent/mod.rs) 使用 `NEXT_RUN_ID.fetch_add(1, Ordering::Relaxed)` 取得递增片段；此计数器不用于发布另一块共享数据，所以可以按这个有限用途理解。不要把同样顺序直接照搬到锁、队列或完成标志实现。
+[AgentRuntime::new](../../../src/agent/mod.rs) 使用 `NEXT_RUN_ID.fetch_add(1, Ordering::Relaxed)` 取得递增片段；此计数器不用于发布另一块共享数据，所以可以按这个有限用途理解。不要把同样顺序直接照搬到锁、队列或完成标志实现。
 
 ## Send 与 Sync 的准确读法
 
@@ -61,6 +61,6 @@ fn main() {
 
 通常让编译器根据字段推导，不手写 unsafe 实现。`Rc` 不适合跨线程；`Arc<T>` 是否 Send/Sync 仍依赖 T。某个程序当前只用一个线程，不会让 `tokio::spawn` 的类型约束自动消失。
 
-项目 [本地模拟服务测试](/home/lihongyu/projects/geer-agent/tests/responses_retry.rs) 使用线程接受请求；[Bash 工具](/home/lihongyu/projects/geer-agent/src/tools/bash.rs) 使用 Tokio 任务同时排空 stdout/stderr。这两个例子分别对应系统线程和异步任务。
+项目 [本地模拟服务测试](../../../tests/responses_retry.rs) 使用线程接受请求；[Bash 工具](../../../src/tools/bash.rs) 使用 Tokio 任务同时排空 stdout/stderr。这两个例子分别对应系统线程和异步任务。
 
 来源：[教程多线程](https://beatai.org/rust-course/advance/concurrency-with-threads/intro)、[std::thread](https://doc.rust-lang.org/std/thread/index.html)、[Atomic Ordering](https://doc.rust-lang.org/std/sync/atomic/enum.Ordering.html)、[Sync](https://doc.rust-lang.org/std/marker/trait.Sync.html)。

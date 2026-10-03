@@ -28,7 +28,7 @@ fn main() {
 
 支持 `Fn` 的闭包也支持 `FnMut`、`FnOnce`；支持 `FnMut` 的也支持 `FnOnce`。`move` 决定如何捕获，闭包体如何使用捕获值才决定实现哪些调用 trait；不要看到 `move` 就断言只支持 `FnOnce`。
 
-[ChatProvider::complete_step](/home/lihongyu/projects/geer-agent/src/provider/mod.rs) 要求 `F: FnMut(&str) -> io::Result<()>`：每次流式片段到达都能调用回调，回调可更新输出状态，终端写失败还能返回错误。
+[ChatProvider::complete_step](../../../src/provider/mod.rs) 要求 `F: FnMut(&str) -> io::Result<()>`：每次流式片段到达都能调用回调，回调可更新输出状态，终端写失败还能返回错误。
 
 ## 迭代器是一条待执行的计算描述
 
@@ -74,7 +74,7 @@ fn main() -> Result<(), std::num::ParseIntError> {
 }
 ```
 
-[Responses::complete_step](/home/lihongyu/projects/geer-agent/src/provider/openai/responses.rs) 用 `filter_map` 只留下工具调用项；[parse_pretty_name](/home/lihongyu/projects/geer-agent/src/prompt/mod.rs) 用 `find_map` 找系统版本；[DAO](/home/lihongyu/projects/geer-agent/src/dao/sql.rs) 用 `collect` 合并一批可失败的转换。
+[Responses::complete_step](../../../src/provider/openai/responses.rs) 用 `filter_map` 只留下工具调用项；[parse_pretty_name](../../../src/prompt/mod.rs) 用 `find_map` 找系统版本；[DAO](../../../src/dao/sql.rs) 用 `collect` 合并一批可失败的转换。
 
 易错点：`filter` 的谓词收到的是元素的引用，因此源迭代器已经产出引用时，闭包参数可能是双层引用。先写出 `Iterator::Item` 类型，再决定是否用 `copied`，不要连续加星号碰运气。
 

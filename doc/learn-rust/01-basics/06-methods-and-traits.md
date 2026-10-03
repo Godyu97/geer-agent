@@ -76,7 +76,7 @@ fn main() {
 
 ## 不要直接把项目改成 `dyn ChatProvider`
 
-[ChatProvider](/home/lihongyu/projects/geer-agent/src/provider/mod.rs) 的 `complete_step<F>` 既是泛型方法，又是原生 `async fn`。它的当前接口不满足直接构造特征对象的 dyn compatibility 要求。因此项目采用泛型参数配合内部枚举分派，并不是漏写了 `Box`。
+[ChatProvider](../../../src/provider/mod.rs) 的 `complete_step<F>` 既是泛型方法，又是原生 `async fn`。它的当前接口不满足直接构造特征对象的 dyn compatibility 要求。因此项目采用泛型参数配合内部枚举分派，并不是漏写了 `Box`。
 
 原生 trait 中的 `async fn` 已稳定，不需要因为旧文章说“不支持”就添加 `async-trait`；但稳定支持静态调用，不代表自动支持 `dyn`。这是学习旧异步章节时必须校正的区别。
 

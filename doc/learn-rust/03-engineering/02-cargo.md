@@ -4,6 +4,8 @@
 
 对应原教程：Cargo 使用指南的上手、基础与进阶全部小节。本篇是日常查表，不要求一次记住。
 
+面向工程师的深讲：[工具链与编译](08-toolchain-and-compilation.md)、[依赖治理](10-dependencies-and-supply-chain.md)、[Workspace 与交付](13-workspace-ci-and-release.md)。先理解构建执行链，再把本篇作为速查。
+
 ## 基础章节逐项归纳
 
 | 原教程主题 | 应理解的关系 | 本项目怎么用 |
@@ -42,11 +44,11 @@ cargo build --locked
 | 发布到 crates.io | 打包元数据、文件与版本 | 先检查包内容，不能带密钥 |
 | build.rs 及示例 | 构建期代码生成、原生库编译/链接 | 会执行程序，需声明重跑条件 |
 
-本项目没有因为需要读取一个配置就使用 build.rs；`include_str!` 是不同的编译期机制。
+本项目使用 build.rs 准备 GUI/Web 构建配置与静态资源变更追踪；embed-env 的 include_str! 则是另一种编译期机制。不要把“现在有 build.rs”理解成“配置读取都发生在构建时”。
 
 ## Cargo.toml 中已经存在的依赖
 
-[实际配置](/home/lihongyu/projects/geer-agent/Cargo.toml) 包含 Tokio、futures-util、Serde、async-openai、数据库驱动等。只把它们按职责理解：运行时、流与 Future 工具、序列化、模型协议、持久化。无需一开始学习所有 SDK 类型。
+[实际配置](../../../Cargo.toml) 包含 Tokio、futures-util、Serde、async-openai、数据库驱动等。只把它们按职责理解：运行时、流与 Future 工具、序列化、模型协议、持久化。无需一开始学习所有 SDK 类型。
 
 `default-features = false` 表示该依赖的这个声明不主动启用默认 features；其他依赖路径仍可能启用相同 crate 的 feature。`cargo tree -e features` 比凭一个 manifest 行判断最终开关更可靠。
 
@@ -57,7 +59,7 @@ cargo build --locked
 embed-env = []
 ```
 
-这个空列表表示 feature 本身不额外启用依赖，但源码可以用 `#[cfg(feature = "embed-env")]` 控制是否编译相关项。启用后，[config](/home/lihongyu/projects/geer-agent/src/config/mod.rs) 会通过 `include_str!` 读取仓库 `.env`。
+这个空列表表示 feature 本身不额外启用依赖，但源码可以用 `#[cfg(feature = "embed-env")]` 控制是否编译相关项。启用后，[config](../../../src/config/mod.rs) 会通过 `include_str!` 读取仓库 `.env`。
 
 因此 `cargo clippy --all-targets --all-features` 也会触发读取；文件缺失会导致编译失败，文件存在则内容可能进入构建产物。不要为验证笔记而构建携带真实配置的程序。本次仅检查笔记，不执行该构建。
 

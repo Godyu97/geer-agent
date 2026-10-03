@@ -8,7 +8,7 @@
 
 package 是由 `Cargo.toml` 管理的项目单位，可以包含多个 target；crate 是一次编译的单元；module 是 crate 内的命名和可见性组织方式。一个源文件不会仅因存在就自动成为模块，通常需要被模块树声明引用。
 
-本项目 package 叫 `geer-agent`，目前是 binary crate，入口为 [src/main.rs](/home/lihongyu/projects/geer-agent/src/main.rs)，没有 `src/lib.rs`。目录 `src/provider/openai/` 不是一个独立的外部包。
+本项目 package 叫 `geer-agent`，目前是 binary crate，入口为 [src/main.rs](../../../src/main.rs)，没有 `src/lib.rs`。目录 `src/provider/openai/` 不是一个独立的外部包。
 
 ## `mod` 与 `use` 分别做什么
 
@@ -26,9 +26,9 @@ package 是由 `Cargo.toml` 管理的项目单位，可以包含多个 target；
 
 ## 项目的再导出
 
-[interaction/mod.rs](/home/lihongyu/projects/geer-agent/src/interaction/mod.rs) 保持内部 `command` 私有，再用 `pub(crate) use command::{CommandError, CommandOutcome, Operation, execute, save};` 给仓库其他模块提供稳定入口。调用者不必知道执行实现在哪个文件。[ui/repl/mod.rs](/home/lihongyu/projects/geer-agent/src/ui/repl/mod.rs) 的颜色模块也保持私有，文本运行入口只对父 UI 模块开放。
+[interaction/mod.rs](../../../src/interaction/mod.rs) 保持内部 `command` 私有，再用 `pub(crate) use command::{CommandError, CommandOutcome, Operation, execute, save};` 给仓库其他模块提供稳定入口。调用者不必知道执行实现在哪个文件。[ui/repl/mod.rs](../../../src/ui/repl/mod.rs) 的颜色模块也保持私有，文本运行入口只对父 UI 模块开放。
 
-[tools/mod.rs](/home/lihongyu/projects/geer-agent/src/tools/mod.rs) 组织 Bash 和文件工具；Provider 需要的协议描述通过 Agent 转换，因此工具模块不必依赖 SDK 请求类型。这种依赖方向比“每个函数放单独目录”更值得学习。
+[tools/mod.rs](../../../src/tools/mod.rs) 组织 Bash 和文件工具；Provider 需要的协议描述通过 Agent 转换，因此工具模块不必依赖 SDK 请求类型。这种依赖方向比“每个函数放单独目录”更值得学习。
 
 ```mermaid
 flowchart TD

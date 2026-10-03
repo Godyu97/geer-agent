@@ -46,7 +46,7 @@ flowchart TD
 
 ## 项目里可以读到类似代码
 
-[tests/tool_loop.rs](/home/lihongyu/projects/geer-agent/tests/tool_loop.rs) 的模拟 HTTP 服务使用 `TcpListener`，读取请求头、按 Content-Length 读取 body，再写预设的流事件。监听 `127.0.0.1:0` 让系统分配空闲端口，便于并行测试。
+[tests/tool_loop.rs](../../../tests/tool_loop.rs) 的模拟 HTTP 服务使用 `TcpListener`，读取请求头、按 Content-Length 读取 body，再写预设的流事件。监听 `127.0.0.1:0` 让系统分配空闲端口，便于并行测试。
 
 这是针对测试客户端的受控模拟器，不应直接作为公网服务器。阅读时重点找四件事：端口怎么传给子进程、连接怎么限时、请求体怎么攒齐、服务线程如何结束。
 

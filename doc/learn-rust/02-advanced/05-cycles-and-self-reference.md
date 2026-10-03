@@ -60,7 +60,7 @@ fn main() {
 
 范围在访问时重新转成借用；若修改源文本，仍要维护范围的语义，这个例子没有声称自动追踪编辑位置。
 
-项目 [Prompt](/home/lihongyu/projects/geer-agent/src/prompt/conversation.rs) 保存拥有型会话项，没有在同一个结构体里保存指向自己字段的借用；[TraceContext](/home/lihongyu/projects/geer-agent/src/agent/mod.rs) 是独立的短期视图，借用外部 Agent。先用这种清楚的拥有者/视图分离，再考虑复杂自引用抽象。
+项目 [Prompt](../../../src/prompt/conversation.rs) 保存拥有型会话项，没有在同一个结构体里保存指向自己字段的借用；[TraceContext](../../../src/agent/mod.rs) 是独立的短期视图，借用外部 Agent。先用这种清楚的拥有者/视图分离，再考虑复杂自引用抽象。
 
 `Pin` 与地址稳定有关，但不是写一个 `Pin<...>` 就能让任意自引用结构体自动安全；它的具体保证见 [异步与 Pin](10-async-future-and-pin.md)。
 

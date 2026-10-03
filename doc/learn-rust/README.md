@@ -1,12 +1,52 @@
-# 跟着 geer-agent 学 Rust
+# 从资深工程师到合格 Rust 开发者
 
-面向 Rust 初学者的中文笔记：沿《Rust 语言圣经》的章节推进，用本仓库的代码解释概念，再用小练习验证理解。第一次阅读不必从头到尾背完；先把一个输入如何变成一次模型请求看懂。
+这套中文教程面向已经熟悉 Go 或其他后端语言的软件工程师。目标是能够独立设计、实现、测试、诊断和交付 Rust 程序：理解工具链，利用所有权和类型表达约束，掌握标准库，正确使用异步运行时，并能解释自己的框架选择。
+
+基础笔记保留《Rust 语言圣经》的章节映射；新增主线按工程能力组织。建议先读 [工程师学习路线与验收标准](00-engineer-roadmap.md)，再从 [Go → Rust 思维迁移](06-go-to-rust/01-mental-model.md) 开始。阅读量不是完成标准，能够用代码证明理解才是。
+
+## 面向工程师的主线
+
+| 阶段 | 重点 | 阅读入口 |
+| --- | --- | --- |
+| 1 | 工具链、编译、Cargo、edition 与构建诊断 | [工具链原理](03-engineering/08-toolchain-and-compilation.md)、[Cargo](03-engineering/02-cargo.md) |
+| 2 | Go 对照、所有权 API、类型与错误、并发迁移 | [Go 专题](06-go-to-rust/01-mental-model.md) → 该目录六篇 |
+| 进阶选修 | HRTB、GAT、const generics、变型、布局与 Future | [类型系统进阶](02-advanced/14-type-system-and-layout.md)、[Future 实验](02-advanced/15-future-send-and-pin-workshop.md) |
+| 3 | 标准库类型、集合、文本、I/O、进程、同步 | [标准库地图](07-standard-library/01-map-and-reading.md) → 该目录五篇 |
+| 4 | 运行时、任务、背压、取消和关闭 | [Tokio 原理](08-ecosystem/03-tokio-runtime.md)、[Tokio 实战](08-ecosystem/04-tokio-workshop.md) |
+| 5 | HTTP 服务、序列化与数据访问 | [Axum/Tower](08-ecosystem/05-axum-and-tower.md)、[Serde/Reqwest](08-ecosystem/06-serde-and-reqwest.md)、[数据库](08-ecosystem/07-database-and-rpc.md) |
+| 6 | 桌面应用、IPC、权限、状态与打包 | [Tauri 原理](08-ecosystem/08-tauri-architecture.md)、[Tauri 实战](08-ecosystem/09-tauri-workshop.md) |
+| 7 | 社区规范、API、依赖治理、服务交付与性能 | [API 与状态设计](03-engineering/09-api-design-and-state.md)、[工程验证](03-engineering/14-testing-and-contracts.md)、[社区实践](03-engineering/15-community-and-open-source.md) |
+| 8 | 项目阅读、综合练习、代码审查与能力验收 | [毕业项目](04-project/04-capstone-and-rubric.md)、[审查练习](04-project/05-review-workshop.md) |
+
+资料选择见 [社区教程怎么学](08-ecosystem/01-learning-resources.md)，技术选型见 [常用生态与选择依据](08-ecosystem/02-stack-decisions.md)。调查时间、版本边界和事实来源见 [调研记录](05-reference/03-research-log.md)。这里的“常用”表示值得工程师了解的代表方案，不表示有统一的市场排名。
+
+阶段复习可用 [术语与自测](05-reference/04-glossary-and-self-check.md)，框架深讲之后再用源码与毕业任务验证，不需要将全部框架加入项目。
+
+## 深化练习：把原理变成代码证据
+
+| 主题 | 完整练习与追问 |
+| --- | --- |
+| Future 与类型约束 | [有限次数手动 poll](02-advanced/15-future-send-and-pin-workshop.md)：Pending、唤醒、Send 与 static |
+| Trait 和宏进阶 | [一致性与动态接口](02-advanced/16-trait-boundaries-and-coherence.md)、[宏与 cfg](02-advanced/17-macro-and-cfg-workshop.md)：异步返回、求值、构建边界 |
+| 标准库数据处理 | [借用解析与拥有汇总](07-standard-library/05-data-processing-workshop.md)：行号、UTF-8、上限和错误来源 |
+| Tokio I/O 与回收 | [分帧与关闭](08-ecosystem/11-tokio-io-and-shutdown.md)：半包、EOF、取消与 await 回收 |
+| Web 契约 | [Axum/Tower 请求验证](08-ecosystem/12-web-testing-and-middleware.md)：输入限制、错误方法与超时层 |
+| 桌面长任务 | [Tauri 任务协议](08-ecosystem/13-tauri-ipc-and-lifecycle.md)：Channel、真正终态、独立取消与关闭 |
+| 错误与观测工具 | [thiserror/anyhow/tracing 实战](08-ecosystem/14-errors-and-observability.md)：错误分类、原因链和异步 span |
+| 质量与协作 | [属性和失败路径](03-engineering/14-testing-and-contracts.md)、[社区贡献流程](03-engineering/15-community-and-open-source.md) |
+
+## Go 学习经验如何复用
+
+复用 Go 的接口隔离、组合、显式错误、并发设计和性能测量经验。需要重新建立的直觉是：赋值可能转移所有权；引用携带有效性与别名约束；枚举能表达带数据的状态；泛型与动态分派需要主动选择；异步任务必须由运行时轮询；释放资源与任务取消都具有具体边界。
+
+Rust 的优势在于将部分资源管理、别名和线程安全约束放进编译期，并允许细致控制分配、布局和运行时成本。收益要结合场景验证；学习难度、编译成本、团队经验和生态适配同样进入选择。对照 [思维迁移](06-go-to-rust/01-mental-model.md) 阅读 [Go GC 指南](https://go.dev/doc/gc-guide) 与 [Rust 所有权](https://doc.rust-lang.org/book/ch04-01-what-is-ownership.html)。
 
 ## 从哪里开始
 
 | 你的目标 | 阅读入口 |
 | --- | --- |
-| 按原教程逐章学习 | [完整章节对照](00-course-map.md) |
+| 按原教程逐章学习 | [原教程章节对照](00-course-map.md) |
+| 已经熟悉 Go，想系统成为 Rust 开发者 | [工程师学习路线](00-engineer-roadmap.md) |
 | 第一次接触 Rust | [环境与 Cargo](01-basics/01-setup.md)，接着读基础目录 |
 | 卡在所有权、借用 | [所有权](01-basics/03-ownership.md) → [生命周期](01-basics/08-lifetimes.md) |
 | 看不懂 `async`、`Stream`、`Pin` | [异步基础](02-advanced/10-async-future-and-pin.md) → [流与取消](02-advanced/11-streams-and-cancellation.md) |
@@ -31,13 +71,16 @@ flowchart TD
 
 每次学习按四步走：先读概念，手动预测例子结果，再编译验证，最后在项目中找到同一写法。基础部分建议每次 1–2 篇；链表、Unsafe、性能布局属于选读，不是运行本项目的前置条件。
 
-## 笔记目录
+## 基础笔记与原章节目录
 
 - `01-basics/`：安装、类型、所有权、模式、Trait、集合、生命周期、错误、模块和 CLI 实战。
 - `02-advanced/`：生命周期进阶、闭包、类型转换、智能指针、线程、宏、异步和 Web/Redis 实战导读。
 - `03-engineering/`：测试、Cargo、日志、开发技巧、链表、编译错误和性能。
 - `04-project/`：源码阅读路线、完整请求流程和带参考答案的练习。
 - `05-reference/`：语法速查、版本差异、资料来源与验证说明。
+- `06-go-to-rust/`：Go 对照与所有权、类型、并发迁移训练。
+- `07-standard-library/`：标准库按工程问题系统学习。
+- `08-ecosystem/`：教程调研、框架原理与实际使用；包含 Tokio、Tauri、Axum/Tower、Serde/Reqwest、数据库与 RPC。
 
 | 章节 | 笔记 |
 | --- | --- |
@@ -78,7 +121,7 @@ flowchart TD
 | 35 | [语法速查、派生特征与版本差异](05-reference/01-syntax-and-versions.md) |
 | 36 | [来源、学习资料与验证说明](05-reference/02-resources-and-verification.md) |
 
-每篇均包含项目对应位置或明确说明“本项目未采用”，避免把教程的演示设计误认为现有功能。文中“项目摘录”依赖仓库上下文；“独立示例”只需要标准库。`rust,compile_fail` 标识的是故意不能编译的教学例子；`rust,ignore` 标识不能脱离上下文独立运行的片段。
+文中“项目摘录”依赖仓库上下文；普通 `rust` 围栏是可独立验证的标准库示例。`rust,compile_fail` 是故意不能编译的例子；`rust,ignore` 是项目摘录或需要单独 Cargo 练习包、前端和系统依赖的框架示例，其验证状态另行记录。练习命令默认从仓库根目录执行；本仓库所有测试和文档示例测试均通过 `scripts/test-safe.sh`，具体步骤见 [验证说明](05-reference/02-resources-and-verification.md)。
 
 ## 教程来源与覆盖边界
 
@@ -90,7 +133,7 @@ flowchart TD
 
 ## 项目快照与阅读方式
 
-源码依据本仓库提交 `4f6a0a2`；本机实际输出为 `rustc 1.98.1`、`cargo 1.98.1`，项目使用 edition 2024。这是本次验证环境，不是最低版本声明。源码已包含 REPL、双模型协议、工具循环和可选数据库 Trace；不能再按治理文件里早期的 Hello World 描述理解项目。
+2026-10-03 扩充依据工作区 HEAD `99e8690`、当前 Cargo.toml 和源码；本机 `rustc 1.98.1`，项目 edition 2024。版本记录描述验证环境，不是最低支持版本承诺。源码包含四种 UI、双模型协议、工具循环、会话与 Trace 持久化、项目指令和主动记忆召回。原教程映射仍保留其固定历史快照，新增教程的调查记录单独维护。
 
 使用支持 Mermaid 的 Markdown 预览打开本文件，点击目录逐篇阅读。图都在 `mermaid` 代码围栏内，无需外部图片服务。若预览器只显示源码，需使用其 Mermaid 支持；正文也保留了文字解释。
 

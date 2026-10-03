@@ -61,11 +61,11 @@ fn main() {
 
 `entry` 把“已有还是缺少”变成一个可操作的状态；`or_insert` 返回值的可变引用，所以需要 `*` 修改值。生成默认值有成本时用 `or_insert_with` 延迟构造。
 
-[TraceCapture::append_call_delta](/home/lihongyu/projects/geer-agent/src/trace/mod.rs) 使用 `entry(index).or_default()` 找到某个工具调用的累积状态，然后追加本次片段。它使用有序映射，便于按输出索引组织结果。
+[TraceCapture::append_call_delta](../../../src/trace/mod.rs) 使用 `entry(index).or_default()` 找到某个工具调用的累积状态，然后追加本次片段。它使用有序映射，便于按输出索引组织结果。
 
 ## 看一个真实的顺序问题
 
-[SqlStore::get_batch](/home/lihongyu/projects/geer-agent/src/dao/sql.rs) 查询多个请求 ID，数据库返回顺序不一定与输入相同。代码将结果放入 `HashMap`，再按 `request_ids.iter()` 重建结果列表。返回类型 `Vec<Option<TraceRecord>>` 还保留了“这个位置不存在”的信息。
+[SqlStore::get_batch](../../../src/dao/sql.rs) 查询多个请求 ID，数据库返回顺序不一定与输入相同。代码将结果放入 `HashMap`，再按 `request_ids.iter()` 重建结果列表。返回类型 `Vec<Option<TraceRecord>>` 还保留了“这个位置不存在”的信息。
 
 练习：输入 ID 为 `["b", "a", "missing"]`，映射只有 a、b。输出必须是 `[Some(b), Some(a), None]`，不能先 `filter_map` 把缺项过滤掉，因为那会破坏位置对应关系。
 

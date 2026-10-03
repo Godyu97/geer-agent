@@ -70,19 +70,19 @@ fn main() {
 }
 ```
 
-[parse_positive_u64](/home/lihongyu/projects/geer-agent/src/config/mod.rs) 就采用类似结构，并额外检查正数：外层 `None` 表示没设置，里面的 `Err` 表示设置了但不合法。
+[parse_positive_u64](../../../src/config/mod.rs) 就采用类似结构，并额外检查正数：外层 `None` 表示没设置，里面的 `Err` 表示设置了但不合法。
 
 ## `panic!`、`unwrap` 和自定义错误
 
 可预期的输入错误、网络失败通常返回 `Result`。`panic!` 表示无法继续的程序状态；不要用它代替业务错误。panic 的展开/中止受配置影响，不能承诺所有 panic 都会走清理逻辑。
 
-`unwrap` 与 `expect` 都会在失败时 panic；`expect` 多了一段解释。测试中的固定成功条件适合 `expect`，用户输入不适合。[TraceError](/home/lihongyu/projects/geer-agent/src/trace/mod.rs) 实现 `Display` 和 `Error`，让错误既能打印又能参与统一错误接口。
+`unwrap` 与 `expect` 都会在失败时 panic；`expect` 多了一段解释。测试中的固定成功条件适合 `expect`，用户输入不适合。[TraceError](../../../src/trace/mod.rs) 实现 `Display` 和 `Error`，让错误既能打印又能参与统一错误接口。
 
 `Box<dyn Error>` 方便应用入口容纳多种错误，但没有自动承诺 `Send + Sync`。要跨任务/线程传递时，需检查具体边界，而不是机械替换整个项目类型。
 
 ## 读懂项目中的 `??`
 
-流读取可能包含 `Result<Option<Result<Event, StreamError>>, TimeoutError>`。外层是等待超时，`Option` 是流是否结束，内层是本次事件是否失败。[collect_reply](/home/lihongyu/projects/geer-agent/src/provider/openai/responses.rs) 分层转换后出现连续 `?`，只是逐层解包，不是特殊运算符。
+流读取可能包含 `Result<Option<Result<Event, StreamError>>, TimeoutError>`。外层是等待超时，`Option` 是流是否结束，内层是本次事件是否失败。[collect_reply](../../../src/provider/openai/responses.rs) 分层转换后出现连续 `?`，只是逐层解包，不是特殊运算符。
 
 练习：解释 `Ok(None)` 与 `Err(...)` 在查数据库时的区别。前者是查询成功但不存在记录，后者连查询结果都不能可靠得到。
 

@@ -73,6 +73,6 @@ fn main() {
 
 ## 项目对应
 
-[TraceCapture](/home/lihongyu/projects/geer-agent/src/trace/mod.rs) 有 `Option<Arc<AtomicI32>>`，共享的是请求尝试次数；原子整数负责数值更新，Arc 负责共享存活。[Tools](/home/lihongyu/projects/geer-agent/src/tools/mod.rs) 用 `Box<dyn FnMut>` 保存可替换的授权回调。项目没有因为所有权报错而普遍引入 `Rc<RefCell<_>>`，这是值得保留的简洁性。
+[TraceCapture](../../../src/trace/mod.rs) 有 `Option<Arc<AtomicI32>>`，共享的是请求尝试次数；原子整数负责数值更新，Arc 负责共享存活。[Tools](../../../src/tools/mod.rs) 用 `Box<dyn FnMut>` 保存可替换的授权回调。项目没有因为所有权报错而普遍引入 `Rc<RefCell<_>>`，这是值得保留的简洁性。
 
 来源：[教程智能指针](https://beatai.org/rust-course/advance/smart-pointer/intro)、[标准库 Rc](https://doc.rust-lang.org/std/rc/struct.Rc.html)、[Arc](https://doc.rust-lang.org/std/sync/struct.Arc.html)、[RefCell](https://doc.rust-lang.org/std/cell/struct.RefCell.html)。

@@ -76,6 +76,6 @@ fn main() {
 }
 ```
 
-项目实践：从 [parse_input](/home/lihongyu/projects/geer-agent/src/interaction/mod.rs) 或 [Prompt::commit_turn](/home/lihongyu/projects/geer-agent/src/prompt/conversation.rs) 抽一段到独立练习目录制造错误，先预测诊断，再修复；不为练习破坏主程序。
+项目实践：从 [parse_input](../../../src/interaction/mod.rs) 或 [Prompt::commit_turn](../../../src/prompt/conversation.rs) 抽一段到独立练习目录制造错误，先预测诊断，再修复；不为练习破坏主程序。
 
 来源：[教程编译错误](https://beatai.org/rust-course/compiler/intro)、[教程陷阱](https://beatai.org/rust-course/compiler/pitfalls/index)、[官方错误索引](https://doc.rust-lang.org/error_codes/)、[Eq](https://doc.rust-lang.org/std/cmp/trait.Eq.html)。
