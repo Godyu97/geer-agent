@@ -1,0 +1,369 @@
+{
+  "version": 1,
+  "source_roots": [
+    "Cargo.toml",
+    "Cargo.lock",
+    "Makefile",
+    ".gitignore",
+    ".env.example",
+    "build.rs",
+    "src",
+    "scripts",
+    "tests",
+    ".agents",
+    "openspec/config.yaml"
+  ],
+  "excluded_paths": [
+    {
+      "path": "src/ui/frontend/node_modules",
+      "reason": "Bun 根据 package.json/bun.lock 安装的第三方依赖；不是第一方源码，可在未安装的 checkout 中缺失。"
+    },
+    {
+      "path": "src/ui/frontend/dist",
+      "reason": "Vite 根据共用前端源码生成的 GUI/Web 静态产物；维护源是 src/ui/frontend/src 与构建配置，可在未构建的 checkout 中缺失。"
+    }
+  ],
+  "components": [
+    {
+      "root": ".",
+      "language": "Rust 2024",
+      "role": "单一二进制应用",
+      "manifest": "Cargo.toml",
+      "notes": "非 Cargo workspace；终端界面是默认构建，gui/web 通过可选 features 启用。"
+    },
+    {
+      "root": "src/ui/frontend",
+      "language": "TypeScript / React",
+      "role": "GUI 与 Web 共用前端包",
+      "manifest": "src/ui/frontend/package.json",
+      "notes": "React、Vite、TypeScript、Vitest；Bun 1.4.2 管理依赖，通过 desktop/web HostAdapter 对接宿主。"
+    },
+    {
+      "root": ".",
+      "language": "POSIX Shell / Python / Rust",
+      "role": "开发命令、测试隔离与进程夹具",
+      "manifest": "Makefile",
+      "notes": "scripts/test-safe.sh 使用 systemd/cgroup v2；scripts/test-safe-check.py 和 tests/support/mod.rs 提供有界安全验证与夹具。"
+    },
+    {
+      "root": ".agents",
+      "language": "Markdown / Python",
+      "role": "已安装仓库工作流",
+      "manifest": ".agents/skills/.openspec-target",
+      "notes": "OpenSpec skill 由 CLI 刷新；Git runner 随对应 skill 安装，归属登记不授予运行或修改权限。"
+    }
+  ],
+  "modules": [
+    {
+      "id": "dev-tooling",
+      "code_paths": [
+        "Cargo.toml",
+        "Cargo.lock",
+        "Makefile",
+        ".gitignore",
+        ".env.example",
+        "scripts",
+        "tests/support",
+        ".agents",
+        "openspec/config.yaml"
+      ],
+      "test_paths": [
+        "scripts/test-safe-check.py",
+        "tests/process_safety.rs"
+      ],
+      "docs": [
+        "docs/mod/dev-tooling/00-overview.md",
+        "docs/mod/dev-tooling/01-implementation.md",
+        "docs/mod/dev-tooling/02-issues.md"
+      ]
+    },
+    {
+      "id": "build-script",
+      "code_paths": [
+        "build.rs"
+      ],
+      "test_paths": [],
+      "docs": [
+        "docs/mod/build-script/00-overview.md",
+        "docs/mod/build-script/01-implementation.md",
+        "docs/mod/build-script/02-issues.md"
+      ]
+    },
+    {
+      "id": "entry",
+      "code_paths": [
+        "src/main.rs",
+        "src/ui/mod.rs"
+      ],
+      "test_paths": [
+        "src/ui/mod.rs",
+        "tests/gui_selection.rs"
+      ],
+      "docs": [
+        "docs/mod/entry/00-overview.md",
+        "docs/mod/entry/01-implementation.md",
+        "docs/mod/entry/02-issues.md"
+      ]
+    },
+    {
+      "id": "agent",
+      "code_paths": [
+        "src/agent"
+      ],
+      "test_paths": [
+        "tests/tool_loop.rs",
+        "tests/session_compaction.rs",
+        "src/agent/guard.rs"
+      ],
+      "docs": [
+        "docs/mod/agent/00-overview.md",
+        "docs/mod/agent/01-implementation.md",
+        "docs/mod/agent/02-issues.md"
+      ]
+    },
+    {
+      "id": "configuration",
+      "code_paths": [
+        "src/config"
+      ],
+      "test_paths": [
+        "tests/config_paths.rs",
+        "tests/process_safety.rs",
+        "src/config/mod.rs"
+      ],
+      "docs": [
+        "docs/mod/configuration/00-overview.md",
+        "docs/mod/configuration/01-implementation.md",
+        "docs/mod/configuration/02-issues.md"
+      ]
+    },
+    {
+      "id": "storage",
+      "code_paths": [
+        "src/dao"
+      ],
+      "test_paths": [
+        "src/dao/mod.rs",
+        "tests/session_compaction.rs",
+        "src/memory/tests.rs"
+      ],
+      "docs": [
+        "docs/mod/storage/00-overview.md",
+        "docs/mod/storage/01-implementation.md",
+        "docs/mod/storage/02-issues.md"
+      ]
+    },
+    {
+      "id": "interaction",
+      "code_paths": [
+        "src/interaction"
+      ],
+      "test_paths": [
+        "src/interaction/command_tests.rs",
+        "src/interaction/tests.rs"
+      ],
+      "docs": [
+        "docs/mod/interaction/00-overview.md",
+        "docs/mod/interaction/01-implementation.md",
+        "docs/mod/interaction/02-issues.md"
+      ]
+    },
+    {
+      "id": "memory",
+      "code_paths": [
+        "src/memory"
+      ],
+      "test_paths": [
+        "src/memory/tests.rs",
+        "src/tools/tests.rs"
+      ],
+      "docs": [
+        "docs/mod/memory/00-overview.md",
+        "docs/mod/memory/01-implementation.md",
+        "docs/mod/memory/02-issues.md"
+      ]
+    },
+    {
+      "id": "prompt",
+      "code_paths": [
+        "src/prompt"
+      ],
+      "test_paths": [
+        "tests/session_compaction.rs",
+        "src/prompt/mod.rs",
+        "src/prompt/conversation.rs"
+      ],
+      "docs": [
+        "docs/mod/prompt/00-overview.md",
+        "docs/mod/prompt/01-implementation.md",
+        "docs/mod/prompt/02-issues.md"
+      ]
+    },
+    {
+      "id": "provider",
+      "code_paths": [
+        "src/provider"
+      ],
+      "test_paths": [
+        "tests/responses_retry.rs",
+        "tests/tool_loop.rs",
+        "src/provider/openai/chat.rs",
+        "src/provider/openai/responses.rs"
+      ],
+      "docs": [
+        "docs/mod/provider/00-overview.md",
+        "docs/mod/provider/01-implementation.md",
+        "docs/mod/provider/02-issues.md"
+      ]
+    },
+    {
+      "id": "retrieval",
+      "code_paths": [
+        "src/retrieval.rs"
+      ],
+      "test_paths": [
+        "src/retrieval.rs",
+        "src/memory/tests.rs"
+      ],
+      "docs": [
+        "docs/mod/retrieval/00-overview.md",
+        "docs/mod/retrieval/01-implementation.md",
+        "docs/mod/retrieval/02-issues.md"
+      ]
+    },
+    {
+      "id": "session",
+      "code_paths": [
+        "src/session"
+      ],
+      "test_paths": [
+        "tests/session_compaction.rs"
+      ],
+      "docs": [
+        "docs/mod/session/00-overview.md",
+        "docs/mod/session/01-implementation.md",
+        "docs/mod/session/02-issues.md"
+      ]
+    },
+    {
+      "id": "tools",
+      "code_paths": [
+        "src/tools"
+      ],
+      "test_paths": [
+        "src/tools/tests.rs",
+        "tests/tool_loop.rs",
+        "tests/process_safety.rs",
+        "src/tools/web_access/tests.rs",
+        "src/tools/bash.rs"
+      ],
+      "docs": [
+        "docs/mod/tools/00-overview.md",
+        "docs/mod/tools/01-implementation.md",
+        "docs/mod/tools/02-issues.md"
+      ]
+    },
+    {
+      "id": "trace",
+      "code_paths": [
+        "src/trace"
+      ],
+      "test_paths": [
+        "src/dao/mod.rs",
+        "tests/session_compaction.rs",
+        "tests/tool_loop.rs"
+      ],
+      "docs": [
+        "docs/mod/trace/00-overview.md",
+        "docs/mod/trace/01-implementation.md",
+        "docs/mod/trace/02-issues.md"
+      ]
+    },
+    {
+      "id": "ui-app",
+      "code_paths": [
+        "src/ui/app"
+      ],
+      "test_paths": [
+        "tests/gui_selection.rs",
+        "tests/web_ui.rs",
+        "src/ui/app/events.rs",
+        "src/ui/app/authorization.rs",
+        "src/ui/app/close.rs"
+      ],
+      "docs": [
+        "docs/mod/ui-app/00-overview.md",
+        "docs/mod/ui-app/01-implementation.md",
+        "docs/mod/ui-app/02-issues.md"
+      ]
+    },
+    {
+      "id": "ui-terminal",
+      "code_paths": [
+        "src/ui/commands.rs",
+        "src/ui/repl",
+        "src/ui/tui"
+      ],
+      "test_paths": [
+        "src/ui/mod.rs",
+        "src/interaction/tests.rs",
+        "src/ui/tui/input.rs",
+        "src/ui/tui/sessions.rs",
+        "src/ui/tui/memory.rs"
+      ],
+      "docs": [
+        "docs/mod/ui-terminal/00-overview.md",
+        "docs/mod/ui-terminal/01-implementation.md",
+        "docs/mod/ui-terminal/02-issues.md"
+      ]
+    },
+    {
+      "id": "ui-gui",
+      "code_paths": [
+        "src/ui/gui"
+      ],
+      "test_paths": [
+        "tests/gui_selection.rs",
+        "src/ui/frontend/src/App.test.tsx"
+      ],
+      "docs": [
+        "docs/mod/ui-gui/00-overview.md",
+        "docs/mod/ui-gui/01-implementation.md",
+        "docs/mod/ui-gui/02-issues.md"
+      ]
+    },
+    {
+      "id": "ui-web",
+      "code_paths": [
+        "src/ui/web"
+      ],
+      "test_paths": [
+        "tests/web_ui.rs",
+        "src/ui/web/auth.rs"
+      ],
+      "docs": [
+        "docs/mod/ui-web/00-overview.md",
+        "docs/mod/ui-web/01-implementation.md",
+        "docs/mod/ui-web/02-issues.md"
+      ]
+    },
+    {
+      "id": "frontend",
+      "code_paths": [
+        "src/ui/frontend"
+      ],
+      "test_paths": [
+        "src/ui/frontend/src/App.test.tsx",
+        "src/ui/frontend/src/model.test.ts",
+        "src/ui/frontend/src/Web.test.tsx",
+        "src/ui/frontend/src/MemoryPanel.test.tsx",
+        "src/ui/frontend/src/markdown.test.ts"
+      ],
+      "docs": [
+        "docs/mod/frontend/00-overview.md",
+        "docs/mod/frontend/01-implementation.md",
+        "docs/mod/frontend/02-issues.md"
+      ]
+    }
+  ]
+}
