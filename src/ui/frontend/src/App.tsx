@@ -1,6 +1,9 @@
 import {
   createContext,
+  memo,
+  useCallback,
   useContext,
+  useDeferredValue,
   useEffect,
   useLayoutEffect,
   useMemo,
@@ -22,6 +25,7 @@ import {
 } from "./model";
 import type { Entry, Pending } from "./model";
 import MemoryPanel, { MemoryConfirmation, memoryLabel } from "./MemoryPanel";
+import { connectStream } from "./stream";
 import "./style.css";
 
 const CopyContext = createContext<(text: string) => Promise<void>>(async () => {});
@@ -35,7 +39,7 @@ function plainText(node: ReactNode): string {
   return "";
 }
 
-function Message({
+const Message = memo(function Message({
   entry,
   onCopyError,
 }: {
@@ -90,7 +94,7 @@ function Message({
       </div>
     </article>
   );
-}
+});
 
 function shortId(id: string): string {
   return id.slice(0, 8);
@@ -128,7 +132,7 @@ function ToolGroup({
   );
 }
 
-function ConversationTurn({
+const ConversationTurn = memo(function ConversationTurn({
   entries,
   onCopyError,
 }: {
@@ -150,14 +154,15 @@ function ConversationTurn({
       )}
     </section>
   );
-}
+});
 
 export default function App({ host = defaultHost, onUnauthenticated }: { host?: HostAdapter; onUnauthenticated?: () => void } = {}) {
   const [state, dispatch] = useReducer(applyEvent, initialState);
   const [input, setInput] = useState("");
-  const drafts = useRef(new Map<string, string>());
+  const drafts = useRef(new Map<string, { text: string; version: number }>());
   const inputSession = useRef<string | null>(null);
   const currentInput = useRef(input);
+  const inputVersion = useRef(0);
   currentInput.current = input;
   const [drawer, setDrawer] = useState<"sessions" | "info" | null>(null);
   const [manualCopy, setManualCopy] = useState<string | null>(null);
@@ -176,16 +181,24 @@ export default function App({ host = defaultHost, onUnauthenticated }: { host?: 
   current.current = state;
   const stream = useRef<HTMLDivElement>(null);
   const followBottom = useRef(true);
+  const [showLatest, setShowLatest] = useState(false);
   const lastSession = useRef<string | null>(null);
   const lastWorkspace = useRef<string | null>(null);
   const prependHeight = useRef<number | null>(null);
 
-  useEffect(() => host.connect(dispatch), [host]);
+  useEffect(() => connectStream(host, dispatch), [host]);
+  const sessionId = state.snapshot?.status.session_id ?? null;
+  const liveFrame = useMemo(() => ({ sessionId, requestId: state.pending?.id, text: state.live }), [sessionId, state.pending?.id, state.live]);
+  const deferredFrame = useDeferredValue(liveFrame);
+  // 延迟呈现只能沿用同一会话、同一请求的正文，切换后不能短暂显示上一轮。
+  const liveText = deferredFrame.sessionId === sessionId && deferredFrame.requestId === state.pending?.id ? deferredFrame.text : "";
+  const liveEntry = useMemo<Entry>(() => ({ role: "assistant", text: liveText }), [liveText]);
+  const pendingEntry = useMemo<Entry>(() => ({ role: "user", text: state.pending?.line ?? "" }), [state.pending?.line]);
+  const liveTools = useMemo<Entry[]>(() => state.liveTools.map((name) => ({ role: "tool", text: `调用 ${name}` })), [state.liveTools]);
   useEffect(() => {
     if (state.connection === "unauthenticated") onUnauthenticated?.();
   }, [state.connection, onUnauthenticated]);
 
-  const sessionId = state.snapshot?.status.session_id ?? null;
   const workspace = state.snapshot?.status.workspace ?? null;
   const displayedSessions = useMemo(
     () => sessionScope === "all"
@@ -206,15 +219,17 @@ export default function App({ host = defaultHost, onUnauthenticated }: { host?: 
     for (const id of removed) drafts.current.delete(id);
     const previous = inputSession.current;
     if (sessionId !== previous) {
-      if (previous && !removed.has(previous)) drafts.current.set(previous, currentInput.current);
+      if (previous && !removed.has(previous)) drafts.current.set(previous, { text: currentInput.current, version: inputVersion.current });
+      inputVersion.current += 1;
       inputSession.current = sessionId;
-      setInput(sessionId ? drafts.current.get(sessionId) ?? "" : "");
+      setInput(sessionId ? drafts.current.get(sessionId)?.text ?? "" : "");
       if (state.deleteReport?.new_session_id !== sessionId) setSelectedSessions(new Set());
     }
   }, [sessionId, state.deleteReport]);
   useEffect(() => {
     if (sessionId !== lastSession.current) {
       followBottom.current = true;
+      setShowLatest(false);
       lastSession.current = sessionId;
       setVisibleCount(120);
     }
@@ -248,7 +263,7 @@ export default function App({ host = defaultHost, onUnauthenticated }: { host?: 
   useEffect(() => {
     if (followBottom.current && stream.current)
       stream.current.scrollTop = stream.current.scrollHeight;
-  }, [state.snapshot?.transcript, state.live, state.liveTools, sessionId]);
+  }, [state.snapshot?.transcript, liveText, state.liveTools, sessionId]);
 
   async function submit(line: string, clearComposer = true) {
     if (
@@ -262,6 +277,7 @@ export default function App({ host = defaultHost, onUnauthenticated }: { host?: 
     )
       return;
     const submittedSession = inputSession.current;
+    const submittedVersion = clearComposer ? ++inputVersion.current : inputVersion.current;
     const pending: Pending = { id: nextRequest.current++, line: line.trim(), local: true };
     current.current = {
       ...current.current,
@@ -279,8 +295,13 @@ export default function App({ host = defaultHost, onUnauthenticated }: { host?: 
       const memoryConfirmed = /^\/memory (?:delete --yes |clear --yes$)/.test(pending.line);
       await host.submit({ requestId: pending.id, line: pending.line, revision: memoryConfirmed ? (current.current.memoryRevision ?? current.current.snapshot?.revision) : pending.line.startsWith("/delete --yes ") ? (current.current.deleteRevision ?? current.current.snapshot?.revision) : current.current.snapshot?.revision });
       if (clearComposer && submittedSession) {
-        drafts.current.delete(submittedSession);
-        if (inputSession.current === submittedSession) setInput("");
+        // 确认可能晚于下一条草稿或会话切换，不能用旧请求清空新的编辑。
+        if (inputSession.current === submittedSession && inputVersion.current === submittedVersion) {
+          drafts.current.delete(submittedSession);
+          setInput("");
+        } else if (inputSession.current !== submittedSession && drafts.current.get(submittedSession)?.version === submittedVersion) {
+          drafts.current.delete(submittedSession);
+        }
       }
     } catch (error) {
       dispatch({
@@ -334,6 +355,10 @@ export default function App({ host = defaultHost, onUnauthenticated }: { host?: 
     !!state.authorization ||
     state.connection !== "connected";
   const disabled = operationBusy || !!state.deleteConfirmation || !!state.memoryConfirmation;
+  // 运行互斥只约束提交；范围、勾选和草稿属于本地状态，不必等待模型。
+  const localDisabled = !state.snapshot || state.closing || !!state.startupError
+    || !!state.authorization || !!state.deleteConfirmation || !!state.memoryConfirmation;
+  const composerDisabled = localDisabled || state.connection !== "connected";
   const contextPercent = status
     ? Math.min(
         100,
@@ -344,6 +369,15 @@ export default function App({ host = defaultHost, onUnauthenticated }: { host?: 
       )
     : 0;
   const isChat = state.pending && !state.pending.line.startsWith("/");
+  const activity = !state.snapshot ? "正在连接工作区"
+    : state.closing ? "等待操作完成并保存"
+    : state.connection !== "connected" ? "正在恢复连接"
+    : state.authorization ? "等待工具授权"
+    : state.pending ? (!isChat ? "正在处理操作" : state.liveTools.length
+      ? `处理中 · 已调用 ${state.liveTools.length} 个工具`
+      : state.live ? "正在接收回复" : "等待模型回复")
+    : "准备就绪";
+  const busyHint = state.pending ? "本轮结束后可发送、切换会话或修改数据" : undefined;
   const retryDeleteIds = state.deleteReport?.items
     .filter((item) => item.state === "failed" || item.state === "cleanup_pending")
     .map((item) => item.id) ?? [];
@@ -356,10 +390,10 @@ export default function App({ host = defaultHost, onUnauthenticated }: { host?: 
     });
   }
 
-  async function copy(text: string) {
+  const copy = useCallback(async (text: string) => {
     try { await host.copy(text); }
     catch (error) { if (host.kind === "web") setManualCopy(text); else throw error; }
-  }
+  }, [host]);
 
   return (
     <CopyContext.Provider value={copy}>
@@ -439,6 +473,7 @@ export default function App({ host = defaultHost, onUnauthenticated }: { host?: 
         <button
           className="new-session"
           disabled={disabled}
+          title={busyHint}
           onClick={() => void submit("/new")}
         >
           ＋ 新建会话
@@ -447,14 +482,16 @@ export default function App({ host = defaultHost, onUnauthenticated }: { host?: 
           <span>会话 {displayedSessions.length}</span>
           <span className="scope-toggle" role="group" aria-label="会话范围">
             <button
-              disabled={disabled}
+              disabled={localDisabled}
+              aria-pressed={sessionScope === "current"}
               className={sessionScope === "current" ? "active" : ""}
               onClick={() => setSessionScope("current")}
             >
               当前
             </button>
             <button
-              disabled={disabled}
+              disabled={localDisabled}
+              aria-pressed={sessionScope === "all"}
               className={sessionScope === "all" ? "active" : ""}
               onClick={() => setSessionScope("all")}
             >
@@ -464,7 +501,8 @@ export default function App({ host = defaultHost, onUnauthenticated }: { host?: 
         </div>
         <div className="session-management">
           <button
-            disabled={disabled}
+            disabled={localDisabled}
+            aria-pressed={managingSessions}
             onClick={() => setManagingSessions(!managingSessions)}
           >
             {managingSessions ? "完成管理" : "管理会话"}
@@ -474,7 +512,7 @@ export default function App({ host = defaultHost, onUnauthenticated }: { host?: 
               <input
                 type="checkbox"
                 aria-label="全选当前列表"
-                disabled={disabled || displayedSessions.length === 0}
+                disabled={localDisabled || displayedSessions.length === 0}
                 checked={displayedSessions.length > 0 && selectedSessions.size === displayedSessions.length}
                 ref={(node) => {
                   if (node) node.indeterminate = selectedSessions.size > 0
@@ -503,6 +541,7 @@ export default function App({ host = defaultHost, onUnauthenticated }: { host?: 
             </button>
           </>}
         </div>
+        {state.pending && <p className="session-busy-hint">可筛选和勾选，本轮结束后可打开或删除会话。</p>}
         {retryDeleteIds.length > 0 && (
           <button
             className="retry-delete"
@@ -534,7 +573,7 @@ export default function App({ host = defaultHost, onUnauthenticated }: { host?: 
                   type="checkbox"
                   aria-label={`选择 ${session.title} ${session.id}`}
                   checked={selectedSessions.has(session.id)}
-                  disabled={disabled}
+                  disabled={localDisabled}
                   onChange={() => toggleSession(session.id)}
                 />
                 {details}
@@ -544,7 +583,8 @@ export default function App({ host = defaultHost, onUnauthenticated }: { host?: 
                 key={session.id}
                 disabled={disabled}
                 className={className}
-                title={session.id}
+                title={busyHint ? `${session.id}\n${busyHint}` : session.id}
+                aria-current={session.active ? "page" : undefined}
                 onClick={() => void submit(`/open ${session.id}`)}
               >
                 <span className="session-dot" />{details}
@@ -574,10 +614,10 @@ export default function App({ host = defaultHost, onUnauthenticated }: { host?: 
           <div className="top-actions">
             <button className="info-toggle" aria-label="状态面板" aria-expanded={drawer === "info"} onClick={() => setDrawer(drawer === "info" ? null : "info")}>状态</button>
             <button disabled={!state.snapshot || !!state.authorization || !!state.deleteConfirmation || !!state.memoryConfirmation} onClick={() => setMemoryOpen(true)}>记忆</button>
-            <button disabled={disabled} onClick={() => void submit("/compact")}>
+            <button disabled={disabled} title={busyHint} onClick={() => void submit("/compact")}>
               压缩
             </button>
-            <button disabled={disabled} onClick={() => void submit("/save")}>
+            <button disabled={disabled} title={busyHint} onClick={() => void submit("/save")}>
               保存
             </button>
             <button disabled={disabled} onClick={() => void submit("/help")}>
@@ -596,11 +636,13 @@ export default function App({ host = defaultHost, onUnauthenticated }: { host?: 
             {host.kind === "web" && state.connection !== "connected" && state.connection !== "exited" && <div className="connection-banner" role="status">连接已中断，正在恢复状态；未确认的操作不会自动重发。</div>}
             <div
               className="feed"
+              aria-label="聊天记录"
               ref={stream}
               onScroll={(event) => {
                 const node = event.currentTarget;
                 followBottom.current =
                   node.scrollHeight - node.scrollTop - node.clientHeight < 64;
+                setShowLatest(!followBottom.current);
               }}
             >
               {transcript.length === 0 && !state.pending && (
@@ -617,6 +659,7 @@ export default function App({ host = defaultHost, onUnauthenticated }: { host?: 
                     prependHeight.current =
                       stream.current?.scrollHeight ?? null;
                     followBottom.current = false;
+                    setShowLatest(true);
                     setVisibleCount((count) => count + 120);
                   }}
                 >
@@ -633,37 +676,23 @@ export default function App({ host = defaultHost, onUnauthenticated }: { host?: 
               {isChat && (
                 <>
                   <Message
-                    entry={{ role: "user", text: state.pending!.line }}
+                    entry={pendingEntry}
                     onCopyError={setLocalError}
                   />
                   {state.liveTools.length > 0 && (
                     <ToolGroup
                       key={`${sessionId}-pending-${state.pending!.id}`}
-                      entries={state.liveTools.map((name) => ({
-                        role: "tool",
-                        text: `调用 ${name}`,
-                      }))}
+                      entries={liveTools}
                       pending
                     />
                   )}
-                  {state.live && (
+                  {liveText && (
                     <Message
-                      entry={{ role: "assistant", text: state.live }}
+                      entry={liveEntry}
                       onCopyError={setLocalError}
                     />
                   )}
                 </>
-              )}
-              {state.pending && (
-                <div className="working">
-                  <span className="pulse" />
-                  {state.closing ? "等待当前操作完成并保存…" : "Geer 正在工作…"}
-                  {state.liveUsage > 0
-                    ? ` · 已报告 ${state.liveUsage} tokens`
-                    : state.live
-                      ? ` · 临时估算约 ${Math.max(1, Math.ceil(state.live.length / 4))} tokens`
-                      : ""}
-                </div>
               )}
               {state.notice && (
                 <div className="notice">
@@ -683,6 +712,19 @@ export default function App({ host = defaultHost, onUnauthenticated }: { host?: 
               )}
             </div>
             <div className="composer">
+              {showLatest && <button className="jump-latest" onClick={() => {
+                followBottom.current = true;
+                setShowLatest(false);
+                if (stream.current) stream.current.scrollTop = stream.current.scrollHeight;
+              }}>↓ 返回最新消息</button>}
+              <div className={`activity-bar ${state.pending ? "is-working" : ""}`}>
+                <span role="status"><span className={state.pending ? "pulse" : "activity-dot"} aria-hidden="true" />{activity}</span>
+                {state.pending && <small>{state.closing ? "完成后保存并退出"
+                  : state.connection !== "connected" ? "连接恢复后可继续"
+                  : state.authorization ? "请先确认工具权限"
+                  : state.liveUsage > 0 ? `已报告 ${state.liveUsage.toLocaleString()} tokens`
+                  : state.live ? `临时估算约 ${Math.max(1, Math.ceil(state.live.length / 4)).toLocaleString()} tokens` : "可继续编辑草稿"}</small>}
+              </div>
               <div className="composer-inner">
                 <label className="composer-identity" htmlFor="message-input">
                   李火旺🔥
@@ -690,22 +732,27 @@ export default function App({ host = defaultHost, onUnauthenticated }: { host?: 
                 <textarea
                   id="message-input"
                   aria-label="消息"
-                  placeholder="发送消息给 Geer…"
+                  placeholder={state.pending ? "继续写下一条，回复结束后发送…" : "发送消息给 Geer…"}
+                  aria-describedby="composer-hint"
                   value={input}
-                  disabled={disabled}
+                  disabled={composerDisabled}
                   rows={3}
-                  onChange={(event) => setInput(event.target.value)}
+                  onChange={(event) => {
+                    inputVersion.current += 1;
+                    setInput(event.target.value);
+                  }}
                   onKeyDown={(event: KeyboardEvent<HTMLTextAreaElement>) => {
                     if (shouldSubmit(event.nativeEvent)) {
                       event.preventDefault();
-                      void submit(input);
+                      if (!disabled) void submit(input);
                     }
                   }}
                 />
                 <div className="composer-bottom">
-                  <span>Enter 发送 · Shift+Enter 换行</span>
+                  <span id="composer-hint">{state.pending ? "草稿不会自动发送 · Shift+Enter 换行" : "Enter 发送 · Shift+Enter 换行"}</span>
                   <button
                     disabled={disabled || !input.trim()}
+                    title={busyHint}
                     onClick={() => void submit(input)}
                   >
                     发送 ↗

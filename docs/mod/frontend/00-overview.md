@@ -5,7 +5,7 @@
 一套 React/TypeScript 应用用于桌面 GUI 和浏览器 Web，按构建模式注入不同宿主能力。
 
 - 代码：[src/ui/frontend](../../../src/ui/frontend)
-- 代表性测试：[App](../../../src/ui/frontend/src/App.test.tsx)、[reducer](../../../src/ui/frontend/src/model.test.ts)、[Web](../../../src/ui/frontend/src/Web.test.tsx)、[记忆面板](../../../src/ui/frontend/src/MemoryPanel.test.tsx)、[Markdown](../../../src/ui/frontend/src/markdown.test.ts)
+- 代表性测试：[App](../../../src/ui/frontend/src/App.test.tsx)、[reducer](../../../src/ui/frontend/src/model.test.ts)、[Web](../../../src/ui/frontend/src/Web.test.tsx)、[记忆面板](../../../src/ui/frontend/src/MemoryPanel.test.tsx)、[Markdown](../../../src/ui/frontend/src/markdown.test.ts)、[流式调度](../../../src/ui/frontend/src/stream.test.ts)
 - 归属与代码覆盖：[catalog](../../../.ai/catalog.json)
 
 ## 按需阅读

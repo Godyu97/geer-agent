@@ -17,7 +17,15 @@ const mock = vi.hoisted(() => ({
   invoke: vi.fn(),
   close: vi.fn(),
   dialogOpen: vi.fn(),
+  markdown: vi.fn(),
 }));
+vi.mock("react-markdown", async (importOriginal) => {
+  const original = await importOriginal<typeof import("react-markdown")>();
+  return { ...original, default: (props: Parameters<typeof original.default>[0]) => {
+    mock.markdown(props.children);
+    return <original.default {...props} />;
+  } };
+});
 vi.mock("@tauri-apps/api/core", () => ({
   Channel: class {
     onmessage: (event: Event) => void = () => {};
@@ -63,6 +71,7 @@ beforeEach(() => {
   mock.invoke.mockReset().mockResolvedValue(undefined);
   mock.close.mockReset().mockResolvedValue(undefined);
   mock.dialogOpen.mockReset().mockResolvedValue(null);
+  mock.markdown.mockClear();
 });
 afterEach(cleanup);
 
@@ -529,9 +538,11 @@ it("previews deletion once, defaults to cancel, preserves drafts and blocks busy
   fireEvent.click(selected(historyB.id));
   fireEvent.click(screen.getByRole("button", { name: "删除所选" }));
   await waitFor(() => expect(lastSubmit().line).toBe(`/delete ${historyB.id}`));
-  expect(selected(historyA.id).disabled).toBe(true);
-  expect((screen.getByRole("button", { name: "全部" }) as HTMLButtonElement).disabled).toBe(true);
+  expect(selected(historyA.id).disabled).toBe(false);
+  expect((screen.getByRole("button", { name: "全部" }) as HTMLButtonElement).disabled).toBe(false);
+  expect((screen.getByRole("button", { name: "删除所选" }) as HTMLButtonElement).disabled).toBe(true);
   completePreview();
+  expect(selected(historyA.id).disabled).toBe(true);
   const dialog = screen.getByRole("dialog", { name: "删除会话确认" });
   expect(within(dialog).getByText(historyB.id)).toBeTruthy();
   expect(within(dialog).getByText(/保留 Trace 日志/)).toBeTruthy();
@@ -552,6 +563,91 @@ it("previews deletion once, defaults to cancel, preserves drafts and blocks busy
   expect(input.value).toBe("保留未发送的草稿");
   expect(screen.queryByRole("checkbox", { name: new RegExp(historyB.id) })).toBeNull();
   expect(screen.getByText("已选 0")).toBeTruthy();
+});
+
+it("keeps local selection and the next draft usable while waiting for the model", async () => {
+  render(<App />);
+  showSessions();
+  const input = screen.getByRole("textbox", { name: "消息" }) as HTMLTextAreaElement;
+  fireEvent.change(input, { target: { value: "正在处理的提问" } });
+  fireEvent.click(screen.getByRole("button", { name: "发送 ↗" }));
+  await waitFor(() => expect(input.value).toBe(""));
+  expect(input.disabled).toBe(false);
+  fireEvent.change(input, { target: { value: "下一条草稿" } });
+  fireEvent.keyDown(input, { key: "Enter", keyCode: 13 });
+  fireEvent.click(screen.getByRole("button", { name: "全部" }));
+  expect(screen.getByRole("button", { name: "全部" }).getAttribute("aria-pressed")).toBe("true");
+  fireEvent.click(screen.getByRole("button", { name: "管理会话" }));
+  fireEvent.click(selected(historyB.id));
+  expect(selected(historyB.id).checked).toBe(true);
+  for (const name of ["发送 ↗", "删除所选", "＋ 新建会话", "压缩", "保存", "更改"]) {
+    expect((screen.getByRole("button", { name }) as HTMLButtonElement).disabled).toBe(true);
+  }
+  expect(mock.invoke.mock.calls.filter(([name]) => name === "gui_submit")).toHaveLength(1);
+  send({ type: "snapshot", request_id: 1, snapshot: historySnapshot, notice: null, error: null });
+  expect(input.value).toBe("下一条草稿");
+  expect((screen.getByRole("button", { name: "发送 ↗" }) as HTMLButtonElement).disabled).toBe(false);
+});
+
+it("preserves edits made before a delayed submit acknowledgement and after failure", async () => {
+  let accept: () => void = () => {};
+  mock.invoke.mockImplementation((command) => command === "gui_submit"
+    ? new Promise<void>((resolve) => { accept = resolve; }) : Promise.resolve());
+  render(<App />);
+  showHistory([]);
+  const input = screen.getByRole("textbox", { name: "消息" }) as HTMLTextAreaElement;
+  fireEvent.change(input, { target: { value: "已提交问题" } });
+  fireEvent.click(screen.getByRole("button", { name: "发送 ↗" }));
+  fireEvent.change(input, { target: { value: "新的草稿" } });
+  await act(async () => accept());
+  expect(input.value).toBe("新的草稿");
+  send({ type: "snapshot", request_id: 1, snapshot, notice: null, error: null });
+  mock.invoke.mockRejectedValueOnce(new Error("连接断开"));
+  fireEvent.click(screen.getByRole("button", { name: "发送 ↗" }));
+  await waitFor(() => expect(screen.getByText(/连接断开/)).toBeTruthy());
+  expect(input.value).toBe("新的草稿");
+});
+
+it("keeps old Markdown and the reading position stable during streaming and draft edits", async () => {
+  render(<App />);
+  showHistory([{ role: "assistant", text: "**已经完成的历史**" }]);
+  const feed = screen.getByLabelText("聊天记录");
+  Object.defineProperties(feed, {
+    scrollHeight: { configurable: true, value: 2000 },
+    clientHeight: { configurable: true, value: 400 },
+  });
+  feed.scrollTop = 200;
+  fireEvent.scroll(feed);
+  send({ type: "started", request_id: 12, line: "新的请求" });
+  expect(screen.getByText("等待模型回复")).toBeTruthy();
+  mock.markdown.mockClear();
+  for (let i = 0; i < 10; i++) send({ type: "delta", request_id: 12, text: "连续正文" });
+  await waitFor(() => expect(screen.getByText("连续正文".repeat(10))).toBeTruthy());
+  fireEvent.change(screen.getByLabelText("消息"), { target: { value: "草稿编辑" } });
+  expect(mock.markdown.mock.calls.some(([text]) => text === "**已经完成的历史**")).toBe(false);
+  expect(feed.scrollTop).toBe(200);
+  fireEvent.click(screen.getByRole("button", { name: "↓ 返回最新消息" }));
+  expect(feed.scrollTop).toBe(2000);
+  expect(screen.queryByRole("button", { name: "↓ 返回最新消息" })).toBeNull();
+  send({ type: "authorization", id: 6, prompt: "允许工具" });
+  expect(screen.getByText("等待工具授权")).toBeTruthy();
+  expect(screen.getByRole("button", { name: "拒绝" })).toBeTruthy();
+});
+
+it("does not let an earlier acknowledgement erase a later submission of unchanged text", async () => {
+  const accepts: Array<() => void> = [];
+  mock.invoke.mockImplementation((command) => command === "gui_submit"
+    ? new Promise<void>((resolve) => accepts.push(resolve)) : Promise.resolve());
+  render(<App />); showHistory([]);
+  const input = screen.getByLabelText("消息") as HTMLTextAreaElement;
+  fireEvent.change(input, { target: { value: "再次提问" } });
+  fireEvent.click(screen.getByRole("button", { name: "发送 ↗" }));
+  send({ type: "snapshot", request_id: 1, snapshot, notice: null, error: null });
+  fireEvent.click(screen.getByRole("button", { name: "发送 ↗" }));
+  await act(async () => accepts[0]());
+  expect(input.value).toBe("再次提问");
+  await act(async () => accepts[1]());
+  expect(input.value).toBe("");
 });
 
 it("replaces a deleted current session, retains failed selections and retries residual cleanup", async () => {

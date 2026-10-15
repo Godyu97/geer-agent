@@ -4,6 +4,6 @@
 
 ## 当前清单
 
-本轮静态核对范围：Vite 两种构建模式、HostAdapter、人工协议类型与五组前端测试入口。该范围未新登记业务缺陷；没有运行模块业务验证，验证入口与边界见 [01](01-implementation.md)，不据此宣称业务或集成全部验收。
+运行期间交互优化已覆盖共用前端、两种构建模式及模拟连续输出；原生 Tauri 在 Linux/Windows 的实际 WebView 和真实模型长时间运行仍需按用户环境复核。模拟浏览器检查不能证明所有原生卡顿均已消除，范围与证据见 [验收记录](../../../openspec/changes/improve-ui-busy-interactions/verification.md)。
 
 维护规则与归档条件见 [.ai/04-documentation.md](../../../.ai/04-documentation.md)。稳定职责进入 00，已落地规则进入 01；尚未实现的目标留在对应需求或变更记录。

@@ -77,6 +77,25 @@ it("passes the snapshot revision through the shared host and disables disconnect
   expect((screen.getByLabelText("消息") as HTMLTextAreaElement).disabled).toBe(true);
 });
 
+it("does not let a late acknowledgement clear a newer draft stored by a remote session switch", async () => {
+  const adapter = fakeHost();
+  let accept: () => void = () => {};
+  vi.mocked(adapter.host.submit).mockReturnValue(new Promise<void>((resolve) => { accept = resolve; }));
+  render(<App host={adapter.host} />); adapter.send(sync());
+  const input = screen.getByLabelText("消息") as HTMLTextAreaElement;
+  fireEvent.change(input, { target: { value: "相同的文字" } });
+  fireEvent.click(screen.getByRole("button", { name: "发送 ↗" }));
+  fireEvent.change(input, { target: { value: "重新编辑" } });
+  fireEvent.change(input, { target: { value: "相同的文字" } });
+  adapter.send(sync({ snapshot: { ...snapshot, status: { ...snapshot.status, session_id: "two" } } }));
+  fireEvent.change(input, { target: { value: "另一会话草稿" } });
+  await act(async () => accept());
+  expect(input.value).toBe("另一会话草稿");
+  adapter.send(sync());
+  expect(input.value).toBe("相同的文字");
+  expect(adapter.host.submit).toHaveBeenCalledTimes(1);
+});
+
 class FakeSocket {
   static OPEN = 1;
   static instances: FakeSocket[] = [];

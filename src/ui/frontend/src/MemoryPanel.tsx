@@ -61,13 +61,14 @@ export default function MemoryPanel({ entries, status, disabled, error, notice, 
     <div className="modal memory-panel" role="dialog" aria-modal="true" aria-label="记忆管理" onKeyDown={(event) => {
       if (event.key === "Escape") {
         event.preventDefault();
-        if (editor && !disabled) { setEditor(null); setAwaiting(false); }
-        else if (!disabled) onClose();
+        if (editor) { setEditor(null); setAwaiting(false); }
+        else onClose();
       }
       trapFocus(event);
     }}>
-      <div className="memory-heading"><h2>长期记忆</h2><button className="secondary" autoFocus disabled={disabled} onClick={onClose}>关闭记忆面板</button></div>
+      <div className="memory-heading"><h2>长期记忆</h2><button className="secondary" autoFocus onClick={onClose}>关闭记忆面板</button></div>
       <p>{memoryLabel(status)} · 同一数据库下的所有 workspace 共享</p>
+      {disabled && <p className="memory-notice">当前仅可查看和搜索；操作结束或连接恢复后可修改。你可以随时关闭面板。</p>}
       {status?.error && <p className="memory-error" role="alert">{status.error}</p>}
       {error && <p className="memory-error" role="alert">{error}</p>}
       {notice && !notice.includes("\n") && <p className="memory-notice" role="status">{notice}</p>}
@@ -82,7 +83,7 @@ export default function MemoryPanel({ entries, status, disabled, error, notice, 
         {editor.id && <code>{editor.id}</code>}
         <textarea id="memory-content" autoFocus value={editor.text} disabled={disabled} onChange={(event) => setEditor({ ...editor, text: event.target.value })} />
         <div className="memory-actions">
-          <button className="secondary" type="button" disabled={disabled} onClick={() => { setEditor(null); setAwaiting(false); }}>取消编辑</button>
+          <button className="secondary" type="button" onClick={() => { setEditor(null); setAwaiting(false); }}>取消编辑</button>
           <button className="primary" disabled={!writable || !editor.text.trim()} type="submit">保存记忆</button>
         </div>
       </form>}

@@ -120,3 +120,36 @@ it("drops expired or foreign previews after state changes, reconnects and remote
   state = applyEvent(state, { type: "connection", status: "disconnected" });
   expect(state.memoryConfirmation).toBeNull();
 });
+
+it("can search and leave the memory panel while a model is running or disconnected", () => {
+  const client = adapter(); render(<App host={client.host} />); client.send(done(null, 5, entries));
+  const composer = screen.getByLabelText("消息") as HTMLTextAreaElement;
+  fireEvent.change(composer, { target: { value: "下一条聊天草稿" } });
+  client.send({ type: "started", request_id: 40, line: "等待回复" });
+  fireEvent.click(screen.getByRole("button", { name: "记忆" }));
+  let panel = screen.getByRole("dialog", { name: "记忆管理" });
+  fireEvent.change(within(panel).getByLabelText("搜索记忆"), { target: { value: "Rust" } });
+  expect(within(panel).queryByText(entries[1].id)).toBeNull();
+  expect((within(panel).getByRole("button", { name: "新增记忆" }) as HTMLButtonElement).disabled).toBe(true);
+  fireEvent.click(within(panel).getByRole("button", { name: "关闭记忆面板" }));
+  expect(screen.queryByRole("dialog", { name: "记忆管理" })).toBeNull();
+  fireEvent.click(screen.getByRole("button", { name: "记忆" }));
+  panel = screen.getByRole("dialog", { name: "记忆管理" });
+  client.send({ type: "connection", status: "disconnected" });
+  fireEvent.keyDown(panel, { key: "Escape" });
+  expect(screen.queryByRole("dialog", { name: "记忆管理" })).toBeNull();
+  expect(composer.value).toBe("下一条聊天草稿");
+  expect(client.host.submit).not.toHaveBeenCalled();
+});
+
+it("lets Escape leave a memory editor and then its panel after a remote run starts", () => {
+  const client = adapter(); render(<App host={client.host} />); client.send(done(null, 5, entries));
+  fireEvent.click(screen.getByRole("button", { name: "记忆" }));
+  const panel = screen.getByRole("dialog", { name: "记忆管理" });
+  fireEvent.click(within(panel).getByRole("button", { name: "新增记忆" }));
+  client.send({ type: "started", request_id: 41, line: "其他端提问" });
+  fireEvent.keyDown(panel, { key: "Escape" });
+  expect(within(panel).queryByLabelText("新增记忆正文")).toBeNull();
+  fireEvent.keyDown(panel, { key: "Escape" });
+  expect(screen.queryByRole("dialog", { name: "记忆管理" })).toBeNull();
+});

@@ -357,7 +357,8 @@
         "src/ui/frontend/src/model.test.ts",
         "src/ui/frontend/src/Web.test.tsx",
         "src/ui/frontend/src/MemoryPanel.test.tsx",
-        "src/ui/frontend/src/markdown.test.ts"
+        "src/ui/frontend/src/markdown.test.ts",
+        "src/ui/frontend/src/stream.test.ts"
       ],
       "docs": [
         "docs/mod/frontend/00-overview.md",
